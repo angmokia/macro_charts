@@ -12,6 +12,7 @@ import time
 
 # ── Setup ─────────────────────────────────────────────────────────────────────
 load_dotenv()
+st.write(os.getenv("FRED_API_KEY"))
 fred = Fred(api_key=os.getenv("FRED_API_KEY"))
 
 st.set_page_config(page_title="US Macro Dashboard", layout="wide", page_icon="🇺🇸")
