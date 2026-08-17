@@ -269,7 +269,7 @@ def get_summary_metrics(end):
         "NFP MoM":      ("PAYEMS",     "diff_k",    "k"),
         "10Y Yield":    ("DGS10",      "level",     "%"),
         "2Y Yield":     ("DGS2",       "level",     "%"),
-        "2s10s":        ("T10Y2Y",     "level",    "bps"),
+        "2s10s":        ("T10Y2Y",     "level_bps","bps"),
         "Fed Funds":    ("FEDFUNDS",   "level",     "%"),
         "M2 YoY":       ("M2SL",       "pct_yoy",  "%"),
     }
@@ -286,6 +286,9 @@ def get_summary_metrics(end):
             elif calc == "diff_k":
                 val = s.diff().iloc[-1]
                 delta = val - s.diff().iloc[-2]
+            elif calc == "level_bps":
+                # FRED reports this series in percentage points (e.g. 0.51 = 51bps)
+                val, delta = latest * 100, (latest - prev) * 100
             else:
                 val, delta = latest, latest - prev
             results[name] = (val, delta, unit)
@@ -302,8 +305,11 @@ for col, (name, (val, delta, unit)) in zip(cols, summary.items()):
         if val is None:
             st.markdown(f'<div class="metric-card"><div class="metric-label">{name}</div><div class="metric-value neutral">N/A</div></div>', unsafe_allow_html=True)
             continue
-        val_str   = f"{val:+.0f}{unit}" if unit == "k" else f"{val:.2f}{unit}"
-        delta_str = f"{delta:+.2f}{unit}" if delta is not None else ""
+        val_str   = f"{val:+.0f}{unit}" if unit in ("k", "bps") else f"{val:.2f}{unit}"
+        if delta is None:
+            delta_str = ""
+        else:
+            delta_str = f"{delta:+.0f}{unit}" if unit in ("k", "bps") else f"{delta:+.2f}{unit}"
         delta_cls = "positive" if (delta or 0) > 0 else "negative" if (delta or 0) < 0 else "neutral"
         st.markdown(f"""
         <div class="metric-card">
@@ -770,16 +776,18 @@ with tabs[3]:
     # Treasury spreads
     spreads = pd.DataFrame()
     if not yc.empty:
-        spreads["10Y-2Y"]  = yc.get("10Y",pd.Series()) - yc.get("2Y",pd.Series())
-        spreads["10Y-3M"]  = yc.get("10Y",pd.Series()) - yc.get("3M",pd.Series())
-        spreads["5Y-2Y"]   = yc.get("5Y",pd.Series())  - yc.get("2Y",pd.Series())
-        spreads["30Y-10Y"] = yc.get("30Y",pd.Series()) - yc.get("10Y",pd.Series())
+        # yc is in percentage points (e.g. 4.15 = 4.15%); *100 converts the spread to bps
+        spreads["10Y-2Y"]  = (yc.get("10Y",pd.Series()) - yc.get("2Y",pd.Series())) * 100
+        spreads["10Y-3M"]  = (yc.get("10Y",pd.Series()) - yc.get("3M",pd.Series())) * 100
+        spreads["5Y-2Y"]   = (yc.get("5Y",pd.Series())  - yc.get("2Y",pd.Series())) * 100
+        spreads["30Y-10Y"] = (yc.get("30Y",pd.Series()) - yc.get("10Y",pd.Series())) * 100
         spreads = spreads.dropna(how="all")
     fig_spreads = go.Figure()
     for col in spreads.columns:
         fig_spreads.add_trace(go.Scatter(x=spreads.index, y=spreads[col], name=col, mode="lines"))
     fig_spreads.add_hline(y=0, line_dash="dot", line_color="#555")
-    fig_spreads.update_layout(**base_layout("Treasury Yield Spreads (%)"))
+    fig_spreads.update_layout(**base_layout("Treasury Yield Spreads (bps)"))
+    fig_spreads.update_yaxes(ticksuffix=" bps")
     add_recessions(fig_spreads, recessions)
 
     # Real yields vs Breakevens
@@ -795,13 +803,13 @@ with tabs[3]:
     fig_real.update_layout(**base_layout("Real Yields (TIPS) vs Breakeven Inflation"))
     add_recessions(fig_real, recessions)
 
-    # Credit spreads
+    # Credit spreads - FRED reports these OAS series in percentage points, not bps
     fig_credit = go.Figure()
     if not ig_oas.empty:
-        fig_credit.add_trace(go.Scatter(x=ig_oas.index, y=ig_oas["IG OAS"],
+        fig_credit.add_trace(go.Scatter(x=ig_oas.index, y=ig_oas["IG OAS"] * 100,
                                         name="IG OAS", line=dict(color="#26a69a"), yaxis="y"))
     if not hy_oas.empty:
-        fig_credit.add_trace(go.Scatter(x=hy_oas.index, y=hy_oas["HY OAS"],
+        fig_credit.add_trace(go.Scatter(x=hy_oas.index, y=hy_oas["HY OAS"] * 100,
                                         name="HY OAS", line=dict(color="#ef5350"), yaxis="y2"))
     fig_credit.update_layout(**dual_axis_layout("Credit Spreads — IG & HY OAS (bps)", "IG OAS (bps)", "HY OAS (bps)"))
     add_recessions(fig_credit, recessions)
@@ -881,24 +889,27 @@ with tabs[3]:
         f"excl. intragovernmental & non-marketable debt"
     ))
 
-    # Bid-to-cover trend, filtered via a Streamlit control instead of an in-chart dropdown
-    bc_col1, bc_col2 = st.columns([1, 1])
-    with bc_col1:
-        bc_type = st.selectbox("Bid-to-cover: security type", sorted(auctions["security_type"].dropna().unique()),
-                                index=sorted(auctions["security_type"].dropna().unique()).index("Note")
-                                if "Note" in auctions["security_type"].values else 0, key="bc_type")
-    with bc_col2:
-        bc_years = st.select_slider("Lookback (years)", options=[1, 2, 3, 5, 10], value=5, key="bc_years")
+    # Bid-to-cover trend - reuses the global date range instead of its own lookback control.
+    # If END isn't today (user is looking at a past window), START may be an arbitrary date
+    # rather than a meaningful lookback, so fall back to a default 5-year window before END.
+    bc_type = st.selectbox("Bid-to-cover: security type", sorted(auctions["security_type"].dropna().unique()),
+                            index=sorted(auctions["security_type"].dropna().unique()).index("Note")
+                            if "Note" in auctions["security_type"].values else 0, key="bc_type")
 
-    bc_cutoff = pd.Timestamp.today().normalize() - pd.DateOffset(years=bc_years)
+    end_ts = pd.Timestamp(END)
+    if end_ts.normalize() == pd.Timestamp.today().normalize():
+        bc_cutoff = pd.Timestamp(START)
+    else:
+        bc_cutoff = end_ts - pd.DateOffset(years=5)
+
     bc_hist = auctions[(auctions["security_type"] == bc_type) & auctions["bid_to_cover_ratio"].notna() &
-                        (auctions["auction_date"] >= bc_cutoff)].sort_values("auction_date")
+                        (auctions["auction_date"] >= bc_cutoff) & (auctions["auction_date"] <= end_ts)].sort_values("auction_date")
     fig_btc = go.Figure()
     for term in sorted(bc_hist["security_term_week_year"].dropna().unique(), key=lambda t: _parse_tenor(t)):
         term_df = bc_hist[bc_hist["security_term_week_year"] == term]
         fig_btc.add_trace(go.Scatter(x=term_df["auction_date"], y=term_df["bid_to_cover_ratio"],
                                       mode="lines+markers", name=term, marker=dict(size=4)))
-    fig_btc.update_layout(**base_layout(f"Bid-to-Cover Ratio — {bc_type}s, Last {bc_years}Y"))
+    fig_btc.update_layout(**base_layout(f"Bid-to-Cover Ratio — {bc_type}s ({bc_cutoff.date()} to {end_ts.date()})"))
     add_recessions(fig_btc, recessions)
 
     treasury_charts = [
