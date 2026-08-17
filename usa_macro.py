@@ -9,10 +9,11 @@ from dotenv import load_dotenv
 import datetime
 import io
 import time
+import re
+import requests
 
 # ── Setup ─────────────────────────────────────────────────────────────────────
 load_dotenv()
-st.write(os.getenv("FRED_API_KEY"))
 fred = Fred(api_key=os.getenv("FRED_API_KEY"))
 
 st.set_page_config(page_title="US Macro Dashboard", layout="wide", page_icon="🇺🇸")
@@ -154,6 +155,90 @@ def render_two_col(charts):
                     if len(item) > 2 and item[2] is not None:
                         csv_download(item[2], item[0])
             i += 2
+
+# ── Treasury auctions (issuance / maturity / outstanding / bid-to-cover) ───────
+
+AUCTIONS_URL = "https://api.fiscaldata.treasury.gov/services/api/fiscal_service/v1/accounting/od/auctions_query"
+
+def _get_json(url, retries=5, backoff=2, timeout=30):
+    for attempt in range(retries):
+        try:
+            r = requests.get(url, timeout=timeout)
+            if r.status_code == 200 and r.text.strip():
+                return r.json()
+        except requests.exceptions.RequestException:
+            pass
+        time.sleep(backoff * (attempt + 1))
+    raise RuntimeError(f"Treasury API failed after {retries} retries: {url}")
+
+def _download_all_auctions():
+    data, result = [], _get_json(f"{AUCTIONS_URL}?filter=record_date:gt:1900-01-01&page[size]=10000")
+    data.extend(result["data"])
+    while result["links"]["next"] is not None:
+        # next link is "&page[number]=N..." with no leading "?" - must not be
+        # concatenated onto a bare url or it 404s past page 1.
+        result = _get_json(f'{AUCTIONS_URL}?{result["links"]["next"].lstrip("&")}')
+        data.extend(result["data"])
+        time.sleep(0.2)
+    return pd.DataFrame(data)
+
+@st.cache_data(ttl=21600)  # Treasury auction calendar only changes a few times/week
+def load_auctions_data():
+    df = _download_all_auctions()
+    for col in ["issue_date", "auction_date", "maturity_date"]:
+        df[col] = pd.to_datetime(df[col], errors="coerce")
+    for col in ["offering_amt", "total_accepted", "bid_to_cover_ratio"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
+
+def _parse_tenor(term):
+    num = re.findall(r"\d+\.?\d*", term)
+    unit = "W" if "Week" in term else "M" if "Month" in term else "Y"
+    return (float(num[0]) if num else 0), unit
+
+def _sort_by_tenor(df, col):
+    df = df.copy()
+    parsed = df[col].apply(_parse_tenor)
+    df["_wk"] = [v * (1 if u == "W" else 4 if u == "M" else 52) for v, u in parsed]
+    return df.sort_values("_wk").drop(columns="_wk")
+
+def get_upcoming_issuances(df, days_ahead):
+    today = pd.Timestamp.today().normalize()
+    cutoff = today + pd.Timedelta(days=days_ahead)
+    upcoming = df[(df["issue_date"] >= today) & (df["issue_date"] <= cutoff)].copy()
+    if upcoming.empty:
+        return upcoming, pd.DataFrame(columns=["security_term_week_year", "Total Issuance (Billion $)"])
+    upcoming["offering_amt_bil"] = upcoming["offering_amt"] / 1e9
+    upcoming = upcoming[["auction_date", "issue_date", "security_type", "security_term_week_year", "cusip", "offering_amt_bil"]].sort_values("issue_date")
+    summary = upcoming.groupby("security_term_week_year")["offering_amt_bil"].sum().reset_index()
+    summary = summary.rename(columns={"offering_amt_bil": "Total Issuance (Billion $)"})
+    return upcoming, _sort_by_tenor(summary, "security_term_week_year")
+
+def get_maturing_treasuries(df, days_ahead):
+    # Amount of previously-issued debt whose maturity_date falls in the same forward
+    # window - i.e. what needs to be rolled over/refinanced alongside new issuance.
+    today = pd.Timestamp.today().normalize()
+    cutoff = today + pd.Timedelta(days=days_ahead)
+    maturing = df[(df["maturity_date"] >= today) & (df["maturity_date"] <= cutoff)].copy()
+    if maturing.empty:
+        return maturing, pd.DataFrame(columns=["security_term_week_year", "Total Maturing (Billion $)"])
+    maturing["maturing_amt_bil"] = maturing["total_accepted"].fillna(maturing["offering_amt"]) / 1e9
+    maturing_out = maturing[["maturity_date", "security_type", "security_term_week_year", "cusip", "maturing_amt_bil"]].sort_values("maturity_date")
+    summary = maturing.groupby("security_term_week_year")["maturing_amt_bil"].sum().reset_index()
+    summary = summary.rename(columns={"maturing_amt_bil": "Total Maturing (Billion $)"})
+    return maturing_out, _sort_by_tenor(summary, "security_term_week_year")
+
+def get_outstanding_by_tenor(df):
+    # Still-alive securities (issued in the past, not yet matured) summed by original
+    # tenor - reopenings included, so it's the full marketable outstanding balance.
+    # Excludes intragovernmental holdings and non-marketable debt (savings bonds, SLGS),
+    # so this will run below Total Public Debt Outstanding - that's expected.
+    today = pd.Timestamp.today().normalize()
+    outstanding = df[(df["issue_date"] <= today) & (df["maturity_date"] > today)].copy()
+    outstanding["amt_bil"] = outstanding["total_accepted"].fillna(outstanding["offering_amt"]) / 1e9
+    summary = outstanding.groupby("security_term_week_year")["amt_bil"].sum().reset_index()
+    summary = summary.rename(columns={"amt_bil": "Outstanding (Billion $)"})
+    return outstanding, _sort_by_tenor(summary, "security_term_week_year")
 
 # ── Date range ────────────────────────────────────────────────────────────────
 st.title("🇺🇸 US Macro Dashboard")
@@ -732,6 +817,99 @@ with tabs[3]:
         ("Credit Spreads",    fig_credit, pd.concat([ig_oas, hy_oas], axis=1)),
     ]
     render_two_col(monetary_charts)
+
+    # ── Treasury issuance, maturity wall, outstanding & bid-to-cover ───────────
+    st.markdown('<div class="section-header">Treasury Issuance & Supply</div>', unsafe_allow_html=True)
+
+    days_ahead = st.select_slider("Forward-looking window (days)", options=[7, 30, 60, 90, 120], value=7, key="treasury_days_ahead")
+
+    with st.spinner("Loading Treasury auction data…"):
+        auctions = load_auctions_data()
+
+    upcoming, issuance_summary = get_upcoming_issuances(auctions, days_ahead)
+    maturing, maturity_summary = get_maturing_treasuries(auctions, days_ahead)
+    outstanding, outstanding_summary = get_outstanding_by_tenor(auctions)
+
+    combined = pd.merge(issuance_summary, maturity_summary, on="security_term_week_year", how="outer").fillna(0)
+    combined = _sort_by_tenor(combined, "security_term_week_year")
+    combined["Net New Supply (Billion $)"] = combined["Total Issuance (Billion $)"] - combined["Total Maturing (Billion $)"]
+    total_issuance, total_maturing = combined["Total Issuance (Billion $)"].sum(), combined["Total Maturing (Billion $)"].sum()
+
+    # Upcoming issuances table
+    fig_upcoming = go.Figure(go.Table(
+        columnwidth=[100, 100, 60, 70, 90, 90],
+        header=dict(values=["Auction Date", "Issue Date", "Type", "Term", "CUSIP", "Offering ($B)"],
+                    fill_color=PLOT_BG, font=dict(color="white", size=12), align="center", height=28),
+        cells=dict(values=[upcoming["auction_date"].dt.strftime("%Y-%m-%d"), upcoming["issue_date"].dt.strftime("%Y-%m-%d"),
+                            upcoming["security_type"], upcoming["security_term_week_year"], upcoming["cusip"],
+                            upcoming["offering_amt_bil"].round(2)],
+                   fill_color=PAPER_BG, font=dict(color="#e0e0e0", size=11), align="center")
+    ))
+    fig_upcoming.update_layout(**base_layout(f"Upcoming Issuances — Next {days_ahead}d (${total_issuance:,.1f}B)", height=420))
+
+    # Maturing treasuries table
+    fig_maturing = go.Figure(go.Table(
+        columnwidth=[110, 60, 70, 90, 90],
+        header=dict(values=["Maturity Date", "Type", "Term", "CUSIP", "Maturing ($B)"],
+                    fill_color=PLOT_BG, font=dict(color="white", size=12), align="center", height=28),
+        cells=dict(values=[maturing["maturity_date"].dt.strftime("%Y-%m-%d"), maturing["security_type"],
+                            maturing["security_term_week_year"], maturing["cusip"], maturing["maturing_amt_bil"].round(2)],
+                   fill_color=PAPER_BG, font=dict(color="#e0e0e0", size=11), align="center")
+    ))
+    fig_maturing.update_layout(**base_layout(f"Maturing Treasuries — Next {days_ahead}d (${total_maturing:,.1f}B)", height=420))
+
+    # Issuance vs. maturities by term
+    fig_supply_bar = go.Figure()
+    fig_supply_bar.add_trace(go.Bar(x=combined["security_term_week_year"], y=combined["Total Issuance (Billion $)"],
+                                     name="Issuance", marker_color="#26a69a"))
+    fig_supply_bar.add_trace(go.Bar(x=combined["security_term_week_year"], y=-combined["Total Maturing (Billion $)"],
+                                     name="Maturing", marker_color="#ef5350"))
+    fig_supply_bar.add_trace(go.Scatter(x=combined["security_term_week_year"], y=combined["Net New Supply (Billion $)"],
+                                         name="Net New Supply", mode="lines+markers", line=dict(color="#90a4d4", width=2)))
+    fig_supply_bar.update_layout(**base_layout(
+        f"Issuance vs. Maturities by Term (Net: ${total_issuance - total_maturing:,.1f}B)"))
+    fig_supply_bar.update_layout(barmode="relative")
+
+    # Outstanding by tenor
+    total_outstanding = outstanding_summary["Outstanding (Billion $)"].sum()
+    fig_outstanding = go.Figure(go.Bar(
+        x=outstanding_summary["security_term_week_year"], y=outstanding_summary["Outstanding (Billion $)"],
+        marker_color="#ab47bc", text=outstanding_summary["Outstanding (Billion $)"].round(0), textposition="outside"
+    ))
+    fig_outstanding.update_layout(**base_layout(
+        f"Outstanding Marketable Treasuries by Tenor (Total ${total_outstanding:,.0f}B) — "
+        f"excl. intragovernmental & non-marketable debt"
+    ))
+
+    # Bid-to-cover trend, filtered via a Streamlit control instead of an in-chart dropdown
+    bc_col1, bc_col2 = st.columns([1, 1])
+    with bc_col1:
+        bc_type = st.selectbox("Bid-to-cover: security type", sorted(auctions["security_type"].dropna().unique()),
+                                index=sorted(auctions["security_type"].dropna().unique()).index("Note")
+                                if "Note" in auctions["security_type"].values else 0, key="bc_type")
+    with bc_col2:
+        bc_years = st.select_slider("Lookback (years)", options=[1, 2, 3, 5, 10], value=5, key="bc_years")
+
+    bc_cutoff = pd.Timestamp.today().normalize() - pd.DateOffset(years=bc_years)
+    bc_hist = auctions[(auctions["security_type"] == bc_type) & auctions["bid_to_cover_ratio"].notna() &
+                        (auctions["auction_date"] >= bc_cutoff)].sort_values("auction_date")
+    fig_btc = go.Figure()
+    for term in sorted(bc_hist["security_term_week_year"].dropna().unique(), key=lambda t: _parse_tenor(t)):
+        term_df = bc_hist[bc_hist["security_term_week_year"] == term]
+        fig_btc.add_trace(go.Scatter(x=term_df["auction_date"], y=term_df["bid_to_cover_ratio"],
+                                      mode="lines+markers", name=term, marker=dict(size=4)))
+    fig_btc.update_layout(**base_layout(f"Bid-to-Cover Ratio — {bc_type}s, Last {bc_years}Y"))
+    add_recessions(fig_btc, recessions)
+
+    treasury_charts = [
+        ("Upcoming Issuances", fig_upcoming, upcoming),
+        ("Maturing Treasuries", fig_maturing, maturing),
+        ("Issuance vs Maturity", fig_supply_bar, combined),
+        ("Outstanding by Tenor", fig_outstanding, outstanding_summary),
+        ("Bid-to-Cover Trend", fig_btc, bc_hist[["auction_date", "security_term_week_year", "bid_to_cover_ratio"]]),
+    ]
+    render_two_col(treasury_charts)
+
 
 # ════════════════════════════════════════════════════════════════════════════════
 # TAB 5 — Leading Indicators
