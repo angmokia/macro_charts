@@ -265,11 +265,11 @@ def get_summary_metrics(end):
         "CPI YoY":      ("CPIAUCSL",   "pct_yoy",  "%"),
         "Core CPI YoY": ("CPILFESL",   "pct_yoy",  "%"),
         "PCE YoY":      ("PCEPI",      "pct_yoy",  "%"),
-        "Unemployment": ("UNRATE",     "level",     "%"),
+        "Unemp":        ("UNRATE",     "level",     "%"),
         "NFP MoM":      ("PAYEMS",     "diff_k",    "k"),
         "10Y Yield":    ("DGS10",      "level",     "%"),
         "2Y Yield":     ("DGS2",       "level",     "%"),
-        "10Y-2Y Spread":("T10Y2Y",     "level",    "bps"),
+        "2s10s":        ("T10Y2Y",     "level",    "bps"),
         "Fed Funds":    ("FEDFUNDS",   "level",     "%"),
         "M2 YoY":       ("M2SL",       "pct_yoy",  "%"),
     }
