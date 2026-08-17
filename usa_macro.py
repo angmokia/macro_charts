@@ -885,8 +885,8 @@ with tabs[3]:
         marker_color="#ab47bc", text=outstanding_summary["Outstanding (Billion $)"].round(0), textposition="outside"
     ))
     fig_outstanding.update_layout(**base_layout(
-        f"Outstanding Marketable Treasuries by Tenor (Total ${total_outstanding:,.0f}B) — "
-        f"excl. intragovernmental & non-marketable debt"
+        f"Outstanding Marketable Treasuries (Total ${total_outstanding:,.0f}B) — "
+        f"excl. intragvmt & non-marketable debt"
     ))
 
     # Bid-to-cover trend - reuses the global date range instead of its own lookback control.
