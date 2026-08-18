@@ -11,6 +11,9 @@ import io
 import time
 import re
 import requests
+import calendar
+import math
+import yfinance as yf
 
 # ── Setup ─────────────────────────────────────────────────────────────────────
 load_dotenv()
@@ -155,6 +158,102 @@ def render_two_col(charts):
                     if len(item) > 2 and item[2] is not None:
                         csv_download(item[2], item[0])
             i += 2
+
+# ── Fed Funds implied-probability (WIRP/FedWatch-style) ────────────────────────
+# Replicates CME's published Fed Funds futures methodology (not a scrape of CME's own
+# tool - there's no public API for that). ZQ = CME 30-Day Fed Funds futures; a contract's
+# price implies the average daily effective rate for its whole delivery month.
+#
+# Reading a meeting's OWN contract month requires solving a days-weighted split between
+# the pre- and post-meeting rate, which is numerically unstable whenever the meeting falls
+# close to month-end (a small "days after" denominator amplifies ordinary price noise into
+# huge implied-rate swings - confirmed by inspecting raw prices, which are smooth; the
+# instability is in that formula, not the data). Since FOMC meetings are always 5+ weeks
+# apart, the calendar month right after any meeting is essentially always meeting-free, so
+# its whole-month average price directly *is* the implied post-meeting rate - no division,
+# no instability, and each meeting is read independently instead of chained (so one bad
+# read can't cascade into every later meeting).
+
+FOMC_MONTH_CODE = {1:"F",2:"G",3:"H",4:"J",5:"K",6:"M",7:"N",8:"Q",9:"U",10:"V",11:"X",12:"Z"}
+RATE_STEP = 0.25  # standard FOMC move size, in percentage points (A.R.M. in Bloomberg's WIRP)
+
+# Every FOMC decision date (2nd day of each 2-day meeting) the Fed has published so far.
+# The Fed only confirms each date at the meeting immediately prior - there's no formula
+# for these, so this table has to be refreshed by hand from
+# https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm once today's date gets
+# within ~2 years of the last entry below (currently covers through Dec 2027).
+FOMC_ALL_DATES = [
+    "2025-01-29", "2025-03-19", "2025-05-07", "2025-06-18", "2025-07-30", "2025-09-17", "2025-10-29", "2025-12-10",
+    "2026-01-28", "2026-03-18", "2026-04-29", "2026-06-17", "2026-07-29", "2026-09-16", "2026-10-28", "2026-12-09",
+    "2027-01-27", "2027-03-17", "2027-04-28", "2027-06-09", "2027-07-28", "2027-09-15", "2027-10-27", "2027-12-08",
+]
+
+def _zq_ticker(date):
+    return f"ZQ{FOMC_MONTH_CODE[date.month]}{date.strftime('%y')}.CBT"
+
+def _month_after(date):
+    return pd.Timestamp(year=date.year + (date.month == 12), month=1 if date.month == 12 else date.month + 1, day=1)
+
+def _zq_price(ticker):
+    hist = yf.download(ticker, period="5d", progress=False, auto_adjust=False)
+    if hist.empty:
+        return None
+    return float(hist["Close"].iloc[-1].iloc[0] if hasattr(hist["Close"].iloc[-1], "iloc") else hist["Close"].iloc[-1])
+
+@st.cache_data(ttl=21600)
+def get_fedwatch_probabilities(years_ahead=2):
+    effr = fred.get_series("EFFR").dropna()
+    current_rate = float(effr.iloc[-1])
+
+    today = pd.Timestamp.today().normalize()
+    window_end = today + pd.DateOffset(years=years_ahead)
+    meetings = [pd.Timestamp(d) for d in FOMC_ALL_DATES if today <= pd.Timestamp(d) <= window_end]
+
+    implied = {}  # meeting -> implied post-meeting rate, computed independently per meeting
+    for meeting in meetings:
+        clean_month = _month_after(meeting)
+        price = _zq_price(_zq_ticker(clean_month))
+        if price is None:
+            # fall back to the meeting's own contract month (day-weighted solve) only if the
+            # cleaner next-month contract isn't available
+            price = _zq_price(_zq_ticker(meeting))
+            if price is None:
+                continue
+            days_in_month = calendar.monthrange(meeting.year, meeting.month)[1]
+            days_before, days_after = meeting.day, days_in_month - meeting.day
+            prior = implied.get(meetings[meetings.index(meeting) - 1], current_rate) if meeting != meetings[0] else current_rate
+            avg_rate = 100 - price
+            implied[meeting] = avg_rate if days_after <= 0 else (avg_rate * days_in_month - days_before * prior) / days_after
+        else:
+            implied[meeting] = 100 - price
+
+    rows = []
+    prior_rate = current_rate
+    for meeting in meetings:
+        if meeting not in implied:
+            continue
+        implied_rate = implied[meeting]
+
+        # This-meeting-only move, relative to the previous meeting's implied rate
+        # (Bloomberg's "%Hike/Cut") ...
+        meeting_delta_bps = (implied_rate - prior_rate) * 100
+        step_bps = int(RATE_STEP * 100)
+        lower = math.floor(meeting_delta_bps / step_bps) * step_bps
+        upper = lower + step_bps
+        frac_upper = 0.0 if upper == lower else min(max((meeting_delta_bps - lower) / step_bps, 0), 1)
+        probs = {lower: 1 - frac_upper} if frac_upper == 0 else {lower: 1 - frac_upper, upper: frac_upper}
+
+        # ... vs. cumulative move from today (Bloomberg's "Imp. Rate Δ" / "#Hikes/Cuts")
+        cum_delta = implied_rate - current_rate
+
+        rows.append({
+            "Meeting": meeting.strftime("%Y-%m-%d"), "Implied Rate": implied_rate,
+            "Imp. Rate Delta": cum_delta, "Hikes/Cuts": cum_delta / RATE_STEP,
+            "This-Meeting Move (bps)": meeting_delta_bps, "Probabilities": probs,
+        })
+        prior_rate = implied_rate  # this meeting's own (independently-read) rate anchors the next delta
+
+    return pd.DataFrame(rows), current_rate
 
 # ── Treasury auctions (issuance / maturity / outstanding / bid-to-cover) ───────
 
@@ -825,6 +924,45 @@ with tabs[3]:
         ("Credit Spreads",    fig_credit, pd.concat([ig_oas, hy_oas], axis=1)),
     ]
     render_two_col(monetary_charts)
+
+    # ── Fed Funds implied-probability (WIRP/FedWatch-style) ─────────────────────
+    st.markdown('<div class="section-header">Fed Funds Implied Probabilities</div>', unsafe_allow_html=True)
+    with st.spinner("Loading Fed Funds futures…"):
+        fedwatch_df, current_effr = get_fedwatch_probabilities(years_ahead=2)
+
+    if not fedwatch_df.empty:
+        st.markdown(f"**Current EFFR:** {current_effr:.2f}%  |  **Meetings shown:** next {len(fedwatch_df)} (through {fedwatch_df['Meeting'].iloc[-1]})")
+
+        bar_colors = ["#26a69a" if r > current_effr else "#ef5350" if r < current_effr else "#8a94a6"
+                      for r in fedwatch_df["Implied Rate"]]
+        fig_fedwatch = go.Figure(go.Bar(
+            x=fedwatch_df["Meeting"], y=fedwatch_df["Implied Rate"], marker_color=bar_colors,
+            text=fedwatch_df["Implied Rate"].round(3), textposition="outside"
+        ))
+        fig_fedwatch.add_hline(y=current_effr, line_dash="dash", line_color="#e0e0e0",
+                                annotation_text=f"Current EFFR ({current_effr:.2f}%)", annotation_position="top left")
+        fig_fedwatch.update_layout(**base_layout("Market-Implied Fed Funds Rate by FOMC Meeting"))
+        fig_fedwatch.update_yaxes(ticksuffix="%", title="Implied Rate")
+        fig_fedwatch.update_xaxes(title="FOMC Meeting Date")
+        st.plotly_chart(fig_fedwatch, use_container_width=True)
+
+        # Detail table, Bloomberg WIRP-style: implied rate path + cumulative and
+        # this-meeting-only move sizes.
+        detail = fedwatch_df[["Meeting", "Implied Rate", "Imp. Rate Delta", "Hikes/Cuts", "This-Meeting Move (bps)"]].copy()
+        detail["Implied Rate"] = detail["Implied Rate"].round(3)
+        detail["Imp. Rate Delta"] = detail["Imp. Rate Delta"].round(3)
+        detail["Hikes/Cuts"] = detail["Hikes/Cuts"].round(2)
+        detail["%Hike/Cut (this meeting)"] = (detail["This-Meeting Move (bps)"] / (RATE_STEP * 100) * 100).round(1)
+        detail = detail.drop(columns="This-Meeting Move (bps)")
+        detail = detail.rename(columns={"Imp. Rate Delta": "Imp. Rate Δ (cum.)", "Hikes/Cuts": "#Hikes/Cuts (cum.)"})
+        st.dataframe(detail, use_container_width=True, hide_index=True)
+        st.caption("A.R.M. (step size): 25bps. \"#Hikes/Cuts (cum.)\" and \"Imp. Rate Δ (cum.)\" are relative to today's "
+                   "EFFR; \"%Hike/Cut (this meeting)\" is the incremental move priced in at that specific meeting only "
+                   "(chained off the previous meeting's implied rate) - the same simplified 2-outcome-per-meeting view "
+                   "as the chart above, not CME's full joint multi-meeting solve.")
+        csv_download(detail, "fedwatch_probabilities")
+    else:
+        st.info("No FOMC meetings in the selected window, or Fed Funds futures data unavailable.")
 
     # ── Treasury issuance, maturity wall, outstanding & bid-to-cover ───────────
     st.markdown('<div class="section-header">Treasury Issuance & Supply</div>', unsafe_allow_html=True)
