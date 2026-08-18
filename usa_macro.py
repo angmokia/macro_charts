@@ -177,16 +177,51 @@ def render_two_col(charts):
 FOMC_MONTH_CODE = {1:"F",2:"G",3:"H",4:"J",5:"K",6:"M",7:"N",8:"Q",9:"U",10:"V",11:"X",12:"Z"}
 RATE_STEP = 0.25  # standard FOMC move size, in percentage points (A.R.M. in Bloomberg's WIRP)
 
-# Every FOMC decision date (2nd day of each 2-day meeting) the Fed has published so far.
-# The Fed only confirms each date at the meeting immediately prior - there's no formula
-# for these, so this table has to be refreshed by hand from
-# https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm once today's date gets
-# within ~2 years of the last entry below (currently covers through Dec 2027).
-FOMC_ALL_DATES = [
-    "2025-01-29", "2025-03-19", "2025-05-07", "2025-06-18", "2025-07-30", "2025-09-17", "2025-10-29", "2025-12-10",
-    "2026-01-28", "2026-03-18", "2026-04-29", "2026-06-17", "2026-07-29", "2026-09-16", "2026-10-28", "2026-12-09",
+# FOMC decision dates (2nd day of each 2-day meeting). The Fed only confirms each date at
+# the meeting immediately prior - there's no formula for these, so *something* has to be
+# the source of truth. The Fed publishes no calendar API/feed, only this HTML page, so
+# FOMC_DATES_FALLBACK below is a seed used only if the live fetch fails (network error, or
+# the page's markup changes enough to break the parser) - refresh it by hand from
+# https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm every year or two.
+FOMC_CALENDAR_URL = "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm"
+FOMC_MONTH_NUM = {"January":1,"February":2,"March":3,"April":4,"May":5,"June":6,"July":7,
+                   "August":8,"September":9,"October":10,"November":11,"December":12}
+FOMC_DATES_FALLBACK = [
+    "2026-09-16", "2026-10-28", "2026-12-09",
     "2027-01-27", "2027-03-17", "2027-04-28", "2027-06-09", "2027-07-28", "2027-09-15", "2027-10-27", "2027-12-08",
 ]
+
+@st.cache_data(ttl=604800)  # the Fed's calendar changes at most a few times a year
+def get_fomc_dates():
+    """Scrape the Fed's own FOMC calendar page. Falls back to FOMC_DATES_FALLBACK on any
+    failure (network error, empty/garbled result) so a live-site hiccup can't take down
+    the whole section."""
+    try:
+        resp = requests.get(FOMC_CALENDAR_URL, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+        resp.raise_for_status()
+        html = resp.text
+        pair_re = re.compile(
+            r'fomc-meeting__month[^>]*><strong>(\w+)</strong></div>\s*'
+            r'<div class="fomc-meeting__date[^"]*">([\d\-\*]+)<'
+        )
+        dates = []
+        for year_str, panel_html in zip(*[iter(re.split(r'<h4><a id="\d+">(\d{4}) FOMC Meetings</a></h4>', html)[1:])] * 2):
+            year = int(year_str)
+            for month_name, day_range in pair_re.findall(panel_html):
+                days = re.findall(r'\d+', day_range)
+                month_num = FOMC_MONTH_NUM.get(month_name)
+                if not days or not month_num:
+                    continue
+                decision_day = int(days[-1])
+                if decision_day > calendar.monthrange(year, month_num)[1]:
+                    continue  # cross-month meeting (e.g. "Jan 31-Feb 1") - skip rather than misattribute
+                dates.append(f"{year:04d}-{month_num:02d}-{decision_day:02d}")
+        dates = sorted(set(dates))
+        if len(dates) < 10:  # sanity floor - a near-empty result means the parser broke
+            raise ValueError(f"only parsed {len(dates)} meetings, expected 10+")
+        return dates
+    except Exception:
+        return FOMC_DATES_FALLBACK
 
 def _zq_ticker(date):
     return f"ZQ{FOMC_MONTH_CODE[date.month]}{date.strftime('%y')}.CBT"
@@ -217,7 +252,7 @@ def get_fedwatch_history(years_ahead=2):
     # i.e. what the market was pricing for these same meetings, as of each snapshot date.
     today = pd.Timestamp.today().normalize()
     window_end = today + pd.DateOffset(years=years_ahead)
-    meetings = [pd.Timestamp(d) for d in FOMC_ALL_DATES if today <= pd.Timestamp(d) <= window_end]
+    meetings = [pd.Timestamp(d) for d in get_fomc_dates() if today <= pd.Timestamp(d) <= window_end]
 
     rows = []
     for meeting in meetings:
@@ -237,7 +272,7 @@ def get_fedwatch_probabilities(years_ahead=2):
 
     today = pd.Timestamp.today().normalize()
     window_end = today + pd.DateOffset(years=years_ahead)
-    meetings = [pd.Timestamp(d) for d in FOMC_ALL_DATES if today <= pd.Timestamp(d) <= window_end]
+    meetings = [pd.Timestamp(d) for d in get_fomc_dates() if today <= pd.Timestamp(d) <= window_end]
 
     implied = {}  # meeting -> implied post-meeting rate, computed independently per meeting
     for meeting in meetings:
@@ -451,11 +486,11 @@ st.markdown("<br>", unsafe_allow_html=True)
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 tabs = st.tabs([
-    "📈 Inflation & Consumer",
-    "👷 Labour Market",
-    "🏠 Housing",
-    "💵 Monetary & Rates",
-    "🔭 Leading Indicators",
+    "Prices",
+    "Labour Market",
+    "Housing",
+    "Treasury & Rates",
+    "Indicators",
 ])
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -971,7 +1006,7 @@ with tabs[3]:
         ))
         fig_fedwatch.add_hline(y=current_effr, line_dash="dash", line_color="#e0e0e0",
                                 annotation_text=f"Current EFFR ({current_effr:.2f}%)", annotation_position="top left")
-        fig_fedwatch.update_layout(**base_layout("Market-Implied Fed Funds Rate by FOMC Meeting"))
+        fig_fedwatch.update_layout(**base_layout("Market-Implied Fed Funds - FOMC Dates"))
         fig_fedwatch.update_yaxes(ticksuffix="%", title="Implied Rate")
         fig_fedwatch.update_xaxes(title="FOMC Meeting Date")
 
@@ -990,7 +1025,7 @@ with tabs[3]:
                            dash="solid" if label == "Today" else "dash"),
             ))
         fig_fedwatch_hist.update_layout(**base_layout("Market-Implied Fed Funds Rate — Snapshots"))
-        fig_fedwatch_hist.update_xaxes(title="FOMC Meeting Date")
+        fig_fedwatch_hist.update_xaxes(title="Dates")
         fig_fedwatch_hist.update_yaxes(title="Implied Rate", ticksuffix="%")
 
         render_two_col([
