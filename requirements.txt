@@ -1,6 +1,8 @@
-streamlit
-fredapi
-plotly
-pandas
-numpy
-python-dotenv
+streamlit>=1.38
+fredapi>=0.5
+plotly>=5.24
+pandas>=2.1
+numpy>=1.26
+python-dotenv>=1.0
+requests>=2.31
+yfinance>=0.2.40
