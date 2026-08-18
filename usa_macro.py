@@ -200,6 +200,36 @@ def _zq_price(ticker):
         return None
     return float(hist["Close"].iloc[-1].iloc[0] if hasattr(hist["Close"].iloc[-1], "iloc") else hist["Close"].iloc[-1])
 
+def _zq_close_series(ticker, period="4mo"):
+    hist = yf.download(ticker, period=period, progress=False, auto_adjust=False)
+    if hist.empty:
+        return None
+    close = hist["Close"]
+    return close.iloc[:, 0] if hasattr(close, "columns") else close
+
+SNAPSHOT_OFFSETS = {"Today": 0, "1W Ago": -5, "1M Ago": -21, "3M Ago": -63}
+SNAPSHOT_COLORS = {"Today": "cyan", "1W Ago": "orange", "1M Ago": "green", "3M Ago": "magenta"}
+
+@st.cache_data(ttl=21600)
+def get_fedwatch_history(years_ahead=2):
+    # Same meetings/clean-month read as get_fedwatch_probabilities, but pulls each
+    # contract's own price history to snapshot the implied curve at past points in time -
+    # i.e. what the market was pricing for these same meetings, as of each snapshot date.
+    today = pd.Timestamp.today().normalize()
+    window_end = today + pd.DateOffset(years=years_ahead)
+    meetings = [pd.Timestamp(d) for d in FOMC_ALL_DATES if today <= pd.Timestamp(d) <= window_end]
+
+    rows = []
+    for meeting in meetings:
+        series = _zq_close_series(_zq_ticker(_month_after(meeting)))
+        row = {"Meeting": meeting.strftime("%Y-%m-%d")}
+        if series is not None:
+            for label, offset in SNAPSHOT_OFFSETS.items():
+                idx = len(series) - 1 + offset
+                row[label] = 100 - float(series.iloc[idx]) if idx >= 0 else None
+        rows.append(row)
+    return pd.DataFrame(rows)
+
 @st.cache_data(ttl=21600)
 def get_fedwatch_probabilities(years_ahead=2):
     effr = fred.get_series("EFFR").dropna()
@@ -944,7 +974,29 @@ with tabs[3]:
         fig_fedwatch.update_layout(**base_layout("Market-Implied Fed Funds Rate by FOMC Meeting"))
         fig_fedwatch.update_yaxes(ticksuffix="%", title="Implied Rate")
         fig_fedwatch.update_xaxes(title="FOMC Meeting Date")
-        st.plotly_chart(fig_fedwatch, use_container_width=True)
+
+        # How the implied path for these same meetings has shifted over time - same
+        # Today/1W/1M/3M snapshot pattern as the Treasury Yield Curve Snapshots chart.
+        with st.spinner("Loading historical Fed Funds futures…"):
+            fedwatch_hist_df = get_fedwatch_history(years_ahead=2)
+        fig_fedwatch_hist = go.Figure()
+        for label in SNAPSHOT_OFFSETS:
+            if label not in fedwatch_hist_df.columns:
+                continue
+            fig_fedwatch_hist.add_trace(go.Scatter(
+                x=fedwatch_hist_df["Meeting"], y=fedwatch_hist_df[label],
+                mode="lines+markers", name=label,
+                line=dict(color=SNAPSHOT_COLORS[label], width=2 if label == "Today" else 1,
+                           dash="solid" if label == "Today" else "dash"),
+            ))
+        fig_fedwatch_hist.update_layout(**base_layout("Market-Implied Fed Funds Rate — Snapshots"))
+        fig_fedwatch_hist.update_xaxes(title="FOMC Meeting Date")
+        fig_fedwatch_hist.update_yaxes(title="Implied Rate", ticksuffix="%")
+
+        render_two_col([
+            ("Market-Implied Fed Funds Rate", fig_fedwatch, fedwatch_df[["Meeting", "Implied Rate"]]),
+            ("Market-Implied Fed Funds Rate Snapshots", fig_fedwatch_hist, fedwatch_hist_df),
+        ])
 
         # Detail table, Bloomberg WIRP-style: implied rate path + cumulative and
         # this-meeting-only move sizes.
