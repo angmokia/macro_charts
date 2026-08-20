@@ -346,6 +346,23 @@ def _download_all_auctions():
         time.sleep(0.2)
     return pd.DataFrame(data)
 
+def _normalize_tenor_bucket(row):
+    # Treasury's security_term_week_year is the REMAINING maturity as of each individual
+    # auction event, not the security's true original tenor - a 26-week bill reopened with
+    # 4 weeks left gets labeled "4-Week", and a 10-year note reopened with 9 years left gets
+    # labeled "9-Year", fragmenting one program's outstanding total across multiple buckets.
+    # original_security_term is the correct field, but has its own two quirks: Cash
+    # Management Bills carry an arbitrary day-count original term (e.g. "119-Day" - real,
+    # tactical, irregular issuances, not a disguised standard week-tenor), and some older
+    # note/bond records carry sub-year precision (e.g. "20-Year 1-Month"). Normalize both.
+    term = row["original_security_term"]
+    if not isinstance(term, str) or term in ("null", ""):
+        return row["security_term_week_year"]  # fallback for the small number of true nulls
+    if "Day" in term:
+        return "CMB"
+    m = re.match(r"(\d+)-Year", term)
+    return f"{m.group(1)}-Year" if m else term  # Week-based bills pass through unchanged
+
 @st.cache_data(ttl=21600)  # Treasury auction calendar only changes a few times/week
 def load_auctions_data():
     df = _download_all_auctions()
@@ -353,6 +370,8 @@ def load_auctions_data():
         df[col] = pd.to_datetime(df[col], errors="coerce")
     for col in ["offering_amt", "total_accepted", "bid_to_cover_ratio"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
+    # Bucket by true original tenor everywhere downstream, not remaining-maturity-at-auction.
+    df["security_term_week_year"] = df.apply(_normalize_tenor_bucket, axis=1)
     return df
 
 def _parse_tenor(term):
@@ -460,6 +479,64 @@ def get_summary_metrics(end):
             results[name] = (None, None, "")
     return results
 
+# ── Economic calendar ───────────────────────────────────────────────────────────
+# Release SCHEDULE dates come from FRED's release/dates endpoint (same API key, no
+# scraping) - it tracks the official publication calendar for each release, including
+# future not-yet-happened dates when include_release_dates_with_no_data=true is set.
+# There's no free source for economist CONSENSUS estimates (that's commercial data -
+# Bloomberg/Refinitiv/TradingEconomics paid tier), so this shows next date + previous
+# actual, not a forecast-vs-actual surprise calendar.
+ECONOMIC_RELEASES = [
+    # (Event name, FRED release_id, FRED series_id, calc type, unit)
+    ("Nonfarm Payrolls",       50,  "PAYEMS",   "diff_k",  "k"),
+    ("Initial Jobless Claims", 180, "ICSA",     "level",   ""),
+    ("JOLTS Job Openings",     192, "JTSJOL",   "level",   "k"),
+    ("Consumer Price Index",   10,  "CPIAUCSL", "pct_mom", "%"),
+    ("Producer Price Index",   46,  "PPIACO",   "pct_mom", "%"),
+    ("PCE Price Index",        54,  "PCEPI",    "pct_mom", "%"),
+    ("Retail Sales",           9,   "RSAFS",    "pct_mom", "%"),
+    ("GDP (QoQ SAAR)",         53,  "GDPC1",    "qoq_saar","%"),
+    ("Housing Starts",         27,  "HOUST",    "level",   "k"),
+]
+
+@st.cache_data(ttl=86400)  # release schedules only get revised a few times a year
+def get_next_release_date(release_id):
+    try:
+        url = (f"https://api.stlouisfed.org/fred/release/dates?release_id={release_id}"
+               f"&include_release_dates_with_no_data=true&sort_order=desc&limit=10"
+               f"&file_type=json&api_key={os.getenv('FRED_API_KEY')}")
+        r = requests.get(url, timeout=15)
+        r.raise_for_status()
+        today_str = pd.Timestamp.today().normalize().strftime("%Y-%m-%d")
+        future = sorted(d["date"] for d in r.json().get("release_dates", []) if d["date"] >= today_str)
+        return pd.Timestamp(future[0]) if future else None
+    except Exception:
+        return None
+
+@st.cache_data(ttl=21600)
+def get_economic_release_calendar():
+    rows = []
+    for name, release_id, series_id, calc, unit in ECONOMIC_RELEASES:
+        next_date = get_next_release_date(release_id)
+        if next_date is None:
+            continue
+        try:
+            s = fred.get_series(series_id).dropna()
+            latest, prev = float(s.iloc[-1]), float(s.iloc[-2])
+            if calc == "diff_k":
+                prev_val = s.diff().iloc[-1]
+            elif calc == "pct_mom":
+                prev_val = s.pct_change().iloc[-1] * 100
+            elif calc == "qoq_saar":
+                prev_val = ((latest / prev) ** 4 - 1) * 100
+            else:
+                prev_val = latest
+            detail = f"Prev: {prev_val:+,.1f}{unit} ({s.index[-1].strftime('%b %Y')})"
+        except Exception:
+            detail = ""
+        rows.append({"Date": next_date, "Event": name, "Type": "Economic Release", "Detail": detail})
+    return pd.DataFrame(rows)
+
 with st.spinner("Loading summary metrics…"):
     summary = get_summary_metrics(END)
 
@@ -491,6 +568,7 @@ tabs = st.tabs([
     "Housing",
     "Treasury & Rates",
     "Indicators",
+    "Economic Calendar",
 ])
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -1230,6 +1308,57 @@ with tabs[4]:
         ("Regional Fed Surveys", fig_regional, pd.concat([philly_fed, empire_state], axis=1)),
     ]
     render_two_col(leading_charts)
+
+# ════════════════════════════════════════════════════════════════════════════════
+# TAB 6 — Economic Calendar
+# ════════════════════════════════════════════════════════════════════════════════
+with tabs[5]:
+    st.header("Economic Calendar")
+    st.caption("Next scheduled release dates (FRED) + upcoming FOMC meetings + upcoming Treasury auctions. "
+               "No consensus/forecast column - that's commercial data with no free legitimate source; "
+               "\"Detail\" shows the previous actual print instead.")
+
+    days_ahead = st.select_slider("Forward-looking window (days)", options=[7, 14, 30, 60], value=30, key="econ_cal_days")
+    today = pd.Timestamp.today().normalize()
+    cutoff = today + pd.Timedelta(days=days_ahead)
+
+    with st.spinner("Loading economic release calendar…"):
+        econ_df = get_economic_release_calendar()
+    econ_df = econ_df[(econ_df["Date"] >= today) & (econ_df["Date"] <= cutoff)]
+
+    with st.spinner("Loading FOMC meeting dates…"):
+        fomc_dates = [pd.Timestamp(d) for d in get_fomc_dates()]
+    fomc_df = pd.DataFrame([
+        {"Date": d, "Event": "FOMC Meeting", "Type": "FOMC", "Detail": ""}
+        for d in fomc_dates if today <= d <= cutoff
+    ])
+
+    with st.spinner("Loading Treasury auction calendar…"):
+        auctions_all = load_auctions_data()
+    # Filter on auction_date (the actual bidding day - the real "event") rather than
+    # issue_date (settlement, a few days later): get_upcoming_issuances filters on
+    # issue_date, which can leave auction_date in the past for a "today onward" calendar.
+    upcoming_auctions = auctions_all[(auctions_all["auction_date"] >= today) & (auctions_all["auction_date"] <= cutoff)].copy()
+    upcoming_auctions["offering_amt_bil"] = upcoming_auctions["offering_amt"] / 1e9
+    auction_df = pd.DataFrame([
+        {"Date": row["auction_date"], "Event": f"{row['security_term_week_year']} {row['security_type']} Auction",
+         "Type": "Treasury Auction", "Detail": f"${row['offering_amt_bil']:.1f}B"}
+        for _, row in upcoming_auctions.iterrows()
+    ])
+
+    calendar_df = pd.concat([econ_df, fomc_df, auction_df], ignore_index=True)
+    if not calendar_df.empty:
+        calendar_df = calendar_df.sort_values("Date")
+        type_counts = calendar_df["Type"].value_counts()
+        st.markdown(f"**{len(calendar_df)} events in the next {days_ahead} days** — "
+                    + " | ".join(f"{t}: {c}" for t, c in type_counts.items()))
+
+        display_df = calendar_df.copy()
+        display_df["Date"] = display_df["Date"].dt.strftime("%Y-%m-%d (%a)")
+        st.dataframe(display_df[["Date", "Event", "Type", "Detail"]], use_container_width=True, hide_index=True, height=600)
+        csv_download(display_df, "economic_calendar")
+    else:
+        st.info(f"No tracked releases, FOMC meetings, or Treasury auctions in the next {days_ahead} days.")
 
 st.markdown("---")
 st.caption("Data: FRED (Federal Reserve Bank of St. Louis) · Shaded areas = NBER recessions · Refresh rate: 1hr cache")
