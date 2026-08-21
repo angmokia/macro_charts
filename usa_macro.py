@@ -1358,7 +1358,6 @@ with tabs[3]:
             ))
     fig_outstanding_maturity.update_layout(**dual_axis_layout(
         f"Outstanding Marketable Treasuries by Remaining Maturity (Total ${total_outstanding_maturity:,.0f}B) "
-        f"— nearest-tenor ladder (3M–30Y)",
         "Outstanding (Billion $)", "Yield (%)"))
     fig_outstanding_maturity.update_layout(yaxis2=dict(ticksuffix="%"))
 
