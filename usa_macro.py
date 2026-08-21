@@ -122,15 +122,15 @@ def mom_yoy(df: pd.DataFrame, col: str) -> pd.DataFrame:
     if df.empty or col not in df.columns:
         return pd.DataFrame(columns=[f"{col} MoM %", f"{col} YoY %"])
     out = pd.DataFrame(index=df.index)
-    out[f"{col} MoM %"] = df[col].pct_change() * 100
-    out[f"{col} YoY %"] = df[col].pct_change(12) * 100
+    out[f"{col} MoM %"] = (df[col].pct_change() * 100).round(3)
+    out[f"{col} YoY %"] = (df[col].pct_change(12) * 100).round(3)
     return out
 
 def nfp_change(df: pd.DataFrame, col: str) -> pd.DataFrame:
     if df.empty or col not in df.columns:
         return pd.DataFrame(columns=[f"{col} MoM Change (k)"])
     out = pd.DataFrame(index=df.index)
-    out[f"{col} MoM Change (k)"] = df[col].diff()
+    out[f"{col} MoM Change (k)"] = df[col].diff().round(3)
     return out
 
 def csv_download(df: pd.DataFrame, label: str):
@@ -346,6 +346,19 @@ def _download_all_auctions():
         time.sleep(0.2)
     return pd.DataFrame(data)
 
+# Standard Treasury note/bond original-issuance tenors (years) - 2/3/5/7/10-Year Notes and
+# 20/30-Year Bonds are the current program; 4-Year existed as a standalone historical
+# program (42 real records, distinct from the 2/3/5/7/10 cycle). Used below to snap
+# sub-year-precision original_security_term values (e.g. "29-Year 9-Month") to the actual
+# program they belong to.
+NOTE_BOND_TENORS = [2, 3, 4, 5, 7, 10, 20, 30]
+
+def _parse_year_month(term):
+    m = re.match(r"(\d+)-Year(?:\s+(\d+)-Month)?", term)
+    if not m:
+        return None
+    return int(m.group(1)) + (int(m.group(2)) / 12 if m.group(2) else 0)
+
 def _normalize_tenor_bucket(row):
     # Treasury's security_term_week_year is the REMAINING maturity as of each individual
     # auction event, not the security's true original tenor - a 26-week bill reopened with
@@ -353,15 +366,27 @@ def _normalize_tenor_bucket(row):
     # labeled "9-Year", fragmenting one program's outstanding total across multiple buckets.
     # original_security_term is the correct field, but has its own two quirks: Cash
     # Management Bills carry an arbitrary day-count original term (e.g. "119-Day" - real,
-    # tactical, irregular issuances, not a disguised standard week-tenor), and some older
-    # note/bond records carry sub-year precision (e.g. "20-Year 1-Month"). Normalize both.
+    # tactical, irregular issuances, not a disguised standard week-tenor), and month-precision
+    # entries (e.g. "29-Year 9-Month", "6-Year 11-Month") are NOT a distinct product - verified
+    # live against the Treasury API: the same CUSIP carries the identical original_security_term
+    # across every one of its reopenings, so this is a fixed attribute of the security (a
+    # genuine 29y9m issue-to-maturity span from Treasury's fixed quarterly refunding calendar),
+    # not an auction-event artifact. Truncating to the leading integer (the old approach) split
+    # these into spurious standalone buckets - e.g. "29-Year 9-Month" (29.75y) got its own
+    # "29-Year" bucket instead of merging into the 30-Year program it actually belongs to.
+    # Snapping to the nearest real Treasury program fixes this correctly.
     term = row["original_security_term"]
     if not isinstance(term, str) or term in ("null", ""):
         return row["security_term_week_year"]  # fallback for the small number of true nulls
     if "Day" in term:
         return "CMB"
-    m = re.match(r"(\d+)-Year", term)
-    return f"{m.group(1)}-Year" if m else term  # Week-based bills pass through unchanged
+    if "Week" in term:
+        return term  # clean week-denominated bills (8/13/17/26/52-Week) - no drift observed
+    decimal_years = _parse_year_month(term)
+    if decimal_years is None:
+        return term
+    nearest = min(NOTE_BOND_TENORS, key=lambda t: abs(t - decimal_years))
+    return f"{nearest}-Year"
 
 @st.cache_data(ttl=21600)  # Treasury auction calendar only changes a few times/week
 def load_auctions_data():
@@ -411,17 +436,65 @@ def get_maturing_treasuries(df, days_ahead):
     summary = summary.rename(columns={"maturing_amt_bil": "Total Maturing (Billion $)"})
     return maturing_out, _sort_by_tenor(summary, "security_term_week_year")
 
-def get_outstanding_by_tenor(df):
-    # Still-alive securities (issued in the past, not yet matured) summed by original
-    # tenor - reopenings included, so it's the full marketable outstanding balance.
-    # Excludes intragovernmental holdings and non-marketable debt (savings bonds, SLGS),
-    # so this will run below Total Public Debt Outstanding - that's expected.
+# Remaining-maturity ladder: buckets every currently-outstanding security by years left to
+# maturity (maturity_date - today), snapped to the NEAREST tenor on this ladder - answers "how
+# much comes due around year X from now" rather than "how much was originally issued as a
+# 10-Year". Its finer 20-30Y granularity (22.5Y/25Y/27.5Y) is exactly what original-tenor
+# bucketing can't show, since Treasury has never issued a standalone 22.5/25/27.5-Year original
+# tenor - those buckets only make sense as remaining-maturity midpoints.
+MATURITY_LADDER = {
+    "3M": 0.25, "6M": 0.5, "12M": 1, "2Y": 2, "3Y": 3, "4Y": 4, "5Y": 5, "7Y": 7,
+    "10Y": 10, "12Y": 12, "15Y": 15, "20Y": 20, "22.5Y": 22.5, "25Y": 25, "27.5Y": 27.5, "30Y": 30,
+}
+_MATURITY_LADDER_ITEMS = list(MATURITY_LADDER.items())
+_MATURITY_LADDER_ORDER = {label: i for i, label in enumerate(MATURITY_LADDER)}
+
+def _nearest_maturity_bucket(years_left):
+    return min(_MATURITY_LADDER_ITEMS, key=lambda kv: abs(kv[1] - years_left))[0]
+
+def get_outstanding_by_remaining_maturity(df):
     today = pd.Timestamp.today().normalize()
     outstanding = df[(df["issue_date"] <= today) & (df["maturity_date"] > today)].copy()
+    outstanding["years_to_maturity"] = (outstanding["maturity_date"] - today).dt.days / 365.25
     outstanding["amt_bil"] = outstanding["total_accepted"].fillna(outstanding["offering_amt"]) / 1e9
-    summary = outstanding.groupby("security_term_week_year")["amt_bil"].sum().reset_index()
+    outstanding["maturity_bucket"] = outstanding["years_to_maturity"].apply(_nearest_maturity_bucket)
+    summary = outstanding.groupby("maturity_bucket")["amt_bil"].sum().reset_index()
     summary = summary.rename(columns={"amt_bil": "Outstanding (Billion $)"})
-    return outstanding, _sort_by_tenor(summary, "security_term_week_year")
+    summary = summary.iloc[summary["maturity_bucket"].map(_MATURITY_LADDER_ORDER).argsort()]
+    return outstanding, summary
+
+def get_upcoming_issuance_by_maturity_bucket(df, days_ahead):
+    # Same remaining-maturity-ladder bucketing as get_outstanding_by_remaining_maturity, applied
+    # to not-yet-issued securities - so a 17-Week bill (maturity ~17 weeks from today, since
+    # issue_date falls within the forward window) lands in the 3M bucket, a 26-Week bill in 6M,
+    # etc. Uses maturity_date - today() (not issue_date), same reference point as the
+    # outstanding side, so the two are directly stackable/addable bucket-for-bucket.
+    today = pd.Timestamp.today().normalize()
+    cutoff = today + pd.Timedelta(days=days_ahead)
+    upcoming = df[(df["issue_date"] >= today) & (df["issue_date"] <= cutoff)].copy()
+    if upcoming.empty:
+        return pd.DataFrame(columns=["maturity_bucket", "Total Issuance (Billion $)"])
+    upcoming["years_to_maturity"] = (upcoming["maturity_date"] - today).dt.days / 365.25
+    upcoming["offering_amt_bil"] = upcoming["offering_amt"] / 1e9
+    upcoming["maturity_bucket"] = upcoming["years_to_maturity"].apply(_nearest_maturity_bucket)
+    summary = upcoming.groupby("maturity_bucket")["offering_amt_bil"].sum().reset_index()
+    summary = summary.rename(columns={"offering_amt_bil": "Total Issuance (Billion $)"})
+    summary = summary.iloc[summary["maturity_bucket"].map(_MATURITY_LADDER_ORDER).argsort()]
+    return summary
+
+# Yield-curve maturities FRED actually quotes (DGS series), in years - used to interpolate an
+# estimated yield at the MATURITY_LADDER's tenors that FRED doesn't directly quote (4Y, 12Y,
+# 15Y, 22.5Y, 25Y, 27.5Y). Standard practitioner technique (linear interpolation between real
+# quoted points), not fabricated data.
+YIELD_CURVE_MATURITY_YEARS = {"1M":1/12,"3M":0.25,"6M":0.5,"1Y":1,"2Y":2,"3Y":3,"5Y":5,"7Y":7,"10Y":10,"20Y":20,"30Y":30}
+
+def _interp_yield_curve(row_vals, target_years):
+    pairs = sorted((YIELD_CURVE_MATURITY_YEARS[lbl], row_vals[lbl]) for lbl in row_vals.index
+                   if lbl in YIELD_CURVE_MATURITY_YEARS and pd.notna(row_vals[lbl]))
+    if not pairs:
+        return [None] * len(target_years)
+    xs, ys = zip(*pairs)
+    return list(np.interp(target_years, xs, ys))
 
 # ── Date range ────────────────────────────────────────────────────────────────
 st.title("🇺🇸 US Macro Dashboard")
@@ -477,6 +550,21 @@ def get_summary_metrics(end):
             results[name] = (val, delta, unit)
         except:
             results[name] = (None, None, "")
+
+    try:
+        d2  = fred.get_series("DGS2").dropna()
+        d5  = fred.get_series("DGS5").dropna()
+        d10 = fred.get_series("DGS10").dropna()
+        d30 = fred.get_series("DGS30").dropna()
+        curve = pd.concat([d2, d5, d10, d30], axis=1, keys=["2Y", "5Y", "10Y", "30Y"]).ffill().dropna()
+        fly = (2 * curve["5Y"] - curve["10Y"] - curve["2Y"]) * 100  # bps
+        results["2s5s10s Fly"] = (float(fly.iloc[-1]), float(fly.iloc[-1] - fly.iloc[-2]), "bps")
+        curve_5s30s = (curve["30Y"] - curve["5Y"]) * 100  # bps
+        results["5s30s"] = (float(curve_5s30s.iloc[-1]), float(curve_5s30s.iloc[-1] - curve_5s30s.iloc[-2]), "bps")
+    except Exception:
+        results["2s5s10s Fly"] = (None, None, "")
+        results["5s30s"] = (None, None, "")
+
     return results
 
 # ── Economic calendar ───────────────────────────────────────────────────────────
@@ -540,24 +628,29 @@ def get_economic_release_calendar():
 with st.spinner("Loading summary metrics…"):
     summary = get_summary_metrics(END)
 
-cols = st.columns(len(summary))
-for col, (name, (val, delta, unit)) in zip(cols, summary.items()):
-    with col:
-        if val is None:
-            st.markdown(f'<div class="metric-card"><div class="metric-label">{name}</div><div class="metric-value neutral">N/A</div></div>', unsafe_allow_html=True)
-            continue
-        val_str   = f"{val:+.0f}{unit}" if unit in ("k", "bps") else f"{val:.2f}{unit}"
-        if delta is None:
-            delta_str = ""
-        else:
-            delta_str = f"{delta:+.0f}{unit}" if unit in ("k", "bps") else f"{delta:+.2f}{unit}"
-        delta_cls = "positive" if (delta or 0) > 0 else "negative" if (delta or 0) < 0 else "neutral"
-        st.markdown(f"""
-        <div class="metric-card">
-          <div class="metric-label">{name}</div>
-          <div class="metric-value neutral">{val_str}</div>
-          <div class="metric-delta {delta_cls}">{delta_str} MoM</div>
-        </div>""", unsafe_allow_html=True)
+summary_items = list(summary.items())
+ROW_SIZE = 6
+for row_start in range(0, len(summary_items), ROW_SIZE):
+    row_items = summary_items[row_start:row_start + ROW_SIZE]
+    cols = st.columns(ROW_SIZE)
+    for col, (name, (val, delta, unit)) in zip(cols, row_items):
+        with col:
+            if val is None:
+                st.markdown(f'<div class="metric-card"><div class="metric-label">{name}</div><div class="metric-value neutral">N/A</div></div>', unsafe_allow_html=True)
+                continue
+            val_str   = f"{val:+.0f}{unit}" if unit in ("k", "bps") else f"{val:.2f}{unit}"
+            if delta is None:
+                delta_str = ""
+            else:
+                delta_str = f"{delta:+.0f}{unit}" if unit in ("k", "bps") else f"{delta:+.2f}{unit}"
+            delta_cls = "positive" if (delta or 0) > 0 else "negative" if (delta or 0) < 0 else "neutral"
+            st.markdown(f"""
+            <div class="metric-card">
+              <div class="metric-label">{name}</div>
+              <div class="metric-value neutral">{val_str}</div>
+              <div class="metric-delta {delta_cls}">{delta_str} MoM</div>
+            </div>""", unsafe_allow_html=True)
+    st.markdown("<div style='margin-top:8px'></div>", unsafe_allow_html=True)
 
 st.markdown("<br>", unsafe_allow_html=True)
 
@@ -590,6 +683,22 @@ with tabs[0]:
         umich    = fetch("UMCSENT", "UMich Sentiment", START, END)
         inf_exp1 = fetch("MICH", "1Y Inf Expectation", START, END)
         inf_exp5 = fetch("EXPINF5YR", "5Y Inf Expectation", START, END)
+
+        # CPI components - the standard BLS major expenditure groups (SA), each verified
+        # live against FRED. Not exhaustive (BLS publishes finer subcomponents too), but this
+        # is the standard "CPI component breakdown" level of granularity.
+        CPI_COMPONENTS = [
+            ("Food",                       "CPIUFDSL"),
+            ("Energy",                     "CPIENGSL"),
+            ("Shelter",                    "CUSR0000SAH1"),
+            ("Apparel",                    "CPIAPPSL"),
+            ("Transportation",             "CPITRNSL"),
+            ("Medical Care",               "CPIMEDSL"),
+            ("Recreation",                 "CPIRECSL"),
+            ("Education & Communication",  "CPIEDUSL"),
+            ("Other Goods & Services",     "CPIOGSSL"),
+        ]
+        cpi_components = {label: mom_yoy(fetch(sid, label, START, END), label) for label, sid in CPI_COMPONENTS}
 
     # CPI vs Core CPI
     fig_cpi = go.Figure()
@@ -669,6 +778,40 @@ with tabs[0]:
     fig_pi.update_layout(**dual_axis_layout("Export & Import Price Indices", "YoY %", "MoM %"))
     add_recessions(fig_pi, recessions)
 
+    # CPI components - YoY % history (all 9 groups) + latest MoM/YoY snapshot
+    fig_cpi_comp_hist = go.Figure()
+    for label, _ in CPI_COMPONENTS:
+        df_c = cpi_components[label]
+        col = f"{label} YoY %"
+        if not df_c.empty and col in df_c.columns:
+            fig_cpi_comp_hist.add_trace(go.Scatter(x=df_c.index, y=df_c[col], name=label, mode="lines"))
+    fig_cpi_comp_hist.update_layout(**base_layout("CPI Components — YoY %"))
+    fig_cpi_comp_hist.update_yaxes(ticksuffix="%")
+    add_recessions(fig_cpi_comp_hist, recessions)
+
+    comp_rows = []
+    for label, _ in CPI_COMPONENTS:
+        df_c = cpi_components[label]
+        mom_col, yoy_col = f"{label} MoM %", f"{label} YoY %"
+        if df_c.empty or mom_col not in df_c.columns:
+            continue
+        mom_s, yoy_s = df_c[mom_col].dropna(), df_c[yoy_col].dropna()
+        if mom_s.empty or yoy_s.empty:
+            continue
+        comp_rows.append({"Component": label, "MoM %": mom_s.iloc[-1], "YoY %": yoy_s.iloc[-1], "As Of": df_c.index[-1]})
+    comp_df = pd.DataFrame(comp_rows).sort_values("YoY %", ascending=True)
+    comp_latest_date = comp_df["As Of"].max().strftime("%b %Y") if not comp_df.empty else ""
+    comp_df = comp_df.drop(columns="As Of")
+
+    fig_cpi_comp_snap = go.Figure()
+    fig_cpi_comp_snap.add_trace(go.Bar(y=comp_df["Component"], x=comp_df["YoY %"], name="YoY %",
+                                        orientation="h", marker_color="#ef5350"))
+    fig_cpi_comp_snap.add_trace(go.Bar(y=comp_df["Component"], x=comp_df["MoM %"], name="MoM %",
+                                        orientation="h", marker_color="#ff9800"))
+    fig_cpi_comp_snap.update_layout(**base_layout(f"CPI Components — Latest MoM & YoY % ({comp_latest_date})", height=420))
+    fig_cpi_comp_snap.update_layout(barmode="group")
+    fig_cpi_comp_snap.update_xaxes(ticksuffix="%")
+
     inflation_charts = [
         ("CPI vs Core CPI", fig_cpi, pd.concat([cpi, core_cpi], axis=1)),
         ("PCE vs Core PCE", fig_pce, pd.concat([pce, core_pce], axis=1)),
@@ -677,6 +820,8 @@ with tabs[0]:
         ("TIPS Breakevens", fig_be, pd.concat([be_5y, be_10y], axis=1)),
         ("UMich & Inflation Expectations", fig_umich, pd.concat([umich, inf_exp1, inf_exp5], axis=1)),
         ("Export & Import Prices", fig_pi, pd.concat([exp_pi, imp_pi], axis=1)),
+        ("CPI Components History", fig_cpi_comp_hist, pd.concat([cpi_components[l] for l, _ in CPI_COMPONENTS], axis=1)),
+        ("CPI Components Snapshot", fig_cpi_comp_snap, comp_df),
     ]
     render_two_col(inflation_charts)
 
@@ -957,8 +1102,8 @@ with tabs[3]:
     m2_data = pd.DataFrame(index=m2.index) if not m2.empty else pd.DataFrame()
     if not m2.empty:
         m2_data["M2 (Billions)"] = m2["M2"] / 1e3
-        m2_data["YoY %"] = m2["M2"].pct_change(12) * 100
-        m2_data["MoM %"] = m2["M2"].pct_change() * 100
+        m2_data["YoY %"] = (m2["M2"].pct_change(12) * 100).round(3)
+        m2_data["MoM %"] = (m2["M2"].pct_change() * 100).round(3)
     fig_m2 = go.Figure()
     if not m2_data.empty:
         fig_m2.add_trace(go.Scatter(x=m2_data.index, y=m2_data["M2 (Billions)"],
@@ -1139,7 +1284,8 @@ with tabs[3]:
 
     upcoming, issuance_summary = get_upcoming_issuances(auctions, days_ahead)
     maturing, maturity_summary = get_maturing_treasuries(auctions, days_ahead)
-    outstanding, outstanding_summary = get_outstanding_by_tenor(auctions)
+    outstanding_mat, outstanding_maturity_summary = get_outstanding_by_remaining_maturity(auctions)
+    issuance_maturity_summary = get_upcoming_issuance_by_maturity_bucket(auctions, days_ahead)
 
     combined = pd.merge(issuance_summary, maturity_summary, on="security_term_week_year", how="outer").fillna(0)
     combined = _sort_by_tenor(combined, "security_term_week_year")
@@ -1181,16 +1327,40 @@ with tabs[3]:
         f"Issuance vs. Maturities by Term (Net: ${total_issuance - total_maturing:,.1f}B)"))
     fig_supply_bar.update_layout(barmode="relative")
 
-    # Outstanding by tenor
-    total_outstanding = outstanding_summary["Outstanding (Billion $)"].sum()
-    fig_outstanding = go.Figure(go.Bar(
-        x=outstanding_summary["security_term_week_year"], y=outstanding_summary["Outstanding (Billion $)"],
-        marker_color="#ab47bc", text=outstanding_summary["Outstanding (Billion $)"].round(0), textposition="outside"
+    # Outstanding by remaining maturity (nearest-tenor ladder), with the yield curve overlaid
+    # on a secondary axis so current supply can be read against where the curve sits at each
+    # tenor. Reindexed to the full ladder (zero-filled) so the bars and the (interpolated)
+    # yield-curve points always line up 1:1 on the shared x-axis, even if a bucket is empty.
+    ladder_labels = list(MATURITY_LADDER.keys())
+    outstanding_maturity_summary = (
+        outstanding_maturity_summary.set_index("maturity_bucket")
+        .reindex(ladder_labels, fill_value=0)
+        .rename_axis("maturity_bucket").reset_index()
+    )
+    total_outstanding_maturity = outstanding_maturity_summary["Outstanding (Billion $)"].sum()
+
+    fig_outstanding_maturity = go.Figure()
+    fig_outstanding_maturity.add_trace(go.Bar(
+        x=outstanding_maturity_summary["maturity_bucket"], y=outstanding_maturity_summary["Outstanding (Billion $)"],
+        marker_color="#42a5f5", text=outstanding_maturity_summary["Outstanding (Billion $)"].round(0),
+        textposition="outside", name="Outstanding (Billion $)", yaxis="y",
     ))
-    fig_outstanding.update_layout(**base_layout(
-        f"Outstanding Marketable Treasuries (Total ${total_outstanding:,.0f}B) — "
-        f"excl. intragvmt & non-marketable debt"
-    ))
+    if not yc.empty:
+        target_years = list(MATURITY_LADDER.values())
+        for label, offset in snap_labels.items():
+            idx = max(0, len(yc) - 1 + offset)
+            interp_yields = _interp_yield_curve(yc.iloc[idx], target_years)
+            fig_outstanding_maturity.add_trace(go.Scatter(
+                x=ladder_labels, y=interp_yields, mode="lines+markers", name=f"Yield: {label}",
+                yaxis="y2", line=dict(color=snap_colors[label], width=2 if label == "Latest" else 1,
+                                       dash="solid" if label == "Latest" else "dash"),
+                marker=dict(size=4),
+            ))
+    fig_outstanding_maturity.update_layout(**dual_axis_layout(
+        f"Outstanding Marketable Treasuries by Remaining Maturity (Total ${total_outstanding_maturity:,.0f}B) "
+        f"— nearest-tenor ladder (3M–30Y), yield curve overlaid",
+        "Outstanding (Billion $)", "Yield (%)"))
+    fig_outstanding_maturity.update_layout(yaxis2=dict(ticksuffix="%"))
 
     # Bid-to-cover trend - reuses the global date range instead of its own lookback control.
     # If END isn't today (user is looking at a past window), START may be an arbitrary date
@@ -1215,12 +1385,34 @@ with tabs[3]:
     fig_btc.update_layout(**base_layout(f"Bid-to-Cover Ratio — {bc_type}s ({bc_cutoff.date()} to {end_ts.date()})"))
     add_recessions(fig_btc, recessions)
 
+    # Outstanding + new issuance - current outstanding balance plus whatever's being newly
+    # issued in the selected forward window, both bucketed on the same remaining-maturity
+    # ladder (a 17-Week bill lands in 3M, a 26-Week bill in 6M, etc. - see
+    # get_upcoming_issuance_by_maturity_bucket). Does not net out maturities - that's what the
+    # "Issuance vs Maturity" chart above already covers.
+    outstanding_plus_new = pd.merge(
+        outstanding_maturity_summary, issuance_maturity_summary, on="maturity_bucket", how="left"
+    ).fillna(0)
+    outstanding_plus_new = outstanding_plus_new.iloc[outstanding_plus_new["maturity_bucket"].map(_MATURITY_LADDER_ORDER).argsort()]
+    outstanding_plus_new["Outstanding + New Issuance (Billion $)"] = (
+        outstanding_plus_new["Outstanding (Billion $)"] + outstanding_plus_new["Total Issuance (Billion $)"])
+    fig_outstanding_plus_new = go.Figure()
+    fig_outstanding_plus_new.add_trace(go.Bar(x=outstanding_plus_new["maturity_bucket"], y=outstanding_plus_new["Outstanding (Billion $)"],
+                                               name="Current Outstanding", marker_color="#ab47bc"))
+    fig_outstanding_plus_new.add_trace(go.Bar(x=outstanding_plus_new["maturity_bucket"], y=outstanding_plus_new["Total Issuance (Billion $)"],
+                                               name=f"New Issuance (Next {days_ahead}d)", marker_color="#26a69a"))
+    fig_outstanding_plus_new.update_layout(**base_layout(
+        f"Outstanding + New Issuance by Remaining Maturity (Next {days_ahead}d, Pro Forma Total "
+        f"${outstanding_plus_new['Outstanding + New Issuance (Billion $)'].sum():,.0f}B)"))
+    fig_outstanding_plus_new.update_layout(barmode="stack")
+
     treasury_charts = [
         ("Upcoming Issuances", fig_upcoming, upcoming),
         ("Maturing Treasuries", fig_maturing, maturing),
         ("Issuance vs Maturity", fig_supply_bar, combined),
-        ("Outstanding by Tenor", fig_outstanding, outstanding_summary),
+        ("Outstanding by Remaining Maturity", fig_outstanding_maturity, outstanding_maturity_summary),
         ("Bid-to-Cover Trend", fig_btc, bc_hist[["auction_date", "security_term_week_year", "bid_to_cover_ratio"]]),
+        ("Outstanding + New Issuance", fig_outstanding_plus_new, outstanding_plus_new),
     ]
     render_two_col(treasury_charts)
 
@@ -1243,7 +1435,7 @@ with tabs[4]:
     # LEI
     fig_lei = go.Figure()
     if not lei.empty:
-        lei_yoy = lei["Conference Board LEI"].pct_change(12) * 100
+        lei_yoy = (lei["Conference Board LEI"].pct_change(12) * 100).round(3)
         fig_lei.add_trace(go.Scatter(x=lei.index, y=lei["Conference Board LEI"],
                                      name="LEI Level", line=dict(color="#26a69a"), yaxis="y"))
         fig_lei.add_trace(go.Scatter(x=lei.index, y=lei_yoy,
