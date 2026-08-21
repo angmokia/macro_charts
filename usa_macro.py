@@ -746,7 +746,7 @@ with tabs[0]:
         fig_be.add_trace(go.Scatter(x=be_5y.index, y=be_5y["5Y Breakeven"], name="5Y Breakeven", line=dict(color="#26a69a")))
     if not be_10y.empty:
         fig_be.add_trace(go.Scatter(x=be_10y.index, y=be_10y["10Y Breakeven"], name="10Y Breakeven", line=dict(color="#ff9800")))
-    fig_be.update_layout(**base_layout("Market-Implied Inflation Expectations (TIPS Breakevens)"))
+    fig_be.update_layout(**base_layout("Inflation Expectations (TIPS Breakevens)"))
     add_recessions(fig_be, recessions)
 
     # UMich Sentiment + Inflation Expectations
@@ -976,7 +976,7 @@ with tabs[1]:
             hovertemplate="Date: %{text}<br>Unemployment: %{x:.1f}%<br>Openings: %{y:.2f}M<extra></extra>",
             name="Beveridge Curve",
         ))
-        fig_bev.update_layout(**base_layout("Beveridge Curve (Job Openings vs Unemployment Rate)"))
+        fig_bev.update_layout(**base_layout("Beveridge Curve (Openings vs Unemployment)"))
         fig_bev.update_xaxes(title="Unemployment Rate (%)", gridcolor=GRID_COLOR)
         fig_bev.update_yaxes(title="Job Openings (M)", gridcolor=GRID_COLOR)
     else:
@@ -986,7 +986,7 @@ with tabs[1]:
     fig_adp = go.Figure()
     for col in adp_sectors.columns:
         fig_adp.add_trace(go.Scatter(x=adp_sectors.index, y=adp_sectors[col], name=col, mode="lines"))
-    fig_adp.update_layout(**base_layout("ADP Private Employment by Sector (MoM Change k)"))
+    fig_adp.update_layout(**base_layout("ADP Employment by Sector (MoM, k)"))
     add_recessions(fig_adp, recessions)
 
 
@@ -1034,7 +1034,7 @@ with tabs[2]:
     if not permits.empty:
         fig_starts.add_trace(go.Scatter(x=permits.index, y=permits["Building Permits"],
                                         name="Permits", line=dict(color="#ab47bc")))
-    fig_starts.update_layout(**base_layout("Housing Starts vs Building Permits (Leading Indicator)"))
+    fig_starts.update_layout(**base_layout("Housing Starts vs Permits"))
     add_recessions(fig_starts, recessions)
 
     # Case-Shiller
@@ -1094,7 +1094,7 @@ with tabs[3]:
         fig_fed.add_trace(go.Scatter(x=fed_tres.index, y=fed_tres["Fed Treasuries (M)"] / 1e6,
                                      name="Treasuries", fill="tozeroy",
                                      line=dict(color="#42a5f5"), fillcolor="rgba(66,165,245,0.15)"))
-    fig_fed.update_layout(**base_layout("Fed Balance Sheet — Total Assets & Treasuries (Trillions)"))
+    fig_fed.update_layout(**base_layout("Fed Balance Sheet ($T)"))
     fig_fed.update_yaxes(ticksuffix="T")
     add_recessions(fig_fed, recessions)
 
@@ -1120,7 +1120,7 @@ with tabs[3]:
         if not df_r.empty:
             fig_rates.add_trace(go.Scatter(x=df_r.index, y=df_r.iloc[:,0],
                                            name=col, line=dict(color=color)))
-    fig_rates.update_layout(**base_layout("Policy Rates — EFFR, SOFR, IORB, ON RRP"))
+    fig_rates.update_layout(**base_layout("Policy Rates"))
     add_recessions(fig_rates, recessions)
 
     # Yield curve snapshots
@@ -1187,7 +1187,7 @@ with tabs[3]:
             fig_real.add_trace(go.Scatter(x=df_r.index, y=df_r.iloc[:,0],
                                           name=col, line=dict(color=color)))
     fig_real.add_hline(y=0, line_dash="dot", line_color="#555")
-    fig_real.update_layout(**base_layout("Real Yields (TIPS) vs Breakeven Inflation"))
+    fig_real.update_layout(**base_layout("Real Yields vs Breakevens"))
     add_recessions(fig_real, recessions)
 
     # Credit spreads - FRED reports these OAS series in percentage points, not bps
@@ -1229,7 +1229,7 @@ with tabs[3]:
         ))
         fig_fedwatch.add_hline(y=current_effr, line_dash="dash", line_color="#e0e0e0",
                                 annotation_text=f"Current EFFR ({current_effr:.2f}%)", annotation_position="top left")
-        fig_fedwatch.update_layout(**base_layout("Market-Implied Fed Funds - FOMC Dates"))
+        fig_fedwatch.update_layout(**base_layout("Market-Implied Fed Funds"))
         fig_fedwatch.update_yaxes(ticksuffix="%", title="Implied Rate")
         fig_fedwatch.update_xaxes(title="FOMC Meeting Date")
 
@@ -1247,7 +1247,7 @@ with tabs[3]:
                 line=dict(color=SNAPSHOT_COLORS[label], width=2 if label == "Today" else 1,
                            dash="solid" if label == "Today" else "dash"),
             ))
-        fig_fedwatch_hist.update_layout(**base_layout("Market-Implied Fed Funds Rate — Snapshots"))
+        fig_fedwatch_hist.update_layout(**base_layout("Fed Funds Rate — Snapshots"))
         fig_fedwatch_hist.update_xaxes(title="Dates")
         fig_fedwatch_hist.update_yaxes(title="Implied Rate", ticksuffix="%")
 
@@ -1357,7 +1357,7 @@ with tabs[3]:
                 marker=dict(size=4),
             ))
     fig_outstanding_maturity.update_layout(**dual_axis_layout(
-        f"Outstanding Marketable Treasuries by Remaining Maturity (Total ${total_outstanding_maturity:,.0f}B) "
+        f"Outstanding Treasuries by Remaining Maturity (${total_outstanding_maturity:,.0f}B)",
         "Outstanding (Billion $)", "Yield (%)"))
     fig_outstanding_maturity.update_layout(yaxis2=dict(ticksuffix="%"))
 
@@ -1381,7 +1381,7 @@ with tabs[3]:
         term_df = bc_hist[bc_hist["security_term_week_year"] == term]
         fig_btc.add_trace(go.Scatter(x=term_df["auction_date"], y=term_df["bid_to_cover_ratio"],
                                       mode="lines+markers", name=term, marker=dict(size=4)))
-    fig_btc.update_layout(**base_layout(f"Bid-to-Cover Ratio — {bc_type}s ({bc_cutoff.date()} to {end_ts.date()})"))
+    fig_btc.update_layout(**base_layout(f"Bid-to-Cover Ratio — {bc_type}s"))
     add_recessions(fig_btc, recessions)
 
     # Outstanding + new issuance - current outstanding balance plus whatever's being newly
@@ -1401,7 +1401,7 @@ with tabs[3]:
     fig_outstanding_plus_new.add_trace(go.Bar(x=outstanding_plus_new["maturity_bucket"], y=outstanding_plus_new["Total Issuance (Billion $)"],
                                                name=f"New Issuance (Next {days_ahead}d)", marker_color="#26a69a"))
     fig_outstanding_plus_new.update_layout(**base_layout(
-        f"Outstanding + New Issuance by Remaining Maturity (Next {days_ahead}d, Pro Forma Total "
+        f"Outstanding + New Issuance ({days_ahead}d, "
         f"${outstanding_plus_new['Outstanding + New Issuance (Billion $)'].sum():,.0f}B)"))
     fig_outstanding_plus_new.update_layout(barmode="stack")
 
