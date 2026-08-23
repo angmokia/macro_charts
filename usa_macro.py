@@ -410,6 +410,23 @@ def _sort_by_tenor(df, col):
     df["_wk"] = [v * (1 if u == "W" else 4 if u == "M" else 52) for v, u in parsed]
     return df.sort_values("_wk").drop(columns="_wk")
 
+def get_issuance_by_tenor_over_time(df, start, end):
+    # How much of each tenor Treasury has actually issued (auction-settled amount) each
+    # quarter, over the selected date range - shows both total issuance growth and how the
+    # tenor mix has shifted (e.g. more bills during a cash-management-heavy phase, more
+    # coupons when terming out debt). Quarterly matches the cadence of Treasury's own
+    # refunding announcements, and smooths out the lumpiness of e.g. monthly 10Y/30Y auctions
+    # vs weekly bills.
+    window = df[(df["issue_date"] >= pd.Timestamp(start)) & (df["issue_date"] <= pd.Timestamp(end))].copy()
+    if window.empty:
+        return pd.DataFrame()
+    window["amt_bil"] = window["total_accepted"].fillna(window["offering_amt"]) / 1e9
+    window["period"] = window["issue_date"].dt.to_period("Q")
+    pivot = window.pivot_table(index="period", columns="security_term_week_year", values="amt_bil", aggfunc="sum").fillna(0)
+    pivot.index = pivot.index.to_timestamp()
+    tenor_order = _sort_by_tenor(pd.DataFrame({"security_term_week_year": pivot.columns}), "security_term_week_year")["security_term_week_year"]
+    return pivot[tenor_order]
+
 def get_upcoming_issuances(df, days_ahead):
     today = pd.Timestamp.today().normalize()
     cutoff = today + pd.Timedelta(days=days_ahead)
@@ -1405,6 +1422,24 @@ with tabs[3]:
         f"${outstanding_plus_new['Outstanding + New Issuance (Billion $)'].sum():,.0f}B)"))
     fig_outstanding_plus_new.update_layout(barmode="stack")
 
+    # Issuance by tenor over time - quarterly stacked area, selected date range. Answers "how
+    # has the magnitude (and mix) of issuance across tenors changed over time" directly: total
+    # stack height is total quarterly issuance, band thickness is that tenor's share.
+    issuance_over_time = get_issuance_by_tenor_over_time(auctions, START, END)
+    fig_issuance_time = go.Figure()
+    TENOR_PALETTE = ["#42a5f5", "#29b6f6", "#26c6da", "#26a69a", "#66bb6a", "#9ccc65",
+                      "#d4e157", "#ffee58", "#ffca28", "#ffa726", "#ff7043", "#ef5350",
+                      "#ec407a", "#ab47bc", "#7e57c2", "#5c6bc0"]
+    if not issuance_over_time.empty:
+        for i, tenor in enumerate(issuance_over_time.columns):
+            fig_issuance_time.add_trace(go.Scatter(
+                x=issuance_over_time.index, y=issuance_over_time[tenor], name=tenor,
+                mode="lines", stackgroup="one", line=dict(width=0.5, color=TENOR_PALETTE[i % len(TENOR_PALETTE)]),
+            ))
+    fig_issuance_time.update_layout(**base_layout("Issuance by Tenor Over Time (Quarterly, Billion $)", height=520))
+    fig_issuance_time.update_yaxes(title="Issuance (Billion $)")
+    add_recessions(fig_issuance_time, recessions)
+
     treasury_charts = [
         ("Upcoming Issuances", fig_upcoming, upcoming),
         ("Maturing Treasuries", fig_maturing, maturing),
@@ -1412,6 +1447,7 @@ with tabs[3]:
         ("Outstanding by Remaining Maturity", fig_outstanding_maturity, outstanding_maturity_summary),
         ("Bid-to-Cover Trend", fig_btc, bc_hist[["auction_date", "security_term_week_year", "bid_to_cover_ratio"]]),
         ("Outstanding + New Issuance", fig_outstanding_plus_new, outstanding_plus_new),
+        ("Issuance by Tenor Over Time", fig_issuance_time, issuance_over_time.reset_index()),
     ]
     render_two_col(treasury_charts)
 
