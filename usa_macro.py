@@ -1185,6 +1185,10 @@ with tabs[3]:
         spreads["10Y-3M"]  = (yc.get("10Y",pd.Series()) - yc.get("3M",pd.Series())) * 100
         spreads["5Y-2Y"]   = (yc.get("5Y",pd.Series())  - yc.get("2Y",pd.Series())) * 100
         spreads["30Y-10Y"] = (yc.get("30Y",pd.Series()) - yc.get("10Y",pd.Series())) * 100
+        spreads["5s30s"]   = (yc.get("30Y",pd.Series()) - yc.get("5Y",pd.Series())) * 100
+        # Butterfly: 2x the belly minus both wings - same definition as the "2s5s10s Fly"
+        # summary metric above, just as a full time series instead of a single latest figure.
+        spreads["2s5s10s Fly"] = (2 * yc.get("5Y",pd.Series()) - yc.get("10Y",pd.Series()) - yc.get("2Y",pd.Series())) * 100
         spreads = spreads.dropna(how="all")
     fig_spreads = go.Figure()
     for col in spreads.columns:
