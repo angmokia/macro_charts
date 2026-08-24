@@ -571,24 +571,6 @@ def get_debt_subject_to_limit(start, end):
     out.index.name = "date"
     return out
 
-@st.cache_data(ttl=21600)
-def get_interest_expense(start, end):
-    j = _get_json_params(f"{FISCAL_BASE}/v2/accounting/od/interest_expense", {
-        "filter": f"record_date:gte:{start},record_date:lte:{end}",
-        "fields": "record_date,expense_type_desc,month_expense_amt",
-        "sort": "record_date", "page[size]": 10000,
-    })
-    data = j.get("data", [])
-    if not data:
-        return pd.DataFrame()
-    df = pd.DataFrame(data)
-    df["record_date"] = pd.to_datetime(df["record_date"])
-    df["month_expense_amt"] = pd.to_numeric(df["month_expense_amt"], errors="coerce")
-    monthly = df.groupby("record_date")["month_expense_amt"].sum() / 1e9
-    out = monthly.to_frame("Interest Expense (Billion $)")
-    out.index.name = "date"
-    return out
-
 MTS_MONTH_ORDER = ["October","November","December","January","February","March","April","May","June",
                     "July","August","September"]
 
@@ -627,6 +609,7 @@ def get_mts_monthly():
 # Salient spending programs, grouped from their real (fragmented) DTS transaction_catg line
 # items - e.g. defense pay, health and retirement are three separate rows in the raw data.
 FISCAL_SPEND_GROUPS = {
+    "Interest on Debt": ["Interest on Treasury Securities"],
     "Defense": ["Dept of Defense (DoD) - misc", "DoD - Health", "DoD - Military Active Duty Pay", "DoD - Military Retirement"],
     "Medicare": ["HHS - Federal Hospital Insr Trust Fund", "HHS - Federal Supple Med Insr Trust Fund",
                  "HHS - Medicare Prescription Drugs", "HHS - Othr Cent Medicare & Medicaid Serv"],
@@ -1616,13 +1599,12 @@ with tabs[3]:
 with tabs[4]:
     st.header("Fiscal Policy & Government Spending")
     st.caption("US Treasury Fiscal Data API — Daily Treasury Statement, Debt Subject to Limit, "
-               "Interest Expense, Monthly Treasury Statement.")
+               "Monthly Treasury Statement.")
 
     with st.spinner("Loading fiscal data…"):
         tga             = get_tga_balance(START, END)
         rrp_vol         = fetch("RRPONTSYD", "ON RRP (Billion $)", START, END)
         debt_limit      = get_debt_subject_to_limit(START, END)
-        interest_expense = get_interest_expense(START, END)
         mts_monthly     = get_mts_monthly()
 
     # TGA & RRP — two separate single-axis charts rather than one dual-axis chart: same
@@ -1654,34 +1636,27 @@ with tabs[4]:
     fig_debt.update_yaxes(ticksuffix="T")
     add_recessions(fig_debt, recessions)
 
-    # Monthly budget — receipts up, outlays down, deficit/surplus as the line
+    # Monthly budget — receipts up, outlays down, net as the line. Treasury's own
+    # current_month_dfct_sur_amt is signed positive=deficit/negative=surplus (the opposite of
+    # receipts-minus-outlays) - confirmed live (e.g. a $27B surplus month reports as -27B). Negating
+    # it here makes the line read the same direction as the bars: positive when the green (receipts)
+    # bar is taller than the red (outlays) bar, matching receipts - outlays exactly.
     fig_mts = go.Figure()
     if not mts_monthly.empty:
         fig_mts.add_trace(go.Bar(x=mts_monthly["Period"], y=mts_monthly["current_month_gross_rcpt_amt"],
                                   name="Receipts", marker_color="#26a69a"))
         fig_mts.add_trace(go.Bar(x=mts_monthly["Period"], y=-mts_monthly["current_month_gross_outly_amt"],
                                   name="Outlays", marker_color="#ef5350"))
-        fig_mts.add_trace(go.Scatter(x=mts_monthly["Period"], y=mts_monthly["current_month_dfct_sur_amt"],
-                                      name="Deficit / Surplus", line=dict(color="#e0e0e0", width=2)))
-    fig_mts.update_layout(**base_layout("Monthly Receipts, Outlays & Deficit (Billion $)"))
+        fig_mts.add_trace(go.Scatter(x=mts_monthly["Period"], y=-mts_monthly["current_month_dfct_sur_amt"],
+                                      name="Net (Receipts − Outlays)", line=dict(color="#e0e0e0", width=2)))
+    fig_mts.update_layout(**base_layout("Monthly Receipts, Outlays & Net (Billion $)"))
     fig_mts.update_layout(barmode="relative")
-
-    # Interest expense
-    fig_ie = go.Figure()
-    if not interest_expense.empty:
-        fig_ie.add_trace(go.Scatter(x=interest_expense.index, y=interest_expense["Interest Expense (Billion $)"],
-                                     name="Interest Expense", line=dict(color="#ff9800"),
-                                     fill="tozeroy", fillcolor="rgba(255,152,0,0.12)"))
-    fig_ie.update_layout(**base_layout("Interest Expense on the Debt"))
-    fig_ie.update_yaxes(ticksuffix="B")
-    add_recessions(fig_ie, recessions)
 
     fiscal_charts = [
         ("TGA Balance", fig_tga, tga),
         ("ON RRP Usage", fig_rrp, rrp_vol),
         ("Debt Subject to Limit", fig_debt, debt_limit),
         ("Monthly Budget", fig_mts, mts_monthly),
-        ("Interest Expense", fig_ie, interest_expense),
     ]
     render_two_col(fiscal_charts)
     st.caption("Debt-ceiling chart drops rows during a suspension period — Treasury reports the statutory "
@@ -1697,7 +1672,8 @@ with tabs[4]:
     with st.spinner(f"Loading {cat_choice} spending…"):
         cat_data = get_category_spend(tuple(FISCAL_SPEND_GROUPS[cat_choice]), "2022-01-01")
 
-    st.caption(f"Summed from {len(FISCAL_SPEND_GROUPS[cat_choice])} DTS categories: "
+    n_cats = len(FISCAL_SPEND_GROUPS[cat_choice])
+    st.caption(f"{'From' if n_cats == 1 else f'Summed from {n_cats}'} DTS categor{'y' if n_cats == 1 else 'ies'}: "
                + ", ".join(FISCAL_SPEND_GROUPS[cat_choice]))
     if cat_choice == "Defense":
         st.caption("⚠️ Treasury only reports DoD pay/health/retirement as separate line items from FY2024 "
@@ -1706,6 +1682,10 @@ with tabs[4]:
     elif cat_choice == "Medicare":
         st.caption("⚠️ One constituent line (HHS - Other Centers for Medicare & Medicaid Services) currently "
                    "returns no rows, so this slightly understates total Medicare-related outlays.")
+    elif cat_choice == "Interest on Debt":
+        st.caption("⚠️ This is Treasury's cash-basis DTS category — interest actually paid out day by day — "
+                   "rather than the accrual-based interest expense Treasury reports elsewhere, so it won't "
+                   "match an accrual figure exactly month to month.")
 
     fig_cat_fytd = go.Figure()
     fig_cat_yoy = go.Figure()
