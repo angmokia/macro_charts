@@ -513,6 +513,159 @@ def _interp_yield_curve(row_vals, target_years):
     xs, ys = zip(*pairs)
     return list(np.interp(target_years, xs, ys))
 
+# ── Fiscal accounts (TGA, debt limit, interest expense, MTS, spending by category) ─────
+
+FISCAL_BASE = "https://api.fiscaldata.treasury.gov/services/api/fiscal_service"
+
+def _get_json_params(url, params, retries=5, backoff=2, timeout=30):
+    for attempt in range(retries):
+        try:
+            r = requests.get(url, params=params, timeout=timeout, headers={"User-Agent": "Mozilla/5.0"})
+            if r.status_code == 200 and r.text.strip():
+                return r.json()
+        except requests.exceptions.RequestException:
+            pass
+        time.sleep(backoff * (attempt + 1))
+    raise RuntimeError(f"Treasury Fiscal Data API failed after {retries} retries: {url}")
+
+@st.cache_data(ttl=21600)
+def get_tga_balance(start, end):
+    j = _get_json_params(f"{FISCAL_BASE}/v1/accounting/dts/operating_cash_balance", {
+        "filter": f"account_type:eq:Treasury General Account (TGA) Closing Balance,record_date:gte:{start},record_date:lte:{end}",
+        "fields": "record_date,open_today_bal",
+        "sort": "record_date", "page[size]": 10000,
+    })
+    data = j.get("data", [])
+    if not data:
+        return pd.DataFrame()
+    df = pd.DataFrame(data)
+    df["record_date"] = pd.to_datetime(df["record_date"])
+    df["TGA Balance (Billion $)"] = pd.to_numeric(df["open_today_bal"], errors="coerce") / 1000
+    df = df.set_index("record_date")[["TGA Balance (Billion $)"]]
+    df.index.name = "date"
+    return df
+
+@st.cache_data(ttl=21600)
+def get_debt_subject_to_limit(start, end):
+    j = _get_json_params(f"{FISCAL_BASE}/v1/accounting/dts/debt_subject_to_limit", {
+        "filter": f"record_date:gte:{start},record_date:lte:{end}",
+        "fields": "record_date,debt_catg,close_today_bal",
+        "sort": "record_date", "page[size]": 10000,
+    })
+    data = j.get("data", [])
+    if not data:
+        return pd.DataFrame()
+    df = pd.DataFrame(data)
+    df["record_date"] = pd.to_datetime(df["record_date"])
+    df["close_today_bal"] = pd.to_numeric(df["close_today_bal"], errors="coerce")
+    pivot = df.pivot_table(index="record_date", columns="debt_catg", values="close_today_bal", aggfunc="last")
+    out = pd.DataFrame(index=pivot.index)
+    out["Debt Subject to Limit ($T)"] = (
+        pivot.get("Debt Held by the Public", 0) + pivot.get("Intragovernmental Holdings", 0)
+        + pivot.get("Other Debt Subject to Limit", 0)
+    ) / 1e6
+    out["Statutory Limit ($T)"] = pivot.get("Statutory Debt Limit", pd.Series(dtype=float)) / 1e6
+    # During a debt-ceiling suspension Treasury reports the statutory limit as 0 - that means
+    # "not currently in effect," not "zero headroom." Drop those rows rather than chart a fake breach.
+    out.loc[out["Statutory Limit ($T)"] <= 0, "Statutory Limit ($T)"] = np.nan
+    out.index.name = "date"
+    return out
+
+@st.cache_data(ttl=21600)
+def get_interest_expense(start, end):
+    j = _get_json_params(f"{FISCAL_BASE}/v2/accounting/od/interest_expense", {
+        "filter": f"record_date:gte:{start},record_date:lte:{end}",
+        "fields": "record_date,expense_type_desc,month_expense_amt",
+        "sort": "record_date", "page[size]": 10000,
+    })
+    data = j.get("data", [])
+    if not data:
+        return pd.DataFrame()
+    df = pd.DataFrame(data)
+    df["record_date"] = pd.to_datetime(df["record_date"])
+    df["month_expense_amt"] = pd.to_numeric(df["month_expense_amt"], errors="coerce")
+    monthly = df.groupby("record_date")["month_expense_amt"].sum() / 1e9
+    out = monthly.to_frame("Interest Expense (Billion $)")
+    out.index.name = "date"
+    return out
+
+MTS_MONTH_ORDER = ["October","November","December","January","February","March","April","May","June",
+                    "July","August","September"]
+
+@st.cache_data(ttl=21600)
+def get_mts_monthly():
+    # Each MTS "vintage" (record_date) carries the full current + prior fiscal year table -
+    # find the latest vintage first, then pull that one vintage's monthly rows.
+    latest_j = _get_json_params(f"{FISCAL_BASE}/v1/accounting/mts/mts_table_1", {
+        "fields": "record_date", "sort": "-record_date", "page[size]": 1,
+    })
+    latest_data = latest_j.get("data", [])
+    if not latest_data:
+        return pd.DataFrame()
+    latest_date = latest_data[0]["record_date"]
+
+    j = _get_json_params(f"{FISCAL_BASE}/v1/accounting/mts/mts_table_1", {
+        "filter": f"record_date:eq:{latest_date}", "page[size]": 500,
+    })
+    mts = pd.DataFrame(j.get("data", []))
+    if mts.empty:
+        return pd.DataFrame()
+    headers_df = mts[mts["data_type_cd"] == "S"][["classification_id", "classification_desc"]].rename(
+        columns={"classification_id": "parent_id", "classification_desc": "fy_label"})
+    months = mts[mts["record_type_cd"] == "MTH"].merge(headers_df, on="parent_id", how="left")
+    months = months.drop_duplicates(subset=["fy_label", "classification_desc"])
+    for c in ["current_month_gross_rcpt_amt", "current_month_gross_outly_amt", "current_month_dfct_sur_amt"]:
+        months[c] = pd.to_numeric(months[c], errors="coerce") / 1e9  # billions
+    months["month_idx"] = months["classification_desc"].apply(lambda m: MTS_MONTH_ORDER.index(m) if m in MTS_MONTH_ORDER else -1)
+    fy_num = months["fy_label"].str.extract(r"(\d+)").astype(float)[0]
+    months["sort_key"] = fy_num * 100 + months["month_idx"]
+    months = months[months["month_idx"] >= 0].sort_values("sort_key")
+    months["Period"] = months["classification_desc"].str[:3] + " " + months["fy_label"].str.extract(r"(\d+)")[0].str[-2:]
+    return months[["Period", "current_month_gross_rcpt_amt", "current_month_gross_outly_amt",
+                    "current_month_dfct_sur_amt"]].reset_index(drop=True)
+
+# Salient spending programs, grouped from their real (fragmented) DTS transaction_catg line
+# items - e.g. defense pay, health and retirement are three separate rows in the raw data.
+FISCAL_SPEND_GROUPS = {
+    "Defense": ["Dept of Defense (DoD) - misc", "DoD - Health", "DoD - Military Active Duty Pay", "DoD - Military Retirement"],
+    "Medicare": ["HHS - Federal Hospital Insr Trust Fund", "HHS - Federal Supple Med Insr Trust Fund",
+                 "HHS - Medicare Prescription Drugs", "HHS - Othr Cent Medicare & Medicaid Serv"],
+    "Medicaid": ["HHS - Grants to States for Medicaid"],
+    "Social Security": ["SSA - Benefits Payments", "SSA - Supplemental Security Income", "Social Security Admin (SSA) - misc"],
+    "Veterans Affairs": ["Dept of Veterans Affairs (VA)", "VA - Benefits"],
+    "Unemployment Insurance": ["DOL - Unemployment Benefits"],
+    "Food Assistance (SNAP/WIC)": ["USDA - Supp Nutrition Assist Prog (SNAP)", "USDA - Supp Nutrition Assist Prog (WIC)"],
+}
+
+@st.cache_data(ttl=21600)
+def get_category_spend(categories: tuple, start: str):
+    # A transaction_catg value containing its own parentheses (e.g. "...(SNAP)") breaks the
+    # API's :in:(...) list filter once a SECOND parenthesised value joins the same list -
+    # confirmed live: SNAP+WIC combined silently returns 0 rows, each alone returns data fine.
+    # Fetching each category separately via :eq: and summing client-side sidesteps this for
+    # every group, not just the ones with parens in the name.
+    per_cat = []
+    for cat in categories:
+        j = _get_json_params(f"{FISCAL_BASE}/v1/accounting/dts/deposits_withdrawals_operating_cash", {
+            "fields": "record_date,transaction_fytd_amt",
+            "filter": f"transaction_catg:eq:{cat},record_date:gte:{start}",
+            "sort": "record_date", "page[size]": 10000,
+        })
+        data = j.get("data", [])
+        if not data:
+            continue
+        df = pd.DataFrame(data)
+        df["record_date"] = pd.to_datetime(df["record_date"])
+        df["transaction_fytd_amt"] = pd.to_numeric(df["transaction_fytd_amt"], errors="coerce")
+        per_cat.append(df.set_index("record_date")["transaction_fytd_amt"].resample("ME").last().rename(cat))
+    if not per_cat:
+        return pd.DataFrame()
+    combined = pd.concat(per_cat, axis=1).sum(axis=1, min_count=1).dropna()
+    out = pd.DataFrame({"FYTD (Billion $)": combined / 1000})
+    out["YoY %"] = (combined / combined.shift(12) - 1) * 100
+    out.index.name = "date"
+    return out
+
 # ── Date range ────────────────────────────────────────────────────────────────
 st.title("🇺🇸 US Macro Dashboard")
 
@@ -677,6 +830,7 @@ tabs = st.tabs([
     "Labour Market",
     "Housing",
     "Treasury & Rates",
+    "Fiscal",
     "Indicators",
     "Economic Calendar",
 ])
@@ -1457,9 +1611,126 @@ with tabs[3]:
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-# TAB 5 — Leading Indicators
+# TAB 5 — Fiscal Policy & Government Spending
 # ════════════════════════════════════════════════════════════════════════════════
 with tabs[4]:
+    st.header("Fiscal Policy & Government Spending")
+    st.caption("US Treasury Fiscal Data API — Daily Treasury Statement, Debt Subject to Limit, "
+               "Interest Expense, Monthly Treasury Statement.")
+
+    with st.spinner("Loading fiscal data…"):
+        tga             = get_tga_balance(START, END)
+        rrp_vol         = fetch("RRPONTSYD", "ON RRP (Billion $)", START, END)
+        debt_limit      = get_debt_subject_to_limit(START, END)
+        interest_expense = get_interest_expense(START, END)
+        mts_monthly     = get_mts_monthly()
+
+    # TGA & RRP — two separate single-axis charts rather than one dual-axis chart: same
+    # "where are reserves going" story, but each series keeps its own honest scale.
+    fig_tga = go.Figure()
+    if not tga.empty:
+        fig_tga.add_trace(go.Scatter(x=tga.index, y=tga["TGA Balance (Billion $)"], name="TGA Balance",
+                                      line=dict(color="#42a5f5"), fill="tozeroy", fillcolor="rgba(66,165,245,0.12)"))
+    fig_tga.update_layout(**base_layout("Treasury General Account Balance"))
+    fig_tga.update_yaxes(ticksuffix="B")
+    add_recessions(fig_tga, recessions)
+
+    fig_rrp = go.Figure()
+    if not rrp_vol.empty:
+        fig_rrp.add_trace(go.Scatter(x=rrp_vol.index, y=rrp_vol["ON RRP (Billion $)"], name="ON RRP",
+                                      line=dict(color="#ab47bc"), fill="tozeroy", fillcolor="rgba(171,71,188,0.12)"))
+    fig_rrp.update_layout(**base_layout("ON RRP Usage"))
+    fig_rrp.update_yaxes(ticksuffix="B")
+    add_recessions(fig_rrp, recessions)
+
+    # Debt ceiling
+    fig_debt = go.Figure()
+    if not debt_limit.empty:
+        fig_debt.add_trace(go.Scatter(x=debt_limit.index, y=debt_limit["Debt Subject to Limit ($T)"],
+                                       name="Debt Subject to Limit", line=dict(color="#42a5f5")))
+        fig_debt.add_trace(go.Scatter(x=debt_limit.index, y=debt_limit["Statutory Limit ($T)"],
+                                       name="Statutory Limit", line=dict(color="#eda100", dash="dash")))
+    fig_debt.update_layout(**base_layout("Debt Subject to Limit vs. Statutory Limit"))
+    fig_debt.update_yaxes(ticksuffix="T")
+    add_recessions(fig_debt, recessions)
+
+    # Monthly budget — receipts up, outlays down, deficit/surplus as the line
+    fig_mts = go.Figure()
+    if not mts_monthly.empty:
+        fig_mts.add_trace(go.Bar(x=mts_monthly["Period"], y=mts_monthly["current_month_gross_rcpt_amt"],
+                                  name="Receipts", marker_color="#26a69a"))
+        fig_mts.add_trace(go.Bar(x=mts_monthly["Period"], y=-mts_monthly["current_month_gross_outly_amt"],
+                                  name="Outlays", marker_color="#ef5350"))
+        fig_mts.add_trace(go.Scatter(x=mts_monthly["Period"], y=mts_monthly["current_month_dfct_sur_amt"],
+                                      name="Deficit / Surplus", line=dict(color="#e0e0e0", width=2)))
+    fig_mts.update_layout(**base_layout("Monthly Receipts, Outlays & Deficit (Billion $)"))
+    fig_mts.update_layout(barmode="relative")
+
+    # Interest expense
+    fig_ie = go.Figure()
+    if not interest_expense.empty:
+        fig_ie.add_trace(go.Scatter(x=interest_expense.index, y=interest_expense["Interest Expense (Billion $)"],
+                                     name="Interest Expense", line=dict(color="#ff9800"),
+                                     fill="tozeroy", fillcolor="rgba(255,152,0,0.12)"))
+    fig_ie.update_layout(**base_layout("Interest Expense on the Debt"))
+    fig_ie.update_yaxes(ticksuffix="B")
+    add_recessions(fig_ie, recessions)
+
+    fiscal_charts = [
+        ("TGA Balance", fig_tga, tga),
+        ("ON RRP Usage", fig_rrp, rrp_vol),
+        ("Debt Subject to Limit", fig_debt, debt_limit),
+        ("Monthly Budget", fig_mts, mts_monthly),
+        ("Interest Expense", fig_ie, interest_expense),
+    ]
+    render_two_col(fiscal_charts)
+    st.caption("Debt-ceiling chart drops rows during a suspension period — Treasury reports the statutory "
+               "limit as $0 then, which means \"not currently in effect,\" not \"zero headroom\"; charting it "
+               "as-is would show a fake breach.")
+
+    # ── Spending by category (grouped, dropdown-selectable) ─────────────────────
+    st.markdown('<div class="section-header">Spending by Category</div>', unsafe_allow_html=True)
+    st.caption("Each option sums several DTS transaction categories that Treasury reports separately "
+               "(e.g. defense pay, health and retirement are three different rows) into one program total.")
+
+    cat_choice = st.selectbox("Spending category", list(FISCAL_SPEND_GROUPS.keys()), key="fiscal_cat_choice")
+    with st.spinner(f"Loading {cat_choice} spending…"):
+        cat_data = get_category_spend(tuple(FISCAL_SPEND_GROUPS[cat_choice]), "2022-01-01")
+
+    st.caption(f"Summed from {len(FISCAL_SPEND_GROUPS[cat_choice])} DTS categories: "
+               + ", ".join(FISCAL_SPEND_GROUPS[cat_choice]))
+    if cat_choice == "Defense":
+        st.caption("⚠️ Treasury only reports DoD pay/health/retirement as separate line items from FY2024 "
+                   "(Oct 2023) onward — before that, defense spending is bundled into a single vendor-payments "
+                   "category not comparable to this grouping, so this series starts Oct 2023.")
+    elif cat_choice == "Medicare":
+        st.caption("⚠️ One constituent line (HHS - Other Centers for Medicare & Medicaid Services) currently "
+                   "returns no rows, so this slightly understates total Medicare-related outlays.")
+
+    fig_cat_fytd = go.Figure()
+    fig_cat_yoy = go.Figure()
+    if not cat_data.empty:
+        fig_cat_fytd.add_trace(go.Scatter(x=cat_data.index, y=cat_data["FYTD (Billion $)"], name=cat_choice,
+                                           line=dict(color="#26a69a"), fill="tozeroy", fillcolor="rgba(38,166,154,0.12)"))
+        yoy_s = cat_data["YoY %"].dropna()
+        fig_cat_yoy.add_trace(go.Scatter(x=yoy_s.index, y=yoy_s, name=f"{cat_choice} YoY", line=dict(color="#ff9800")))
+        fig_cat_yoy.add_hline(y=0, line_dash="dot", line_color="#555")
+    fig_cat_fytd.update_layout(**base_layout(f"{cat_choice} — FYTD Cumulative Spend (Billion $)"))
+    fig_cat_yoy.update_layout(**base_layout(f"{cat_choice} — YoY Change on FYTD (%)"))
+    fig_cat_yoy.update_yaxes(ticksuffix="%")
+
+    render_two_col([
+        (f"{cat_choice} FYTD", fig_cat_fytd, cat_data),
+        (f"{cat_choice} YoY", fig_cat_yoy, cat_data),
+    ])
+    st.caption("FYTD resets every October, so the October YoY reading compares one month of new-fiscal-year "
+               "spend against a much larger September base and can look like a large swing — that's the "
+               "reset, not a real spending spike.")
+
+# ════════════════════════════════════════════════════════════════════════════════
+# TAB 6 — Leading Indicators
+# ════════════════════════════════════════════════════════════════════════════════
+with tabs[5]:
     st.header("Leading Indicators")
     with st.spinner("Loading leading indicator data…"):
         ism_mfg  = fetch("MANEMP",    "ISM Mfg Employment", START, END)
@@ -1541,9 +1812,9 @@ with tabs[4]:
     render_two_col(leading_charts)
 
 # ════════════════════════════════════════════════════════════════════════════════
-# TAB 6 — Economic Calendar
+# TAB 7 — Economic Calendar
 # ════════════════════════════════════════════════════════════════════════════════
-with tabs[5]:
+with tabs[6]:
     st.header("Economic Calendar")
     st.caption("Next scheduled release dates (FRED) + upcoming FOMC meetings + upcoming Treasury auctions. "
                "No consensus/forecast column - that's commercial data with no free legitimate source; "
