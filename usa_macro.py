@@ -1167,7 +1167,17 @@ with tabs[2]:
         new_sales   = fetch("HSN1F",         "New Home Sales", START, END)
         starts      = fetch("HOUST",         "Housing Starts", START, END)
         permits     = fetch("PERMIT",        "Building Permits", START, END)
+        completions = fetch("COMPUTSA",      "Completions", START, END)
         case_shiller = fetch("CSUSHPINSA",   "Case-Shiller HPI", START, END)
+
+        mort30      = fetch("MORTGAGE30US", "30Y Fixed Mortgage", START, END)
+        mort15      = fetch("MORTGAGE15US", "15Y Fixed Mortgage", START, END)
+        dgs30_h     = fetch("DGS30",        "30Y Treasury", START, END)
+        new_supply  = fetch("MSACSR",       "New Home Months Supply", START, END)
+        existing_supply = fetch("HOSSUPUSM673N", "Existing Home Months Supply", START, END)
+        median_price = fetch("MSPUS",       "Median New-Home Price", START, END)
+        homeownership = fetch("RHORUSQ156N", "Homeownership Rate", START, END)
+        affordability = fetch("FIXHAI",     "Housing Affordability Index", START, END)
 
     # Existing vs New Home Sales
     fig_sales = go.Figure()
@@ -1180,7 +1190,8 @@ with tabs[2]:
     fig_sales.update_layout(**dual_axis_layout("Existing vs New Home Sales", "Existing (k)", "New (k)"))
     add_recessions(fig_sales, recessions)
 
-    # Starts vs Permits
+    # Starts vs Permits vs Completions - full construction pipeline; a widening
+    # permits-to-completions gap signals a building backlog before it shows up elsewhere.
     fig_starts = go.Figure()
     if not starts.empty:
         fig_starts.add_trace(go.Scatter(x=starts.index, y=starts["Housing Starts"],
@@ -1188,7 +1199,10 @@ with tabs[2]:
     if not permits.empty:
         fig_starts.add_trace(go.Scatter(x=permits.index, y=permits["Building Permits"],
                                         name="Permits", line=dict(color="#ab47bc")))
-    fig_starts.update_layout(**base_layout("Housing Starts vs Permits"))
+    if not completions.empty:
+        fig_starts.add_trace(go.Scatter(x=completions.index, y=completions["Completions"],
+                                        name="Completions", line=dict(color="#26a69a")))
+    fig_starts.update_layout(**base_layout("Housing Starts, Permits & Completions"))
     add_recessions(fig_starts, recessions)
 
     # Case-Shiller
@@ -1201,13 +1215,110 @@ with tabs[2]:
     fig_cs.update_layout(**dual_axis_layout("Case-Shiller Home Price Index", "YoY %", "MoM %"))
     add_recessions(fig_cs, recessions)
 
+    # 30Y vs 15Y fixed mortgage rate
+    fig_mortgage = go.Figure()
+    if not mort30.empty:
+        fig_mortgage.add_trace(go.Scatter(x=mort30.index, y=mort30["30Y Fixed Mortgage"],
+                                          name="30Y Fixed", line=dict(color="#42a5f5")))
+    if not mort15.empty:
+        fig_mortgage.add_trace(go.Scatter(x=mort15.index, y=mort15["15Y Fixed Mortgage"],
+                                          name="15Y Fixed", line=dict(color="#8a94a6")))
+    fig_mortgage.update_layout(**base_layout("30Y vs 15Y Fixed Mortgage Rate"))
+    fig_mortgage.update_yaxes(ticksuffix="%")
+    add_recessions(fig_mortgage, recessions)
+
+    # Mortgage-Treasury spread - the standard MBS-market-stress read (30Y mortgage over
+    # 30Y Treasury, matching maturities). Peaked well above its historical norm during the
+    # 2022-23 stress episode and has been normalizing since.
+    mort_spread = pd.DataFrame()
+    if not mort30.empty and not dgs30_h.empty:
+        spread_df = pd.concat([mort30, dgs30_h], axis=1).ffill().dropna()
+        mort_spread = pd.DataFrame(index=spread_df.index)
+        mort_spread["Mortgage-Treasury Spread (bps)"] = (
+            spread_df["30Y Fixed Mortgage"] - spread_df["30Y Treasury"]) * 100
+    fig_mort_spread = go.Figure()
+    if not mort_spread.empty:
+        fig_mort_spread.add_trace(go.Scatter(x=mort_spread.index, y=mort_spread["Mortgage-Treasury Spread (bps)"],
+                                             name="Spread", line=dict(color="#e08b4f"), fill="tozeroy",
+                                             fillcolor="rgba(224,139,79,0.15)"))
+    fig_mort_spread.update_layout(**base_layout("Mortgage — 30Y Treasury Spread"))
+    fig_mort_spread.update_yaxes(ticksuffix=" bps")
+    add_recessions(fig_mort_spread, recessions)
+
+    # New home months' supply
+    fig_new_supply = go.Figure()
+    if not new_supply.empty:
+        fig_new_supply.add_trace(go.Scatter(x=new_supply.index, y=new_supply["New Home Months Supply"],
+                                            name="Months Supply", line=dict(color="#e08b4f"), fill="tozeroy",
+                                            fillcolor="rgba(224,139,79,0.15)"))
+    fig_new_supply.update_layout(**base_layout("New Home Months' Supply"))
+    add_recessions(fig_new_supply, recessions)
+
+    # Existing home months' supply - NAR restricted data redistribution in 2023-24, so FRED
+    # restarted this series from scratch; only a short window of history is available.
+    fig_existing_supply = go.Figure()
+    if not existing_supply.empty:
+        fig_existing_supply.add_trace(go.Scatter(x=existing_supply.index, y=existing_supply["Existing Home Months Supply"],
+                                                  name="Months Supply", line=dict(color="#26a69a"), fill="tozeroy",
+                                                  fillcolor="rgba(38,166,154,0.15)"))
+    fig_existing_supply.update_layout(**base_layout("Existing Home Months' Supply"))
+
+    # Median new-home price vs Case-Shiller - two panels, not one dual-axis chart: different
+    # units and scales. Case-Shiller says how much prices moved (%); this says what a home
+    # actually costs ($).
+    fig_price = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                              subplot_titles=("Median New-Home Price ($)", "Case-Shiller Index"),
+                              vertical_spacing=0.12)
+    if not median_price.empty:
+        fig_price.add_trace(go.Scatter(x=median_price.index, y=median_price["Median New-Home Price"],
+                                       name="Median Price", line=dict(color="#e08b4f")), row=1, col=1)
+    if not case_shiller.empty:
+        fig_price.add_trace(go.Scatter(x=case_shiller.index, y=case_shiller["Case-Shiller HPI"],
+                                       name="Case-Shiller", line=dict(color="#8a94a6")), row=2, col=1)
+    fig_price.update_layout(template=TEMPLATE, paper_bgcolor=PAPER_BG, plot_bgcolor=PLOT_BG,
+                            height=500, margin=dict(l=10,r=10,t=45,b=30), showlegend=False)
+    fig_price.update_xaxes(gridcolor=GRID_COLOR)
+    fig_price.update_yaxes(gridcolor=GRID_COLOR)
+    add_recessions(fig_price, recessions, rows=[1,2], cols=[1,1])
+
+    # Homeownership rate - slow-moving structural context, not a series people watch move
+    # month to month.
+    fig_homeownership = go.Figure()
+    if not homeownership.empty:
+        fig_homeownership.add_trace(go.Scatter(x=homeownership.index, y=homeownership["Homeownership Rate"],
+                                                name="Homeownership Rate", line=dict(color="#90a4d4")))
+    fig_homeownership.update_layout(**base_layout("Homeownership Rate"))
+    fig_homeownership.update_yaxes(ticksuffix="%")
+    add_recessions(fig_homeownership, recessions)
+
+    # Housing affordability index - same NAR restart issue as existing-home supply; short
+    # history, useful as a current reading (100 = median family exactly qualifies for the
+    # median-priced home) more than a trend.
+    fig_afford = go.Figure()
+    if not affordability.empty:
+        fig_afford.add_trace(go.Scatter(x=affordability.index, y=affordability["Housing Affordability Index"],
+                                        name="Affordability Index", line=dict(color="#ab47bc")))
+    fig_afford.add_hline(y=100, line_dash="dot", line_color="#555",
+                          annotation_text="100 = median family qualifies")
+    fig_afford.update_layout(**base_layout("Housing Affordability Index"))
 
     housing_charts = [
         ("Home Sales", fig_sales, pd.concat([home_sales, new_sales], axis=1)),
-        ("Starts vs Permits", fig_starts, pd.concat([starts, permits], axis=1)),
+        ("Starts, Permits & Completions", fig_starts, pd.concat([starts, permits, completions], axis=1)),
         ("Case-Shiller HPI", fig_cs, cs_mom),
+        ("30Y vs 15Y Mortgage Rate", fig_mortgage, pd.concat([mort30, mort15], axis=1)),
+        ("Mortgage-Treasury Spread", fig_mort_spread, mort_spread),
+        ("New Home Months Supply", fig_new_supply, new_supply),
+        ("Existing Home Months Supply", fig_existing_supply, existing_supply),
+        ("Median Price vs Case-Shiller", fig_price, pd.concat([median_price, case_shiller], axis=1)),
+        ("Homeownership Rate", fig_homeownership, homeownership),
+        ("Housing Affordability Index", fig_afford, affordability),
     ]
     render_two_col(housing_charts)
+    st.caption("Existing Home Months' Supply and the Housing Affordability Index both restart in "
+               "2025 - NAR restricted redistribution of this data in 2023-24, and FRED rebuilt these "
+               "series from scratch once a new agreement was reached. The same gap affects the "
+               "Existing Home Sales series above, which also only carries recent history.")
 
 # ════════════════════════════════════════════════════════════════════════════════
 # TAB 4 — Monetary & Rates
