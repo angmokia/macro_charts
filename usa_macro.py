@@ -54,6 +54,13 @@ RECESSION_COLOR = "rgba(180,60,60,0.12)"
 
 @st.cache_data(ttl=3600)
 def fetch(series_id: str, label: str, start: str, end: str = None) -> pd.DataFrame:
+    # Retry on ANY failure, not just rate-limit-shaped ones - fredapi occasionally raises a
+    # bare ValueError(None) (str(e) == "None") on a transient FRED-side hiccup (a malformed
+    # response during a brief server restart, a dropped connection), which is not a rate-limit
+    # message and would previously skip the retry entirely and fail on the very first attempt.
+    # Confirmed live: DGS1 (1-Year Treasury) failed this way once while being a completely
+    # healthy, currently-published series - a one-off transient issue, not a broken series.
+    last_exc = None
     for attempt in range(3):
         try:
             s = fred.get_series(series_id, observation_start=start, observation_end=end)
@@ -62,12 +69,9 @@ def fetch(series_id: str, label: str, start: str, end: str = None) -> pd.DataFra
             time.sleep(0.15)
             return df
         except Exception as e:
-            if "Too Many Requests" in str(e) or "Rate Limit" in str(e):
-                time.sleep(2 ** attempt)  # 1s, 2s, 4s backoff
-                continue
-            st.warning(f"Could not load {label} ({series_id}): {e}")
-            return pd.DataFrame()
-    st.warning(f"Rate limit: could not load {label} ({series_id}) after 3 attempts")
+            last_exc = e
+            time.sleep(2 ** attempt)  # 1s, 2s, 4s backoff
+    st.warning(f"Could not load {label} ({series_id}) after 3 attempts: {last_exc}")
     return pd.DataFrame()
 
 @st.cache_data(ttl=3600)
@@ -1873,21 +1877,31 @@ with tabs[4]:
 
     # Equity risk premium - current snapshot only. yfinance doesn't expose a historical daily
     # P/E series for SPY/S&P 500, only the current value, so this can't be a time series.
+    # y10_nominal goes through the shared fetch() helper (retry + cache) rather than a raw,
+    # unretried fred.get_series call, so a transient FRED hiccup here behaves the same way as
+    # everywhere else in the file instead of risking an unhandled exception.
     st.markdown('<div class="section-header">Equity Risk Premium</div>', unsafe_allow_html=True)
-    if spy_pe and not real_yield_10y.empty:
+    y10_nominal_df = fetch("DGS10", "10Y Nominal Yield", MARKETS_HIST_START, END)
+    missing = []
+    if not spy_pe:
+        missing.append("SPY trailing P/E")
+    if y10_nominal_df.empty:
+        missing.append("10Y Treasury yield")
+
+    if not missing:
         earnings_yield = 100 / spy_pe
-        y10_nominal = fred.get_series("DGS10").dropna().iloc[-1]
-        erp = earnings_yield - float(y10_nominal)
+        y10_nominal = float(y10_nominal_df["10Y Nominal Yield"].dropna().iloc[-1])
+        erp = earnings_yield - y10_nominal
         erp_col1, erp_col2, erp_col3 = st.columns(3)
         with erp_col1:
             st.metric("SPY Earnings Yield", f"{earnings_yield:.2f}%", help=f"1 / trailing P/E ({spy_pe:.1f})")
         with erp_col2:
-            st.metric("10Y Treasury Yield", f"{float(y10_nominal):.2f}%")
+            st.metric("10Y Treasury Yield", f"{y10_nominal:.2f}%")
         with erp_col3:
             st.metric("Equity Risk Premium", f"{erp:+.2f}%",
                      help="Earnings yield minus 10Y yield. Negative means bonds currently yield more than stock earnings.")
     else:
-        st.info("Equity risk premium unavailable this run (SPY P/E or 10Y yield failed to load).")
+        st.info(f"Equity risk premium unavailable this run - failed to load: {', '.join(missing)}.")
 
     st.plotly_chart(fig_corr, use_container_width=True)
     csv_download(corr_df if not spy_full.empty and not tlt_full.empty else pd.DataFrame(), "stock_bond_correlation")
