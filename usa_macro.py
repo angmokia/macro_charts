@@ -649,6 +649,60 @@ def get_category_spend(categories: tuple, start: str):
     out.index.name = "date"
     return out
 
+# ── US Markets (equities, cross-asset, via yfinance) ────────────────────────────
+# yfinance/Yahoo Finance is well known to rate-limit or transiently block requests more
+# readily than a residential/dev IP - confirmed live on a different dashboard in this same
+# project (a ticker silently vanished from a ranking for a full day because one failed fetch
+# got cached as "no data"). Retry with backoff, and keep the cache TTL short (1hr) so any
+# fetch that does fail all retries self-heals quickly instead of persisting all day.
+
+def _yf_retry(fn, retries=3, backoff=1.5):
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            return fn()
+        except Exception as e:
+            last_exc = e
+            time.sleep(backoff * (attempt + 1))
+    raise last_exc if last_exc else RuntimeError("yfinance call failed")
+
+@st.cache_data(ttl=3600)
+def fetch_yf_close(ticker: str, label: str, start: str, end: str = None) -> pd.DataFrame:
+    try:
+        hist = _yf_retry(lambda: yf.download(ticker, start=start, end=end, progress=False,
+                                             auto_adjust=True))
+        if hist.empty:
+            return pd.DataFrame()
+        close = hist["Close"]
+        s = close.iloc[:, 0] if hasattr(close, "columns") else close
+        df = pd.DataFrame({label: s.values}, index=pd.to_datetime(s.index).tz_localize(None))
+        df.index.name = "date"
+        return df.dropna()
+    except Exception as e:
+        st.warning(f"Could not load {label} ({ticker}): {e}")
+        return pd.DataFrame()
+
+Z_SCORE_WINDOWS = {"1M": 21, "3M": 63, "1Y": 252}  # trading days - same convention as the CIX
+                                                     # backtester's dependent-variable z-score
+
+def calculate_price_zscores(series: pd.Series, windows=Z_SCORE_WINDOWS) -> dict:
+    """Latest rolling z-score of a price level against its own trailing history, per window -
+    how stretched a ticker is relative to its own recent range, not a return z-score."""
+    out = {}
+    for label, window in windows.items():
+        roll_mean = series.rolling(window).mean()
+        roll_std = series.rolling(window).std()
+        z = (series - roll_mean) / roll_std
+        out[label] = float(z.iloc[-1]) if pd.notna(z.iloc[-1]) else None
+    return out
+
+SECTOR_ETFS = {
+    "XLK": "Technology", "XLF": "Financials", "XLE": "Energy", "XLV": "Health Care",
+    "XLY": "Cons. Discretionary", "XLP": "Cons. Staples", "XLI": "Industrials",
+    "XLB": "Materials", "XLU": "Utilities", "XLRE": "Real Estate", "XLC": "Comm. Services",
+}
+MARKET_INDICES = {"^GSPC": "S&P 500", "^IXIC": "Nasdaq", "^RUT": "Russell 2000", "^DJI": "Dow Jones"}
+
 # ── Date range ────────────────────────────────────────────────────────────────
 st.title("🇺🇸 US Macro Dashboard")
 
@@ -813,6 +867,7 @@ tabs = st.tabs([
     "Labour Market",
     "Housing",
     "Treasury & Rates",
+    "US Markets",
     "Fiscal",
     "Indicators",
     "Economic Calendar",
@@ -1758,9 +1813,232 @@ with tabs[3]:
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-# TAB 5 — Fiscal Policy & Government Spending
+# TAB 5 — US Markets
 # ════════════════════════════════════════════════════════════════════════════════
 with tabs[4]:
+    st.header("US Markets")
+    st.caption("Equities and cross-asset - a different data domain from the rest of this dashboard "
+               "(yfinance, not FRED, for most of this tab). Charts respect the global date range above; "
+               "z-scores and period returns use a longer fixed lookback under the hood so the latest "
+               "reading stays valid even if you narrow the date range.")
+
+    MARKETS_HIST_START = "2015-01-01"  # independent of the global slider - z-scores need a
+                                        # trailing window regardless of the selected display range
+
+    with st.spinner("Loading market data…"):
+        spy_full = fetch_yf_close("SPY", "SPY", MARKETS_HIST_START)
+        tlt_full = fetch_yf_close("TLT", "TLT", MARKETS_HIST_START)
+        vix_full = fetch_yf_close("^VIX", "VIX", MARKETS_HIST_START)
+        dxy_full = fetch_yf_close("DX-Y.NYB", "DXY", MARKETS_HIST_START)
+        gold_full = fetch_yf_close("GC=F", "Gold", MARKETS_HIST_START)
+        real_yield_10y = fetch("DFII10", "10Y Real Yield", MARKETS_HIST_START, END)
+        idx_full = {t: fetch_yf_close(t, name, MARKETS_HIST_START) for t, name in MARKET_INDICES.items()}
+        sector_full = {t: fetch_yf_close(t, name, MARKETS_HIST_START) for t, name in SECTOR_ETFS.items()}
+
+        # VIX term structure - ^VIX9D/^VIX3M only ever return their single current value via
+        # yfinance (confirmed live: requesting 2 years of history still returns exactly 1 row),
+        # so this can only ever be a snapshot, never a time series, with this data source.
+        try:
+            vix9d_now = float(_yf_retry(lambda: yf.Ticker("^VIX9D").history(period="5d"))["Close"].iloc[-1])
+        except Exception:
+            vix9d_now = None
+        try:
+            vix3m_now = float(_yf_retry(lambda: yf.Ticker("^VIX3M").history(period="5d"))["Close"].iloc[-1])
+        except Exception:
+            vix3m_now = None
+        try:
+            spy_pe = _yf_retry(lambda: yf.Ticker("SPY").info.get("trailingPE"))
+        except Exception:
+            spy_pe = None
+
+    def _clip_mkt(df):
+        return df[(df.index >= START) & (df.index <= END)] if not df.empty else df
+
+    # Stock/Bond rolling correlation - your original idea. SPY vs TLT daily returns (price-
+    # based, not yield-based, so positive = "stocks and bonds moving together", matching how
+    # this is conventionally reported - a yield-diff version would read with the opposite sign
+    # since bond prices and yields move inversely).
+    fig_corr = go.Figure()
+    if not spy_full.empty and not tlt_full.empty:
+        combo = pd.concat([spy_full, tlt_full], axis=1).dropna()
+        rets = combo.pct_change().dropna()
+        corr_60 = rets["SPY"].rolling(21 * 3).corr(rets["TLT"])  # ~60 trading days
+        corr_252 = rets["SPY"].rolling(252).corr(rets["TLT"])
+        corr_df = _clip_mkt(pd.DataFrame({"60D": corr_60, "1Y": corr_252}).dropna())
+        fig_corr.add_trace(go.Scatter(x=corr_df.index, y=corr_df["60D"], name="60D", line=dict(color="#42a5f5")))
+        fig_corr.add_trace(go.Scatter(x=corr_df.index, y=corr_df["1Y"], name="1Y", line=dict(color="#ab47bc")))
+    fig_corr.add_hline(y=0, line_dash="dot", line_color="#555")
+    fig_corr.update_layout(**base_layout("Stock/Bond Rolling Correlation (SPY vs TLT)"))
+    add_recessions(fig_corr, recessions)
+
+    # Equity risk premium - current snapshot only. yfinance doesn't expose a historical daily
+    # P/E series for SPY/S&P 500, only the current value, so this can't be a time series.
+    st.markdown('<div class="section-header">Equity Risk Premium</div>', unsafe_allow_html=True)
+    if spy_pe and not real_yield_10y.empty:
+        earnings_yield = 100 / spy_pe
+        y10_nominal = fred.get_series("DGS10").dropna().iloc[-1]
+        erp = earnings_yield - float(y10_nominal)
+        erp_col1, erp_col2, erp_col3 = st.columns(3)
+        with erp_col1:
+            st.metric("SPY Earnings Yield", f"{earnings_yield:.2f}%", help=f"1 / trailing P/E ({spy_pe:.1f})")
+        with erp_col2:
+            st.metric("10Y Treasury Yield", f"{float(y10_nominal):.2f}%")
+        with erp_col3:
+            st.metric("Equity Risk Premium", f"{erp:+.2f}%",
+                     help="Earnings yield minus 10Y yield. Negative means bonds currently yield more than stock earnings.")
+    else:
+        st.info("Equity risk premium unavailable this run (SPY P/E or 10Y yield failed to load).")
+
+    st.plotly_chart(fig_corr, use_container_width=True)
+    csv_download(corr_df if not spy_full.empty and not tlt_full.empty else pd.DataFrame(), "stock_bond_correlation")
+
+    # Index levels & period return + z-scores
+    st.markdown('<div class="section-header">Index Levels & Z-Scores</div>', unsafe_allow_html=True)
+    idx_rows, idx_z_rows = [], []
+    for t, name in MARKET_INDICES.items():
+        full = idx_full[t]
+        if full.empty:
+            continue
+        clipped = _clip_mkt(full)
+        if len(clipped) < 2:
+            continue
+        period_ret = (clipped[name].iloc[-1] / clipped[name].iloc[0] - 1) * 100
+        idx_rows.append({"Index": name, "Level": full[name].iloc[-1], "Period Return %": period_ret})
+        z = calculate_price_zscores(full[name])
+        idx_z_rows.append({"Index": name, **{f"{k} Z-Score": v for k, v in z.items()}})
+    idx_df = pd.DataFrame(idx_rows).sort_values("Period Return %")
+    idx_z_df = pd.DataFrame(idx_z_rows)
+
+    fig_idx_ret = go.Figure(go.Bar(
+        x=idx_df["Period Return %"], y=idx_df["Index"], orientation="h",
+        marker_color=["#26a69a" if v >= 0 else "#ef5350" for v in idx_df["Period Return %"]],
+        hovertemplate="%{y}: %{x:+.1f}%<extra></extra>",
+    ))
+    fig_idx_ret.update_layout(**base_layout("Index Period Return (%)", height=300))
+    fig_idx_ret.update_xaxes(ticksuffix="%")
+
+    fig_idx_z = go.Figure()
+    for label, color in [("1M Z-Score", "#42a5f5"), ("3M Z-Score", "#ab47bc"), ("1Y Z-Score", "#ff9800")]:
+        fig_idx_z.add_trace(go.Bar(x=idx_z_df[label], y=idx_z_df["Index"], name=label,
+                                   orientation="h", marker_color=color))
+    fig_idx_z.add_vline(x=0, line_dash="dot", line_color="#555")
+    fig_idx_z.update_layout(**base_layout("Index Price Z-Scores (vs Own Trailing History)", height=300))
+    fig_idx_z.update_layout(barmode="group")
+
+    render_two_col([
+        ("Index Period Return", fig_idx_ret, idx_df),
+        ("Index Z-Scores", fig_idx_z, idx_z_df),
+    ])
+
+    # Sector rotation + z-scores
+    st.markdown('<div class="section-header">Sector Rotation & Z-Scores</div>', unsafe_allow_html=True)
+    sec_rows, sec_z_rows = [], []
+    for t, name in SECTOR_ETFS.items():
+        full = sector_full[t]
+        if full.empty:
+            continue
+        clipped = _clip_mkt(full)
+        if len(clipped) < 2:
+            continue
+        period_ret = (clipped[name].iloc[-1] / clipped[name].iloc[0] - 1) * 100
+        sec_rows.append({"Sector": name, "Period Return %": period_ret})
+        z = calculate_price_zscores(full[name])
+        sec_z_rows.append({"Sector": name, **{f"{k} Z-Score": v for k, v in z.items()}})
+    if not spy_full.empty:
+        spy_clipped = _clip_mkt(spy_full)
+        if len(spy_clipped) >= 2:
+            spy_ret = (spy_clipped["SPY"].iloc[-1] / spy_clipped["SPY"].iloc[0] - 1) * 100
+            sec_rows.append({"Sector": "S&P 500 (SPY)", "Period Return %": spy_ret})
+    sec_df = pd.DataFrame(sec_rows).sort_values("Period Return %")
+    sec_z_df = pd.DataFrame(sec_z_rows).sort_values("1M Z-Score") if sec_z_rows else pd.DataFrame()
+
+    fig_sec_ret = go.Figure(go.Bar(
+        x=sec_df["Period Return %"], y=sec_df["Sector"], orientation="h",
+        marker_color=["#26a69a" if v >= 0 else "#ef5350" for v in sec_df["Period Return %"]],
+        hovertemplate="%{y}: %{x:+.1f}%<extra></extra>",
+    ))
+    fig_sec_ret.update_layout(**base_layout("Sector Period Return vs SPY (%)", height=420))
+    fig_sec_ret.update_xaxes(ticksuffix="%")
+
+    fig_sec_z = go.Figure()
+    for label, color in [("1M Z-Score", "#42a5f5"), ("3M Z-Score", "#ab47bc"), ("1Y Z-Score", "#ff9800")]:
+        fig_sec_z.add_trace(go.Bar(x=sec_z_df[label], y=sec_z_df["Sector"], name=label,
+                                   orientation="h", marker_color=color))
+    fig_sec_z.add_vline(x=0, line_dash="dot", line_color="#555")
+    fig_sec_z.update_layout(**base_layout("Sector Price Z-Scores (vs Own Trailing History)", height=420))
+    fig_sec_z.update_layout(barmode="group")
+
+    render_two_col([
+        ("Sector Rotation", fig_sec_ret, sec_df),
+        ("Sector Z-Scores", fig_sec_z, sec_z_df),
+    ])
+
+    # VIX level
+    fig_vix = go.Figure()
+    vix_clipped = _clip_mkt(vix_full)
+    if not vix_clipped.empty:
+        fig_vix.add_trace(go.Scatter(x=vix_clipped.index, y=vix_clipped["VIX"], name="VIX",
+                                     line=dict(color="#ef5350"), fill="tozeroy", fillcolor="rgba(239,83,80,0.12)"))
+    fig_vix.update_layout(**base_layout("VIX (Implied Volatility)"))
+    add_recessions(fig_vix, recessions)
+
+    # VIX term structure - snapshot only (see note above on why no history exists for these two)
+    fig_vix_term = go.Figure()
+    vix_now = vix_full["VIX"].iloc[-1] if not vix_full.empty else None
+    term_labels, term_vals = [], []
+    for lbl, val in [("9D", vix9d_now), ("30D (VIX)", vix_now), ("3M", vix3m_now)]:
+        if val is not None:
+            term_labels.append(lbl); term_vals.append(val)
+    if term_labels:
+        fig_vix_term.add_trace(go.Bar(x=term_labels, y=term_vals, marker_color="#ef5350",
+                                      hovertemplate="%{x}: %{y:.1f}<extra></extra>"))
+    fig_vix_term.update_layout(**base_layout("VIX Term Structure (Snapshot Only)", height=420))
+
+    render_two_col([
+        ("VIX", fig_vix, vix_clipped),
+        ("VIX Term Structure", fig_vix_term, pd.DataFrame({"Tenor": term_labels, "VIX": term_vals})),
+    ])
+    st.caption("VIX Term Structure is a current snapshot, not a time series - confirmed live that "
+               "yfinance only ever returns the single latest value for ^VIX9D and ^VIX3M, regardless "
+               "of how much history is requested.")
+
+    # Dollar Index
+    fig_dxy = go.Figure()
+    dxy_clipped = _clip_mkt(dxy_full)
+    if not dxy_clipped.empty:
+        fig_dxy.add_trace(go.Scatter(x=dxy_clipped.index, y=dxy_clipped["DXY"], name="DXY",
+                                     line=dict(color="#90a4d4")))
+    fig_dxy.update_layout(**base_layout("US Dollar Index (DXY)"))
+    add_recessions(fig_dxy, recessions)
+
+    # Gold vs 10Y real yield - two panels, not one dual-axis chart: different units.
+    fig_gold = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                             subplot_titles=("Gold ($/oz)", "10Y Real Yield (%)"),
+                             vertical_spacing=0.12)
+    gold_clipped = _clip_mkt(gold_full)
+    ry_clipped = real_yield_10y[(real_yield_10y.index >= START) & (real_yield_10y.index <= END)] if not real_yield_10y.empty else real_yield_10y
+    if not gold_clipped.empty:
+        fig_gold.add_trace(go.Scatter(x=gold_clipped.index, y=gold_clipped["Gold"],
+                                      name="Gold", line=dict(color="#eda100")), row=1, col=1)
+    if not ry_clipped.empty:
+        fig_gold.add_trace(go.Scatter(x=ry_clipped.index, y=ry_clipped["10Y Real Yield"],
+                                      name="10Y Real Yield", line=dict(color="#ef5350")), row=2, col=1)
+    fig_gold.update_layout(template=TEMPLATE, paper_bgcolor=PAPER_BG, plot_bgcolor=PLOT_BG,
+                           height=500, margin=dict(l=10, r=10, t=45, b=30), showlegend=False)
+    fig_gold.update_xaxes(gridcolor=GRID_COLOR)
+    fig_gold.update_yaxes(gridcolor=GRID_COLOR)
+    add_recessions(fig_gold, recessions, rows=[1, 2], cols=[1, 1])
+
+    render_two_col([
+        ("Dollar Index (DXY)", fig_dxy, dxy_clipped),
+        ("Gold vs 10Y Real Yield", fig_gold, pd.concat([gold_clipped, ry_clipped], axis=1)),
+    ])
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# TAB 6 — Fiscal Policy & Government Spending
+# ════════════════════════════════════════════════════════════════════════════════
+with tabs[5]:
     st.header("Fiscal Policy & Government Spending")
     st.caption("US Treasury Fiscal Data API — Daily Treasury Statement, Debt Subject to Limit, "
                "Monthly Treasury Statement.")
@@ -1872,9 +2150,9 @@ with tabs[4]:
                "reset, not a real spending spike.")
 
 # ════════════════════════════════════════════════════════════════════════════════
-# TAB 6 — Leading Indicators
+# TAB 7 — Leading Indicators
 # ════════════════════════════════════════════════════════════════════════════════
-with tabs[5]:
+with tabs[6]:
     st.header("Leading Indicators")
     with st.spinner("Loading leading indicator data…"):
         ism_mfg  = fetch("MANEMP",    "ISM Mfg Employment", START, END)
@@ -1956,9 +2234,9 @@ with tabs[5]:
     render_two_col(leading_charts)
 
 # ════════════════════════════════════════════════════════════════════════════════
-# TAB 7 — Economic Calendar
+# TAB 8 — Economic Calendar
 # ════════════════════════════════════════════════════════════════════════════════
-with tabs[6]:
+with tabs[7]:
     st.header("Economic Calendar")
     st.caption("Next scheduled release dates (FRED) + upcoming FOMC meetings + upcoming Treasury auctions. "
                "No consensus/forecast column - that's commercial data with no free legitimate source; "
