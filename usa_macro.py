@@ -854,6 +854,23 @@ with tabs[0]:
         ]
         cpi_components = {label: mom_yoy(fetch(sid, label, START, END), label) for label, sid in CPI_COMPONENTS}
 
+        # PCE components - BEA's monthly PCE price index release is coarser than BLS's CPI
+        # release: it only splits Goods/Services (each further split Durable/Nondurable, plus
+        # Food and Energy as cross-cutting cuts) at monthly frequency. The finer CPI-style
+        # categories (Housing, Health Care, Transportation Services, Recreation Services etc.)
+        # only exist in BEA's underlying-detail tables at quarterly/annual frequency, so
+        # they're left out here rather than mixed with monthly series at a different cadence.
+        PCE_COMPONENTS = [
+            ("Goods",                          "DGDSRG3M086SBEA"),
+            ("Services",                       "DSERRG3M086SBEA"),
+            ("Durable Goods",                  "DDURRG3M086SBEA"),
+            ("Nondurable Goods",                "DNDGRG3M086SBEA"),
+            ("Food",                           "DFXARG3M086SBEA"),
+            ("Energy Goods & Services",        "DNRGRG3M086SBEA"),
+            ("Services Excl. Energy & Housing","IA001260M"),
+        ]
+        pce_components = {label: mom_yoy(fetch(sid, label, START, END), label) for label, sid in PCE_COMPONENTS}
+
     # CPI vs Core CPI
     fig_cpi = go.Figure()
     for col, color in [("CPI YoY %","#ef5350"),("Core CPI YoY %","#ff9800"),
@@ -966,6 +983,40 @@ with tabs[0]:
     fig_cpi_comp_snap.update_layout(barmode="group")
     fig_cpi_comp_snap.update_xaxes(ticksuffix="%")
 
+    # PCE components - YoY % history (7 groups) + latest MoM/YoY snapshot, same pairing as CPI
+    fig_pce_comp_hist = go.Figure()
+    for label, _ in PCE_COMPONENTS:
+        df_c = pce_components[label]
+        col = f"{label} YoY %"
+        if not df_c.empty and col in df_c.columns:
+            fig_pce_comp_hist.add_trace(go.Scatter(x=df_c.index, y=df_c[col], name=label, mode="lines"))
+    fig_pce_comp_hist.update_layout(**base_layout("PCE Components — YoY %"))
+    fig_pce_comp_hist.update_yaxes(ticksuffix="%")
+    add_recessions(fig_pce_comp_hist, recessions)
+
+    pce_comp_rows = []
+    for label, _ in PCE_COMPONENTS:
+        df_c = pce_components[label]
+        mom_col, yoy_col = f"{label} MoM %", f"{label} YoY %"
+        if df_c.empty or mom_col not in df_c.columns:
+            continue
+        mom_s, yoy_s = df_c[mom_col].dropna(), df_c[yoy_col].dropna()
+        if mom_s.empty or yoy_s.empty:
+            continue
+        pce_comp_rows.append({"Component": label, "MoM %": mom_s.iloc[-1], "YoY %": yoy_s.iloc[-1], "As Of": df_c.index[-1]})
+    pce_comp_df = pd.DataFrame(pce_comp_rows).sort_values("YoY %", ascending=True)
+    pce_comp_latest_date = pce_comp_df["As Of"].max().strftime("%b %Y") if not pce_comp_df.empty else ""
+    pce_comp_df = pce_comp_df.drop(columns="As Of")
+
+    fig_pce_comp_snap = go.Figure()
+    fig_pce_comp_snap.add_trace(go.Bar(y=pce_comp_df["Component"], x=pce_comp_df["YoY %"], name="YoY %",
+                                        orientation="h", marker_color="#26a69a"))
+    fig_pce_comp_snap.add_trace(go.Bar(y=pce_comp_df["Component"], x=pce_comp_df["MoM %"], name="MoM %",
+                                        orientation="h", marker_color="#80cbc4"))
+    fig_pce_comp_snap.update_layout(**base_layout(f"PCE Components — Latest MoM & YoY % ({pce_comp_latest_date})", height=380))
+    fig_pce_comp_snap.update_layout(barmode="group")
+    fig_pce_comp_snap.update_xaxes(ticksuffix="%")
+
     inflation_charts = [
         ("CPI vs Core CPI", fig_cpi, pd.concat([cpi, core_cpi], axis=1)),
         ("PCE vs Core PCE", fig_pce, pd.concat([pce, core_pce], axis=1)),
@@ -976,6 +1027,8 @@ with tabs[0]:
         ("Export & Import Prices", fig_pi, pd.concat([exp_pi, imp_pi], axis=1)),
         ("CPI Components History", fig_cpi_comp_hist, pd.concat([cpi_components[l] for l, _ in CPI_COMPONENTS], axis=1)),
         ("CPI Components Snapshot", fig_cpi_comp_snap, comp_df),
+        ("PCE Components History", fig_pce_comp_hist, pd.concat([pce_components[l] for l, _ in PCE_COMPONENTS], axis=1)),
+        ("PCE Components Snapshot", fig_pce_comp_snap, pce_comp_df),
     ]
     render_two_col(inflation_charts)
 
