@@ -700,6 +700,19 @@ def calculate_price_zscores(series: pd.Series, windows=Z_SCORE_WINDOWS) -> dict:
         out[label] = float(z.iloc[-1]) if pd.notna(z.iloc[-1]) else None
     return out
 
+def calculate_period_returns(series: pd.Series, windows=Z_SCORE_WINDOWS) -> dict:
+    """% return over each trailing window (1M/3M/1Y trading days), independent of the global
+    date-range slider - same fixed-window convention as calculate_price_zscores, so the return
+    and z-score bars for the same ticker are directly comparable side by side."""
+    out = {}
+    for label, window in windows.items():
+        if len(series) <= window:
+            out[label] = None
+            continue
+        past = series.iloc[-1 - window]
+        out[label] = float((series.iloc[-1] / past - 1) * 100) if past else None
+    return out
+
 SECTOR_ETFS = {
     "XLK": "Technology", "XLF": "Financials", "XLE": "Energy", "XLV": "Health Care",
     "XLY": "Cons. Discretionary", "XLP": "Cons. Staples", "XLI": "Industrials",
@@ -1906,29 +1919,29 @@ with tabs[4]:
     st.plotly_chart(fig_corr, use_container_width=True)
     csv_download(corr_df if not spy_full.empty and not tlt_full.empty else pd.DataFrame(), "stock_bond_correlation")
 
-    # Index levels & period return + z-scores
+    # Index levels, 1M/3M/1Y returns, and z-scores - returns use the same fixed trailing
+    # windows as the z-scores (not the global date-range slider), so the two charts stay
+    # directly comparable row-for-row and both are labeled unambiguously by period.
     st.markdown('<div class="section-header">Index Levels & Z-Scores</div>', unsafe_allow_html=True)
     idx_rows, idx_z_rows = [], []
     for t, name in MARKET_INDICES.items():
         full = idx_full[t]
         if full.empty:
             continue
-        clipped = _clip_mkt(full)
-        if len(clipped) < 2:
-            continue
-        period_ret = (clipped[name].iloc[-1] / clipped[name].iloc[0] - 1) * 100
-        idx_rows.append({"Index": name, "Level": full[name].iloc[-1], "Period Return %": period_ret})
+        ret = calculate_period_returns(full[name])
+        idx_rows.append({"Index": name, "Level": full[name].iloc[-1], **{f"{k} Return %": v for k, v in ret.items()}})
         z = calculate_price_zscores(full[name])
         idx_z_rows.append({"Index": name, **{f"{k} Z-Score": v for k, v in z.items()}})
-    idx_df = pd.DataFrame(idx_rows).sort_values("Period Return %")
-    idx_z_df = pd.DataFrame(idx_z_rows)
+    idx_df = pd.DataFrame(idx_rows).sort_values("1M Return %")
+    idx_z_df = pd.DataFrame(idx_z_rows).sort_values("1M Z-Score")
 
-    fig_idx_ret = go.Figure(go.Bar(
-        x=idx_df["Period Return %"], y=idx_df["Index"], orientation="h",
-        marker_color=["#26a69a" if v >= 0 else "#ef5350" for v in idx_df["Period Return %"]],
-        hovertemplate="%{y}: %{x:+.1f}%<extra></extra>",
-    ))
-    fig_idx_ret.update_layout(**base_layout("Index Period Return (%)", height=300))
+    fig_idx_ret = go.Figure()
+    for label, color in [("1M Return %", "#42a5f5"), ("3M Return %", "#ab47bc"), ("1Y Return %", "#ff9800")]:
+        fig_idx_ret.add_trace(go.Bar(x=idx_df[label], y=idx_df["Index"], name=label,
+                                     orientation="h", marker_color=color))
+    fig_idx_ret.add_vline(x=0, line_dash="dot", line_color="#555")
+    fig_idx_ret.update_layout(**base_layout("Index Returns — 1M / 3M / 1Y (%)", height=300))
+    fig_idx_ret.update_layout(barmode="group")
     fig_idx_ret.update_xaxes(ticksuffix="%")
 
     fig_idx_z = go.Figure()
@@ -1940,38 +1953,36 @@ with tabs[4]:
     fig_idx_z.update_layout(barmode="group")
 
     render_two_col([
-        ("Index Period Return", fig_idx_ret, idx_df),
+        ("Index Returns", fig_idx_ret, idx_df),
         ("Index Z-Scores", fig_idx_z, idx_z_df),
     ])
 
-    # Sector rotation + z-scores
+    # Sector rotation + z-scores - same 1M/3M/1Y treatment as the index chart above.
     st.markdown('<div class="section-header">Sector Rotation & Z-Scores</div>', unsafe_allow_html=True)
     sec_rows, sec_z_rows = [], []
     for t, name in SECTOR_ETFS.items():
         full = sector_full[t]
         if full.empty:
             continue
-        clipped = _clip_mkt(full)
-        if len(clipped) < 2:
-            continue
-        period_ret = (clipped[name].iloc[-1] / clipped[name].iloc[0] - 1) * 100
-        sec_rows.append({"Sector": name, "Period Return %": period_ret})
+        ret = calculate_period_returns(full[name])
+        sec_rows.append({"Sector": name, **{f"{k} Return %": v for k, v in ret.items()}})
         z = calculate_price_zscores(full[name])
         sec_z_rows.append({"Sector": name, **{f"{k} Z-Score": v for k, v in z.items()}})
     if not spy_full.empty:
-        spy_clipped = _clip_mkt(spy_full)
-        if len(spy_clipped) >= 2:
-            spy_ret = (spy_clipped["SPY"].iloc[-1] / spy_clipped["SPY"].iloc[0] - 1) * 100
-            sec_rows.append({"Sector": "S&P 500 (SPY)", "Period Return %": spy_ret})
-    sec_df = pd.DataFrame(sec_rows).sort_values("Period Return %")
+        spy_ret = calculate_period_returns(spy_full["SPY"])
+        sec_rows.append({"Sector": "S&P 500 (SPY)", **{f"{k} Return %": v for k, v in spy_ret.items()}})
+        spy_z = calculate_price_zscores(spy_full["SPY"])
+        sec_z_rows.append({"Sector": "S&P 500 (SPY)", **{f"{k} Z-Score": v for k, v in spy_z.items()}})
+    sec_df = pd.DataFrame(sec_rows).sort_values("1M Return %")
     sec_z_df = pd.DataFrame(sec_z_rows).sort_values("1M Z-Score") if sec_z_rows else pd.DataFrame()
 
-    fig_sec_ret = go.Figure(go.Bar(
-        x=sec_df["Period Return %"], y=sec_df["Sector"], orientation="h",
-        marker_color=["#26a69a" if v >= 0 else "#ef5350" for v in sec_df["Period Return %"]],
-        hovertemplate="%{y}: %{x:+.1f}%<extra></extra>",
-    ))
-    fig_sec_ret.update_layout(**base_layout("Sector Period Return vs SPY (%)", height=420))
+    fig_sec_ret = go.Figure()
+    for label, color in [("1M Return %", "#42a5f5"), ("3M Return %", "#ab47bc"), ("1Y Return %", "#ff9800")]:
+        fig_sec_ret.add_trace(go.Bar(x=sec_df[label], y=sec_df["Sector"], name=label,
+                                     orientation="h", marker_color=color))
+    fig_sec_ret.add_vline(x=0, line_dash="dot", line_color="#555")
+    fig_sec_ret.update_layout(**base_layout("Sector Returns — 1M / 3M / 1Y (%)", height=420))
+    fig_sec_ret.update_layout(barmode="group")
     fig_sec_ret.update_xaxes(ticksuffix="%")
 
     fig_sec_z = go.Figure()
@@ -1983,7 +1994,7 @@ with tabs[4]:
     fig_sec_z.update_layout(barmode="group")
 
     render_two_col([
-        ("Sector Rotation", fig_sec_ret, sec_df),
+        ("Sector Returns", fig_sec_ret, sec_df),
         ("Sector Z-Scores", fig_sec_z, sec_z_df),
     ])
 
