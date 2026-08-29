@@ -1624,7 +1624,15 @@ with tabs[3]:
         fig_fedwatch.add_hline(y=current_effr, line_dash="dash", line_color="#e0e0e0",
                                 annotation_text=f"Current EFFR ({current_effr:.2f}%)", annotation_position="top left")
         fig_fedwatch.update_layout(**base_layout("Market-Implied Fed Funds"))
-        fig_fedwatch.update_yaxes(ticksuffix="%", title="Implied Rate")
+        # Plotly bars default to a 0-anchored y-axis, which buries a tight cluster of implied
+        # rates (e.g. 3.6-4.3%) in the top sliver of the chart. Bloomberg's WIRP view zooms to
+        # the data instead - do the same: range from just below the lowest of (current EFFR,
+        # implied rates) to just above the highest, not from zero.
+        y_vals = list(fedwatch_df["Implied Rate"]) + [current_effr]
+        y_min, y_max = min(y_vals), max(y_vals)
+        y_pad = (y_max - y_min) * 0.15 or 0.25
+        fig_fedwatch.update_yaxes(ticksuffix="%", title="Implied Rate",
+                                  range=[y_min - y_pad, y_max + y_pad * 1.6])  # extra headroom for outside bar labels
         fig_fedwatch.update_xaxes(title="FOMC Meeting Date")
 
         # How the implied path for these same meetings has shifted over time - same
