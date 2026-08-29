@@ -18,6 +18,7 @@ import yfinance as yf
 # ── Setup ─────────────────────────────────────────────────────────────────────
 load_dotenv()
 fred = Fred(api_key=os.getenv("FRED_API_KEY"))
+EIA_API_KEY = os.getenv("EIA_API_KEY")
 
 st.set_page_config(page_title="US Macro Dashboard", layout="wide", page_icon="🇺🇸")
 
@@ -720,6 +721,78 @@ SECTOR_ETFS = {
 }
 MARKET_INDICES = {"^GSPC": "S&P 500", "^IXIC": "Nasdaq", "^RUT": "Russell 2000", "^DJI": "Dow Jones"}
 
+# ── Oil & Gas (EIA) ──────────────────────────────────────────────────────────────
+EIA_BASE = "https://api.eia.gov/v2"
+
+def _eia_get(path, params, retries=3, backoff=1.5):
+    params = {**params, "api_key": EIA_API_KEY}
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            r = requests.get(f"{EIA_BASE}/{path}", params=params, timeout=20)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            last_exc = e
+            time.sleep(backoff * (attempt + 1))
+    raise last_exc
+
+@st.cache_data(ttl=21600)  # SPR data only updates weekly
+def get_spr_level() -> pd.DataFrame:
+    """U.S. Strategic Petroleum Reserve crude oil ending stocks, weekly, full history since
+    1982 - EIA series WCSSTUS1 (thousand barrels, converted to million barrels here)."""
+    if not EIA_API_KEY:
+        st.warning("EIA_API_KEY not set - Oil & Gas tab needs a free key from eia.gov/opendata/register.php")
+        return pd.DataFrame()
+    try:
+        all_rows, offset = [], 0
+        while True:
+            j = _eia_get("petroleum/stoc/wstk/data/", {
+                "frequency": "weekly", "data[0]": "value", "facets[series][]": "WCSSTUS1",
+                "sort[0][column]": "period", "sort[0][direction]": "asc",
+                "length": 5000, "offset": offset,
+            })
+            rows = j["response"]["data"]
+            all_rows.extend(rows)
+            if len(rows) < 5000:
+                break
+            offset += 5000
+        df = pd.DataFrame(all_rows)
+        df["date"] = pd.to_datetime(df["period"])
+        df["SPR (Million Barrels)"] = pd.to_numeric(df["value"], errors="coerce") / 1000
+        out = df.set_index("date")[["SPR (Million Barrels)"]].sort_index()
+        return out
+    except Exception as e:
+        st.warning(f"Could not load SPR data: {e}")
+        return pd.DataFrame()
+
+# Statutory floor for the SPR's non-emergency ("routine") drawdown authority - 42 U.S.C.
+# 6241(h): petroleum cannot be drawn down under this authority "if there are fewer than
+# 252,400,000 barrels ... in the Reserve", and a drawdown under this specific subsection
+# additionally requires "the Secretary of Defense has found that action taken under this
+# subsection will not impair national security" - the "SecDef-authorized floor". This does
+# NOT apply to the President's separate emergency drawdown authority (subsection (d)), which
+# has no statutory minimum. Verified live against the US Code (Cornell Law, 42 USC 6241).
+SPR_SECDEF_FLOOR = 252.4  # million barrels
+
+def estimate_time_to_floor(series: pd.Series, floor: float, freq: str = "weekly") -> dict:
+    """Projects weeks (or months) until `series` reaches `floor` at the current drawdown pace.
+    Weekly series: drawdown rate = 4-period moving average of the period-over-period change
+    (smooths weekly noise). Monthly series: drawdown rate = latest single month's change only
+    (no averaging - one data point per month is already a smoothed read). Returns
+    periods_to_floor=None if the series isn't currently declining (undefined ETA)."""
+    diffs = series.diff().dropna()
+    if diffs.empty:
+        return {"rate_per_period": None, "periods_to_floor": None, "eta_date": None}
+    rate = diffs.tail(4).mean() if freq == "weekly" else diffs.iloc[-1]
+    current = series.iloc[-1]
+    if rate >= 0:  # flat or refilling - no defined time-to-floor
+        return {"rate_per_period": float(rate), "periods_to_floor": None, "eta_date": None}
+    periods = max((current - floor) / abs(rate), 0)
+    unit_days = 7 if freq == "weekly" else 30
+    eta_date = series.index[-1] + pd.Timedelta(days=periods * unit_days)
+    return {"rate_per_period": float(rate), "periods_to_floor": float(periods), "eta_date": eta_date}
+
 # ── Date range ────────────────────────────────────────────────────────────────
 st.title("🇺🇸 US Macro Dashboard")
 
@@ -881,6 +954,7 @@ st.markdown("<br>", unsafe_allow_html=True)
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 tabs = st.tabs([
     "Prices",
+    "Oil & Gas",
     "Labour Market",
     "Housing",
     "Treasury & Rates",
@@ -1105,9 +1179,82 @@ with tabs[0]:
     render_two_col(inflation_charts)
 
 # ════════════════════════════════════════════════════════════════════════════════
-# TAB 2 — Labour Market
+# TAB 2 — Oil & Gas
 # ════════════════════════════════════════════════════════════════════════════════
 with tabs[1]:
+    st.header("Oil & Gas")
+    st.caption("Strategic Petroleum Reserve - EIA (api.eia.gov), not FRED. A different data domain "
+               "from the rest of this dashboard.")
+
+    with st.spinner("Loading SPR data…"):
+        spr = get_spr_level()
+
+    if spr.empty:
+        st.info("SPR data unavailable this run.")
+    else:
+        latest_level = spr["SPR (Million Barrels)"].iloc[-1]
+        ath = spr["SPR (Million Barrels)"].max()
+        ath_date = spr["SPR (Million Barrels)"].idxmax()
+        pct_of_ath = latest_level / ath * 100
+        proj = estimate_time_to_floor(spr["SPR (Million Barrels)"], SPR_SECDEF_FLOOR, freq="weekly")
+
+        m1, m2, m3, m4 = st.columns(4)
+        with m1:
+            st.metric("Latest SPR Level", f"{latest_level:,.1f}M bbls", help=f"As of {spr.index[-1].strftime('%b %d, %Y')}")
+        with m2:
+            st.metric("All-Time High", f"{ath:,.1f}M bbls", help=f"{ath_date.strftime('%b %Y')}")
+        with m3:
+            st.metric("% of All-Time High", f"{pct_of_ath:.1f}%")
+        with m4:
+            if proj["periods_to_floor"] is not None:
+                weeks = proj["periods_to_floor"]
+                st.metric("Est. Time to SecDef Floor", f"{weeks:,.0f} weeks",
+                         delta=f"~{proj['eta_date'].strftime('%b %Y')}", delta_color="off",
+                         help=f"Floor: {SPR_SECDEF_FLOOR:.1f}M bbls (42 USC 6241(h), the non-emergency "
+                              f"drawdown minimum requiring Secretary of Defense sign-off). Drawdown rate: "
+                              f"4-week moving average of the weekly change, currently {proj['rate_per_period']:+.2f}M bbls/week.")
+            else:
+                st.metric("Est. Time to SecDef Floor", "N/A",
+                         help="Not currently drawing down (4-week average weekly change is flat or positive), "
+                              "so time-to-floor is undefined.")
+
+        st.caption(f"**SecDef-authorized floor: {SPR_SECDEF_FLOOR:.1f}M bbls** — the statutory minimum for the "
+                   f"SPR's non-emergency drawdown authority (42 U.S.C. § 6241(h)); a drawdown under this "
+                   f"specific authority requires the Secretary of Defense to confirm it \"will not impair "
+                   f"national security.\" This does not apply to the President's separate emergency-drawdown "
+                   f"authority, which has no statutory minimum.")
+
+        fig_spr = go.Figure()
+        fig_spr.add_trace(go.Scatter(x=spr.index, y=spr["SPR (Million Barrels)"], name="SPR Level",
+                                     line=dict(color="#e08b4f"), fill="tozeroy", fillcolor="rgba(224,139,79,0.12)"))
+        fig_spr.add_hline(y=SPR_SECDEF_FLOOR, line_dash="dash", line_color="#ef5350",
+                          annotation_text=f"SecDef Floor ({SPR_SECDEF_FLOOR:.1f}M)", annotation_position="bottom right")
+        fig_spr.update_layout(**base_layout("SPR Level — Full History (Weekly)"))
+        fig_spr.update_yaxes(title="Million Barrels")
+        add_recessions(fig_spr, recessions)
+
+        spr_recent = spr[spr.index >= (spr.index[-1] - pd.DateOffset(years=2))].copy()
+        spr_recent["WoW Change"] = spr_recent["SPR (Million Barrels)"].diff()
+        spr_recent["4W MA"] = spr_recent["WoW Change"].rolling(4).mean()
+        fig_spr_chg = go.Figure()
+        fig_spr_chg.add_trace(go.Bar(x=spr_recent.index, y=spr_recent["WoW Change"],
+                                     marker_color=["#26a69a" if v >= 0 else "#ef5350" for v in spr_recent["WoW Change"].fillna(0)],
+                                     name="Weekly Change", opacity=0.6))
+        fig_spr_chg.add_trace(go.Scatter(x=spr_recent.index, y=spr_recent["4W MA"],
+                                         name="4W MA (Drawdown Rate)", line=dict(color="white", width=2)))
+        fig_spr_chg.add_hline(y=0, line_dash="dot", line_color="#555")
+        fig_spr_chg.update_layout(**base_layout("SPR Weekly Change + 4W Moving Average (Last 2Y)"))
+        fig_spr_chg.update_yaxes(title="Million Barrels")
+
+        render_two_col([
+            ("SPR Level", fig_spr, spr),
+            ("SPR Weekly Change", fig_spr_chg, spr_recent),
+        ])
+
+# ════════════════════════════════════════════════════════════════════════════════
+# TAB 3 — Labour Market
+# ════════════════════════════════════════════════════════════════════════════════
+with tabs[2]:
     st.header("Labour Market")
     with st.spinner("Loading labour data…"):
         wages   = mom_yoy(fetch("CES0500000003", "Avg Hourly Earnings", START, END), "Avg Hourly Earnings")
@@ -1283,9 +1430,9 @@ with tabs[1]:
     render_two_col(labor_charts)
 
 # ════════════════════════════════════════════════════════════════════════════════
-# TAB 3 — Housing
+# TAB 4 — Housing
 # ════════════════════════════════════════════════════════════════════════════════
-with tabs[2]:
+with tabs[3]:
     st.header("Housing")
     with st.spinner("Loading housing data…"):
         home_sales  = fetch("EXHOSLUSM495S", "Existing Home Sales", START, END)
@@ -1446,9 +1593,9 @@ with tabs[2]:
                "Existing Home Sales series above, which also only carries recent history.")
 
 # ════════════════════════════════════════════════════════════════════════════════
-# TAB 4 — Monetary & Rates
+# TAB 5 — Monetary & Rates
 # ════════════════════════════════════════════════════════════════════════════════
-with tabs[3]:
+with tabs[4]:
     st.header("Monetary Policy & Rates")
     with st.spinner("Loading monetary data…"):
         fed_total  = fetch("WALCL",        "Fed Total Assets (M)", START, END)
@@ -1838,9 +1985,9 @@ with tabs[3]:
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-# TAB 5 — US Markets
+# TAB 6 — US Markets
 # ════════════════════════════════════════════════════════════════════════════════
-with tabs[4]:
+with tabs[5]:
     st.header("US Markets")
     st.caption("Equities and cross-asset - a different data domain from the rest of this dashboard "
                "(yfinance, not FRED, for most of this tab). Charts respect the global date range above; "
@@ -2069,9 +2216,9 @@ with tabs[4]:
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-# TAB 6 — Fiscal Policy & Government Spending
+# TAB 7 — Fiscal Policy & Government Spending
 # ════════════════════════════════════════════════════════════════════════════════
-with tabs[5]:
+with tabs[6]:
     st.header("Fiscal Policy & Government Spending")
     st.caption("US Treasury Fiscal Data API — Daily Treasury Statement, Debt Subject to Limit, "
                "Monthly Treasury Statement.")
@@ -2183,9 +2330,9 @@ with tabs[5]:
                "reset, not a real spending spike.")
 
 # ════════════════════════════════════════════════════════════════════════════════
-# TAB 7 — Leading Indicators
+# TAB 8 — Leading Indicators
 # ════════════════════════════════════════════════════════════════════════════════
-with tabs[6]:
+with tabs[7]:
     st.header("Leading Indicators")
     with st.spinner("Loading leading indicator data…"):
         ism_mfg  = fetch("MANEMP",    "ISM Mfg Employment", START, END)
@@ -2267,9 +2414,9 @@ with tabs[6]:
     render_two_col(leading_charts)
 
 # ════════════════════════════════════════════════════════════════════════════════
-# TAB 8 — Economic Calendar
+# TAB 9 — Economic Calendar
 # ════════════════════════════════════════════════════════════════════════════════
-with tabs[7]:
+with tabs[8]:
     st.header("Economic Calendar")
     st.caption("Next scheduled release dates (FRED) + upcoming FOMC meetings + upcoming Treasury auctions. "
                "No consensus/forecast column - that's commercial data with no free legitimate source; "
