@@ -1017,6 +1017,52 @@ with tabs[0]:
         ]
         pce_components = {label: mom_yoy(fetch(sid, label, START, END), label) for label, sid in PCE_COMPONENTS}
 
+        # PCE weights - nominal-dollar expenditure shares (current $, distinct from the
+        # chain-type price index series above used for MoM/YoY). These update monthly via
+        # FRED, unlike CPI's BLS relative-importance weights, which are a static annual table
+        # published only as an HTML page BLS blocks scripted access to (confirmed live: direct
+        # curl and WebFetch both 403, even against the raw flat-file mirror) - PCE is the only
+        # side of this that's realistically live-refreshable, hence weighting PCE only.
+        PCE_WEIGHT_SERIES = {
+            "Services":                        "PCES",
+            "Durable Goods":                   "PCEDG",
+            "Nondurable Goods":                "PCEND",
+            "Food":                            "DFXARC1M027SBEA",
+            "Energy Goods & Services":         "DNRGRC1M027SBEA",
+            "Services Excl. Energy & Housing": "LA001260M",  # millions of $; the rest are billions
+        }
+        pce_total_df = fetch("PCE", "PCE Total", START, END)
+        pce_weights = {}
+        if not pce_total_df.empty:
+            pce_total = pce_total_df["PCE Total"].dropna().iloc[-1]
+            pce_levels = {}
+            for label, sid in PCE_WEIGHT_SERIES.items():
+                df_w = fetch(sid, f"{label} $", START, END)
+                if df_w.empty:
+                    continue
+                val = df_w[f"{label} $"].dropna().iloc[-1]
+                if sid == "LA001260M":
+                    val = val / 1000  # millions -> billions, to match the other series' units
+                pce_levels[label] = val
+                pce_weights[label] = val / pce_total * 100
+            if "Durable Goods" in pce_levels and "Nondurable Goods" in pce_levels:
+                pce_weights["Goods"] = (pce_levels["Durable Goods"] + pce_levels["Nondurable Goods"]) / pce_total * 100
+
+        # GDP vs 30Y Treasury yield - Real & Nominal GDP YoY (quarterly pct_change(4), since
+        # mom_yoy() above assumes monthly cadence) plotted as grouped bars against the 30Y
+        # yield as a line, all on one shared % axis (levels would need a $ vs % dual axis,
+        # which fights against reading the yield line cleanly against the bars).
+        real_gdp = fetch("GDPC1", "Real GDP", START, END)
+        nom_gdp  = fetch("GDP", "Nominal GDP", START, END)
+        gdp_dgs30 = fetch("DGS30", "30Y Treasury", START, END)
+        real_gdp_yoy = (real_gdp["Real GDP"].pct_change(4) * 100).round(3).dropna() if not real_gdp.empty else pd.Series(dtype=float)
+        nom_gdp_yoy  = (nom_gdp["Nominal GDP"].pct_change(4) * 100).round(3).dropna() if not nom_gdp.empty else pd.Series(dtype=float)
+        gdp_y30_aligned = pd.Series(dtype=float)
+        if not gdp_dgs30.empty and not real_gdp_yoy.empty:
+            dgs30_sorted = gdp_dgs30.rename(columns={"30Y Treasury": "y30"}).dropna().reset_index().sort_values("date")
+            gdp_dates = pd.DataFrame({"date": real_gdp_yoy.index}).sort_values("date")
+            gdp_y30_aligned = pd.merge_asof(gdp_dates, dgs30_sorted, on="date", direction="forward").set_index("date")["y30"]
+
     # CPI vs Core CPI
     fig_cpi = go.Figure()
     for col, color in [("CPI YoY %","#ef5350"),("Core CPI YoY %","#ff9800"),
@@ -1149,19 +1195,49 @@ with tabs[0]:
         mom_s, yoy_s = df_c[mom_col].dropna(), df_c[yoy_col].dropna()
         if mom_s.empty or yoy_s.empty:
             continue
-        pce_comp_rows.append({"Component": label, "MoM %": mom_s.iloc[-1], "YoY %": yoy_s.iloc[-1], "As Of": df_c.index[-1]})
+        mom_latest, yoy_latest = mom_s.iloc[-1], yoy_s.iloc[-1]
+        weight = pce_weights.get(label)
+        pce_comp_rows.append({
+            "Component": label, "MoM %": mom_latest, "YoY %": yoy_latest,
+            "Weight %": weight,
+            "Weighted MoM (pp)": weight / 100 * mom_latest if weight is not None else None,
+            "Weighted YoY (pp)": weight / 100 * yoy_latest if weight is not None else None,
+            "As Of": df_c.index[-1],
+        })
     pce_comp_df = pd.DataFrame(pce_comp_rows).sort_values("YoY %", ascending=True)
     pce_comp_latest_date = pce_comp_df["As Of"].max().strftime("%b %Y") if not pce_comp_df.empty else ""
     pce_comp_df = pce_comp_df.drop(columns="As Of")
 
+    # Weight-adjusted bars use nominal-$ PCE expenditure shares (pce_weights, fetched above).
+    # "Goods" and "Services Excl. Energy & Housing" overlap other rows (Goods = Durable +
+    # Nondurable; Services Excl. Energy & Housing is a subset of Services) - included for
+    # visibility, but not meant to be summed together with the rows they overlap.
     fig_pce_comp_snap = go.Figure()
     fig_pce_comp_snap.add_trace(go.Bar(y=pce_comp_df["Component"], x=pce_comp_df["YoY %"], name="YoY %",
                                         orientation="h", marker_color="#26a69a"))
     fig_pce_comp_snap.add_trace(go.Bar(y=pce_comp_df["Component"], x=pce_comp_df["MoM %"], name="MoM %",
                                         orientation="h", marker_color="#80cbc4"))
-    fig_pce_comp_snap.update_layout(**base_layout(f"PCE Components — Latest MoM & YoY % ({pce_comp_latest_date})", height=380))
+    fig_pce_comp_snap.add_trace(go.Bar(y=pce_comp_df["Component"], x=pce_comp_df["Weighted YoY (pp)"], name="Weighted YoY (pp)",
+                                        orientation="h", marker_color="#f5a24c"))
+    fig_pce_comp_snap.add_trace(go.Bar(y=pce_comp_df["Component"], x=pce_comp_df["Weighted MoM (pp)"], name="Weighted MoM (pp)",
+                                        orientation="h", marker_color="#ffcc80"))
+    fig_pce_comp_snap.update_layout(**base_layout(f"PCE Components — Latest MoM & YoY % + Weight-Adjusted Contribution (pp) ({pce_comp_latest_date})", height=440))
     fig_pce_comp_snap.update_layout(barmode="group")
-    fig_pce_comp_snap.update_xaxes(ticksuffix="%")
+    fig_pce_comp_snap.update_xaxes(ticksuffix="%", title="% (raw) / pp (weight-adjusted contribution)")
+
+    # Real & Nominal GDP (YoY %) vs 30Y Treasury yield - GDP as grouped bars, yield as an
+    # overlaid line, all on one shared % axis so the growth-vs-borrowing-cost read (is nominal
+    # GDP outgrowing the 30Y yield) doesn't require a dual-axis.
+    fig_gdp_30y = go.Figure()
+    fig_gdp_30y.add_trace(go.Bar(x=real_gdp_yoy.index, y=real_gdp_yoy.values, name="Real GDP YoY %", marker_color="#4c8bf5"))
+    fig_gdp_30y.add_trace(go.Bar(x=nom_gdp_yoy.index, y=nom_gdp_yoy.values, name="Nominal GDP YoY %", marker_color="#f5a24c"))
+    if not gdp_y30_aligned.empty:
+        fig_gdp_30y.add_trace(go.Scatter(x=gdp_y30_aligned.index, y=gdp_y30_aligned.values, name="30Y Treasury Yield",
+                                          mode="lines+markers", line=dict(color="#c85fd6", width=2)))
+    fig_gdp_30y.update_layout(**base_layout("Real & Nominal GDP (YoY %) vs. 30Y Treasury Yield"))
+    fig_gdp_30y.update_layout(barmode="group")
+    fig_gdp_30y.update_yaxes(ticksuffix="%")
+    add_recessions(fig_gdp_30y, recessions)
 
     inflation_charts = [
         ("CPI vs Core CPI", fig_cpi, pd.concat([cpi, core_cpi], axis=1)),
@@ -1175,6 +1251,9 @@ with tabs[0]:
         ("CPI Components Snapshot", fig_cpi_comp_snap, comp_df),
         ("PCE Components History", fig_pce_comp_hist, pd.concat([pce_components[l] for l, _ in PCE_COMPONENTS], axis=1)),
         ("PCE Components Snapshot", fig_pce_comp_snap, pce_comp_df),
+        ("GDP vs 30Y Treasury Yield", fig_gdp_30y, pd.DataFrame({
+            "Real GDP YoY %": real_gdp_yoy, "Nominal GDP YoY %": nom_gdp_yoy, "30Y Treasury Yield": gdp_y30_aligned,
+        })),
     ]
     render_two_col(inflation_charts)
 
