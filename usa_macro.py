@@ -1810,15 +1810,23 @@ with tabs[4]:
     fig_real.update_layout(**base_layout("Real Yields vs Breakevens"))
     add_recessions(fig_real, recessions)
 
-    # Credit spreads - FRED reports these OAS series in percentage points, not bps
+    # Credit spreads - FRED reports these OAS series in percentage points, not bps.
+    # IG and HY now share one axis (both bps, directly comparable); the HY-IG differential
+    # gets its own axis since it moves on a much smaller scale than either level.
     fig_credit = go.Figure()
     if not ig_oas.empty:
         fig_credit.add_trace(go.Scatter(x=ig_oas.index, y=ig_oas["IG OAS"] * 100,
                                         name="IG OAS", line=dict(color="#26a69a"), yaxis="y"))
     if not hy_oas.empty:
         fig_credit.add_trace(go.Scatter(x=hy_oas.index, y=hy_oas["HY OAS"] * 100,
-                                        name="HY OAS", line=dict(color="#ef5350"), yaxis="y2"))
-    fig_credit.update_layout(**dual_axis_layout("Credit Spreads — IG & HY OAS (bps)", "IG OAS (bps)", "HY OAS (bps)"))
+                                        name="HY OAS", line=dict(color="#ef5350"), yaxis="y"))
+    credit_diff_df = pd.DataFrame()
+    if not ig_oas.empty and not hy_oas.empty:
+        credit_diff = ((hy_oas["HY OAS"] - ig_oas["IG OAS"]) * 100).dropna()
+        credit_diff_df = pd.DataFrame({"HY-IG Diff (bps)": credit_diff})
+        fig_credit.add_trace(go.Scatter(x=credit_diff.index, y=credit_diff.values,
+                                        name="HY − IG Differential", line=dict(color="#ff9800", dash="dot"), yaxis="y2"))
+    fig_credit.update_layout(**dual_axis_layout("Credit Spreads — IG & HY OAS vs. HY−IG Differential (bps)", "IG & HY OAS (bps)", "HY − IG Differential (bps)"))
     add_recessions(fig_credit, recessions)
 
     monetary_charts = [
@@ -1829,7 +1837,7 @@ with tabs[4]:
         ("Yield Curve Changes", fig_yc_chg, None),
         ("Treasury Spreads",  fig_spreads, spreads),
         ("Real Yields vs Breakevens", fig_real, pd.concat([tips_5y, tips_10y, be_5y2, be_10y2], axis=1)),
-        ("Credit Spreads",    fig_credit, pd.concat([ig_oas, hy_oas], axis=1)),
+        ("Credit Spreads",    fig_credit, pd.concat([ig_oas, hy_oas, credit_diff_df], axis=1)),
     ]
     render_two_col(monetary_charts)
 
