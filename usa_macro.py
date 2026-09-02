@@ -1000,53 +1000,57 @@ with tabs[0]:
         ]
         cpi_components = {label: mom_yoy(fetch(sid, label, START, END), label) for label, sid in CPI_COMPONENTS}
 
-        # PCE components - BEA's monthly PCE price index release is coarser than BLS's CPI
-        # release: it only splits Goods/Services (each further split Durable/Nondurable, plus
-        # Food and Energy as cross-cutting cuts) at monthly frequency. The finer CPI-style
-        # categories (Housing, Health Care, Transportation Services, Recreation Services etc.)
-        # only exist in BEA's underlying-detail tables at quarterly/annual frequency, so
-        # they're left out here rather than mixed with monthly series at a different cadence.
+        # PCE components - a genuinely non-overlapping partition of PCE (BEA NIPA Table 2.4.5,
+        # "Personal Consumption Expenditures by Type of Product" - verified live via FRED's
+        # release/tables API, not guessed). The previous 7-category set mixed a clean
+        # Goods/Durable/Nondurable/Services split with cross-cutting memo categories (Food,
+        # Energy, Services-Excl-Energy&Housing) that overlapped both the clean split and each
+        # other, so weights never summed to 100% and nothing here was meant to be added up -
+        # confusing without a caption explaining it. This 16-category set IS BEA's actual leaf
+        # level of the Goods/Services tree, so every dollar of PCE falls into exactly one row.
+        # Only available quarterly at BEA/FRED (confirmed - no monthly series at this
+        # granularity exists), so this section runs at quarterly cadence unlike the rest of
+        # the Prices tab.
         PCE_COMPONENTS = [
-            ("Goods",                          "DGDSRG3M086SBEA"),
-            ("Services",                       "DSERRG3M086SBEA"),
-            ("Durable Goods",                  "DDURRG3M086SBEA"),
-            ("Nondurable Goods",                "DNDGRG3M086SBEA"),
-            ("Food",                           "DFXARG3M086SBEA"),
-            ("Energy Goods & Services",        "DNRGRG3M086SBEA"),
-            ("Services Excl. Energy & Housing","IA001260M"),
+            ("Motor Vehicles & Parts",             "DMOT"),
+            ("Furnishings & Durable HH Equipment",  "DFDH"),
+            ("Recreational Goods & Vehicles",       "DREQ"),
+            ("Other Durable Goods",                 "DODG"),
+            ("Food & Beverages (Off-Premises)",     "DFXA"),
+            ("Clothing & Footwear",                 "DCLO"),
+            ("Gasoline & Other Energy Goods",       "DGOE"),
+            ("Other Nondurable Goods",              "DONG"),
+            ("Housing & Utilities",                 "DHUT"),
+            ("Health Care",                         "DHLC"),
+            ("Transportation Services",             "DTRS"),
+            ("Recreation Services",                 "DRCA"),
+            ("Food Services & Accommodations",      "DFSA"),
+            ("Financial Services & Insurance",       "DIFS"),
+            ("Other Services",                      "DOTS"),
+            ("Nonprofit Institutions (NPISH)",      "DNPI"),
         ]
-        pce_components = {label: mom_yoy(fetch(sid, label, START, END), label) for label, sid in PCE_COMPONENTS}
 
-        # PCE weights - nominal-dollar expenditure shares (current $, distinct from the
-        # chain-type price index series above used for MoM/YoY). These update monthly via
-        # FRED, unlike CPI's BLS relative-importance weights, which are a static annual table
-        # published only as an HTML page BLS blocks scripted access to (confirmed live: direct
-        # curl and WebFetch both 403, even against the raw flat-file mirror) - PCE is the only
-        # side of this that's realistically live-refreshable, hence weighting PCE only.
-        PCE_WEIGHT_SERIES = {
-            "Services":                        "PCES",
-            "Durable Goods":                   "PCEDG",
-            "Nondurable Goods":                "PCEND",
-            "Food":                            "DFXARC1M027SBEA",
-            "Energy Goods & Services":         "DNRGRC1M027SBEA",
-            "Services Excl. Energy & Housing": "LA001260M",  # millions of $; the rest are billions
-        }
-        pce_total_df = fetch("PCE", "PCE Total", START, END)
-        pce_weights = {}
-        if not pce_total_df.empty:
-            pce_total = pce_total_df["PCE Total"].dropna().iloc[-1]
-            pce_levels = {}
-            for label, sid in PCE_WEIGHT_SERIES.items():
-                df_w = fetch(sid, f"{label} $", START, END)
-                if df_w.empty:
-                    continue
-                val = df_w[f"{label} $"].dropna().iloc[-1]
-                if sid == "LA001260M":
-                    val = val / 1000  # millions -> billions, to match the other series' units
-                pce_levels[label] = val
-                pce_weights[label] = val / pce_total * 100
-            if "Durable Goods" in pce_levels and "Nondurable Goods" in pce_levels:
-                pce_weights["Goods"] = (pce_levels["Durable Goods"] + pce_levels["Nondurable Goods"]) / pce_total * 100
+        def qoq_yoy(df: pd.DataFrame, col: str) -> pd.DataFrame:
+            if df.empty or col not in df.columns:
+                return pd.DataFrame(columns=[f"{col} QoQ %", f"{col} YoY %"])
+            out = pd.DataFrame(index=df.index)
+            out[f"{col} QoQ %"] = (df[col].pct_change() * 100).round(3)
+            out[f"{col} YoY %"] = (df[col].pct_change(4) * 100).round(3)
+            return out
+
+        pce_components = {label: qoq_yoy(fetch(f"{root}RG3Q086SBEA", label, START, END), label)
+                           for label, root in PCE_COMPONENTS}
+
+        # Weights - nominal-dollar expenditure shares. Since these 16 categories are a complete
+        # partition by construction, the total is just their own sum - no separate "PCE Total"
+        # series needed, and weights always sum to exactly 100%.
+        pce_levels = {}
+        for label, root in PCE_COMPONENTS:
+            df_w = fetch(f"{root}RC1Q027SBEA", f"{label} $", START, END)
+            if not df_w.empty:
+                pce_levels[label] = df_w[f"{label} $"].dropna().iloc[-1]
+        pce_total = sum(pce_levels.values())
+        pce_weights = {label: val / pce_total * 100 for label, val in pce_levels.items()} if pce_total else {}
 
         # GDP vs 30Y Treasury yield - Real & Nominal GDP YoY (quarterly pct_change(4), since
         # mom_yoy() above assumes monthly cadence) plotted as grouped bars against the 30Y
@@ -1175,55 +1179,49 @@ with tabs[0]:
     fig_cpi_comp_snap.update_layout(barmode="group")
     fig_cpi_comp_snap.update_xaxes(ticksuffix="%")
 
-    # PCE components - YoY % history (7 groups) + latest MoM/YoY snapshot, same pairing as CPI
+    # PCE components - YoY % history (16 non-overlapping groups) + latest QoQ/YoY snapshot.
+    # Quarterly cadence (see PCE_COMPONENTS comment above), unlike CPI's monthly history.
     fig_pce_comp_hist = go.Figure()
     for label, _ in PCE_COMPONENTS:
         df_c = pce_components[label]
         col = f"{label} YoY %"
         if not df_c.empty and col in df_c.columns:
             fig_pce_comp_hist.add_trace(go.Scatter(x=df_c.index, y=df_c[col], name=label, mode="lines"))
-    fig_pce_comp_hist.update_layout(**base_layout("PCE Components — YoY %"))
+    fig_pce_comp_hist.update_layout(**base_layout("PCE Components — YoY % (Quarterly)"))
     fig_pce_comp_hist.update_yaxes(ticksuffix="%")
     add_recessions(fig_pce_comp_hist, recessions)
 
     pce_comp_rows = []
     for label, _ in PCE_COMPONENTS:
         df_c = pce_components[label]
-        mom_col, yoy_col = f"{label} MoM %", f"{label} YoY %"
-        if df_c.empty or mom_col not in df_c.columns:
+        qoq_col, yoy_col = f"{label} QoQ %", f"{label} YoY %"
+        if df_c.empty or qoq_col not in df_c.columns:
             continue
-        mom_s, yoy_s = df_c[mom_col].dropna(), df_c[yoy_col].dropna()
-        if mom_s.empty or yoy_s.empty:
+        qoq_s, yoy_s = df_c[qoq_col].dropna(), df_c[yoy_col].dropna()
+        if qoq_s.empty or yoy_s.empty:
             continue
-        mom_latest, yoy_latest = mom_s.iloc[-1], yoy_s.iloc[-1]
         weight = pce_weights.get(label)
+        label_with_weight = f"{label} ({weight:.1f}%)" if weight is not None else label
         pce_comp_rows.append({
-            "Component": label, "MoM %": mom_latest, "YoY %": yoy_latest,
-            "Weight %": weight,
-            "Weighted MoM (pp)": weight / 100 * mom_latest if weight is not None else None,
-            "Weighted YoY (pp)": weight / 100 * yoy_latest if weight is not None else None,
+            "Component": label_with_weight, "Weight %": weight,
+            "QoQ %": qoq_s.iloc[-1], "YoY %": yoy_s.iloc[-1],
             "As Of": df_c.index[-1],
         })
     pce_comp_df = pd.DataFrame(pce_comp_rows).sort_values("YoY %", ascending=True)
     pce_comp_latest_date = pce_comp_df["As Of"].max().strftime("%b %Y") if not pce_comp_df.empty else ""
     pce_comp_df = pce_comp_df.drop(columns="As Of")
 
-    # Weight-adjusted bars use nominal-$ PCE expenditure shares (pce_weights, fetched above).
-    # "Goods" and "Services Excl. Energy & Housing" overlap other rows (Goods = Durable +
-    # Nondurable; Services Excl. Energy & Housing is a subset of Services) - included for
-    # visibility, but not meant to be summed together with the rows they overlap.
+    # Weight is baked into each category's label (e.g. "Housing & Utilities (23.4%)") rather
+    # than a separate bar - since this is a complete, non-overlapping partition, the weights
+    # already sum to 100% and don't need a contribution/pp calculation to be meaningful.
     fig_pce_comp_snap = go.Figure()
     fig_pce_comp_snap.add_trace(go.Bar(y=pce_comp_df["Component"], x=pce_comp_df["YoY %"], name="YoY %",
                                         orientation="h", marker_color="#26a69a"))
-    fig_pce_comp_snap.add_trace(go.Bar(y=pce_comp_df["Component"], x=pce_comp_df["MoM %"], name="MoM %",
+    fig_pce_comp_snap.add_trace(go.Bar(y=pce_comp_df["Component"], x=pce_comp_df["QoQ %"], name="QoQ %",
                                         orientation="h", marker_color="#80cbc4"))
-    fig_pce_comp_snap.add_trace(go.Bar(y=pce_comp_df["Component"], x=pce_comp_df["Weighted YoY (pp)"], name="Weighted YoY (pp)",
-                                        orientation="h", marker_color="#f5a24c"))
-    fig_pce_comp_snap.add_trace(go.Bar(y=pce_comp_df["Component"], x=pce_comp_df["Weighted MoM (pp)"], name="Weighted MoM (pp)",
-                                        orientation="h", marker_color="#ffcc80"))
-    fig_pce_comp_snap.update_layout(**base_layout(f"PCE Components — Latest MoM & YoY % + Weight-Adjusted Contribution (pp) ({pce_comp_latest_date})", height=440))
+    fig_pce_comp_snap.update_layout(**base_layout(f"PCE Components — Latest QoQ & YoY % ({pce_comp_latest_date})", height=560))
     fig_pce_comp_snap.update_layout(barmode="group")
-    fig_pce_comp_snap.update_xaxes(ticksuffix="%", title="% (raw) / pp (weight-adjusted contribution)")
+    fig_pce_comp_snap.update_xaxes(ticksuffix="%")
 
     # Real & Nominal GDP (YoY %) vs 30Y Treasury yield - GDP as grouped bars, yield as an
     # overlaid line, all on one shared % axis so the growth-vs-borrowing-cost read (is nominal
