@@ -1052,6 +1052,36 @@ with tabs[0]:
         pce_total = sum(pce_levels.values())
         pce_weights = {label: val / pce_total * 100 for label, val in pce_levels.items()} if pce_total else {}
 
+        # Monthly "parent" categories - Durable Goods, Nondurable Goods, and Services DO update
+        # monthly (mom_yoy(), same cadence as the rest of the tab), unlike the 16 quarterly-only
+        # children above. Shown as header rows with their matching children nested underneath,
+        # so the chart gets a fresh top-level number every month even though the granular detail
+        # only refreshes once a quarter.
+        PCE_PARENTS = [
+            ("Durable Goods",    "DDURRG3M086SBEA", "PCEDG"),
+            ("Nondurable Goods", "DNDGRG3M086SBEA", "PCEND"),
+            ("Services",         "DSERRG3M086SBEA", "PCES"),
+        ]
+        PCE_PARENT_CHILDREN = {
+            "Durable Goods": ["Motor Vehicles & Parts", "Furnishings & Durable HH Equipment",
+                              "Recreational Goods & Vehicles", "Other Durable Goods"],
+            "Nondurable Goods": ["Food & Beverages (Off-Premises)", "Clothing & Footwear",
+                                 "Gasoline & Other Energy Goods", "Other Nondurable Goods"],
+            "Services": ["Housing & Utilities", "Health Care", "Transportation Services",
+                         "Recreation Services", "Food Services & Accommodations",
+                         "Financial Services & Insurance", "Other Services",
+                         "Nonprofit Institutions (NPISH)"],
+        }
+        pce_parent_data = {label: mom_yoy(fetch(pid, label, START, END), label) for label, pid, _ in PCE_PARENTS}
+        pce_total_monthly_df = fetch("PCE", "PCE Total (Monthly)", START, END)
+        pce_parent_weights = {}
+        if not pce_total_monthly_df.empty:
+            pce_total_monthly = pce_total_monthly_df["PCE Total (Monthly)"].dropna().iloc[-1]
+            for label, _, wid in PCE_PARENTS:
+                df_pw = fetch(wid, f"{label} $ (Monthly)", START, END)
+                if not df_pw.empty:
+                    pce_parent_weights[label] = df_pw[f"{label} $ (Monthly)"].dropna().iloc[-1] / pce_total_monthly * 100
+
         # GDP vs 30Y Treasury yield - Real & Nominal GDP YoY (quarterly pct_change(4), since
         # mom_yoy() above assumes monthly cadence) plotted as grouped bars against the 30Y
         # yield as a line, all on one shared % axis (levels would need a $ vs % dual axis,
@@ -1191,37 +1221,52 @@ with tabs[0]:
     fig_pce_comp_hist.update_yaxes(ticksuffix="%")
     add_recessions(fig_pce_comp_hist, recessions)
 
+    # Grouped snapshot: each monthly parent (Durable Goods / Nondurable Goods / Services) as a
+    # header row, its non-overlapping quarterly children nested underneath - gives a fresh
+    # top-level number every month even though the granular detail only refreshes quarterly.
+    # Parent rows use YoY/MoM, child rows use YoY/QoQ; row order is fixed (not sorted by value)
+    # so the grouping stays intact, and colors are darker for parents, lighter for children.
     pce_comp_rows = []
-    for label, _ in PCE_COMPONENTS:
-        df_c = pce_components[label]
-        qoq_col, yoy_col = f"{label} QoQ %", f"{label} YoY %"
-        if df_c.empty or qoq_col not in df_c.columns:
-            continue
-        qoq_s, yoy_s = df_c[qoq_col].dropna(), df_c[yoy_col].dropna()
-        if qoq_s.empty or yoy_s.empty:
-            continue
-        weight = pce_weights.get(label)
-        label_with_weight = f"{label} ({weight:.1f}%)" if weight is not None else label
-        pce_comp_rows.append({
-            "Component": label_with_weight, "Weight %": weight,
-            "QoQ %": qoq_s.iloc[-1], "YoY %": yoy_s.iloc[-1],
-            "As Of": df_c.index[-1],
-        })
-    pce_comp_df = pd.DataFrame(pce_comp_rows).sort_values("YoY %", ascending=True)
-    pce_comp_latest_date = pce_comp_df["As Of"].max().strftime("%b %Y") if not pce_comp_df.empty else ""
-    pce_comp_df = pce_comp_df.drop(columns="As Of")
+    for p_label, _, _ in PCE_PARENTS:
+        df_p = pce_parent_data[p_label]
+        mom_col, pyoy_col = f"{p_label} MoM %", f"{p_label} YoY %"
+        if not df_p.empty and mom_col in df_p.columns:
+            mom_s, pyoy_s = df_p[mom_col].dropna(), df_p[pyoy_col].dropna()
+            if not mom_s.empty and not pyoy_s.empty:
+                pweight = pce_parent_weights.get(p_label)
+                row_label = f"{p_label.upper()} ({pweight:.1f}%)" if pweight is not None else p_label.upper()
+                pce_comp_rows.append({"Component": row_label, "YoY %": pyoy_s.iloc[-1],
+                                       "Period %": mom_s.iloc[-1], "is_parent": True, "As Of": df_p.index[-1]})
+        for child in PCE_PARENT_CHILDREN[p_label]:
+            df_c = pce_components.get(child)
+            qoq_col, cyoy_col = f"{child} QoQ %", f"{child} YoY %"
+            if df_c is None or df_c.empty or qoq_col not in df_c.columns:
+                continue
+            qoq_s, cyoy_s = df_c[qoq_col].dropna(), df_c[cyoy_col].dropna()
+            if qoq_s.empty or cyoy_s.empty:
+                continue
+            cweight = pce_weights.get(child)
+            row_label = f"     {child} ({cweight:.1f}%)" if cweight is not None else f"     {child}"
+            pce_comp_rows.append({"Component": row_label, "YoY %": cyoy_s.iloc[-1],
+                                   "Period %": qoq_s.iloc[-1], "is_parent": False, "As Of": df_c.index[-1]})
 
-    # Weight is baked into each category's label (e.g. "Housing & Utilities (23.4%)") rather
-    # than a separate bar - since this is a complete, non-overlapping partition, the weights
-    # already sum to 100% and don't need a contribution/pp calculation to be meaningful.
+    pce_comp_df = pd.DataFrame(pce_comp_rows)
+    pce_comp_latest_date = pce_comp_df["As Of"].max().strftime("%b %Y") if not pce_comp_df.empty else ""
+    pce_comp_df = pce_comp_df.drop(columns="As Of").iloc[::-1]  # reverse so parents render top-to-bottom
+
+    yoy_colors = ["#1f8f6b" if p else "#26a69a" for p in pce_comp_df["is_parent"]]
+    period_colors = ["#3568c9" if p else "#80cbc4" for p in pce_comp_df["is_parent"]]
+
     fig_pce_comp_snap = go.Figure()
     fig_pce_comp_snap.add_trace(go.Bar(y=pce_comp_df["Component"], x=pce_comp_df["YoY %"], name="YoY %",
-                                        orientation="h", marker_color="#26a69a"))
-    fig_pce_comp_snap.add_trace(go.Bar(y=pce_comp_df["Component"], x=pce_comp_df["QoQ %"], name="QoQ %",
-                                        orientation="h", marker_color="#80cbc4"))
-    fig_pce_comp_snap.update_layout(**base_layout(f"PCE Components — Latest QoQ & YoY % ({pce_comp_latest_date})", height=560))
+                                        orientation="h", marker_color=yoy_colors))
+    fig_pce_comp_snap.add_trace(go.Bar(y=pce_comp_df["Component"], x=pce_comp_df["Period %"],
+                                        name="MoM % (parents) / QoQ % (children)",
+                                        orientation="h", marker_color=period_colors))
+    fig_pce_comp_snap.update_layout(**base_layout(f"PCE Components — Monthly Parents + Quarterly Detail ({pce_comp_latest_date})", height=680))
     fig_pce_comp_snap.update_layout(barmode="group")
     fig_pce_comp_snap.update_xaxes(ticksuffix="%")
+    fig_pce_comp_snap.update_yaxes(tickfont=dict(size=10))
 
     # Real & Nominal GDP (YoY %) vs 30Y Treasury yield - GDP as grouped bars, yield as an
     # overlaid line, all on one shared % axis so the growth-vs-borrowing-cost read (is nominal
