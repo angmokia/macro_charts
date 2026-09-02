@@ -35,6 +35,8 @@ st.markdown("""
                   text-transform: uppercase; margin-bottom: 3px; }
   .metric-value { font-size: 1.25rem; font-weight: 700; }
   .metric-delta { font-size: 0.72rem; margin-top: 2px; }
+  .metric-z { font-size: 0.62rem; margin-top: 4px; padding-top: 4px;
+              border-top: 1px solid #2a2f3e; display: flex; justify-content: center; gap: 8px; }
   .positive { color: #26a69a; }
   .negative { color: #ef5350; }
   .neutral  { color: #e0e0e0; }
@@ -813,41 +815,66 @@ recessions = fetch_recessions(START, END)
 # ── Summary bar ───────────────────────────────────────────────────────────────
 st.markdown('<div class="section-header">Latest Readings</div>', unsafe_allow_html=True)
 
+Z_WINDOWS_DAILY = {"1M": 21, "3M": 63, "12M": 252}      # trading days
+Z_WINDOWS_MONTHLY = {"3M": 3, "12M": 12, "36M": 36}      # months - a literal 1-month rolling
+# window can't produce a std (needs >=2 points), so monthly-frequency cards use 3M/12M/36M
+# instead of 1M/3M/12M - the closest honest equivalent to the daily convention.
+
+def _zscores(series, windows):
+    out = {}
+    series = series.dropna()
+    for label, window in windows.items():
+        if len(series) <= window + 1:
+            out[label] = None
+            continue
+        roll_mean = series.rolling(window).mean()
+        roll_std = series.rolling(window).std()
+        z = (series - roll_mean) / roll_std
+        v = z.iloc[-1]
+        out[label] = float(v) if pd.notna(v) else None
+    return out
+
 @st.cache_data(ttl=3600)
 def get_summary_metrics(end):
     metrics = {
-        "CPI YoY":      ("CPIAUCSL",   "pct_yoy",  "%"),
-        "Core CPI YoY": ("CPILFESL",   "pct_yoy",  "%"),
-        "PCE YoY":      ("PCEPI",      "pct_yoy",  "%"),
-        "Unemp":        ("UNRATE",     "level",     "%"),
-        "NFP MoM":      ("PAYEMS",     "diff_k",    "k"),
-        "10Y Yield":    ("DGS10",      "level",     "%"),
-        "2Y Yield":     ("DGS2",       "level",     "%"),
-        "2s10s":        ("T10Y2Y",     "level_bps","bps"),
-        "Fed Funds":    ("FEDFUNDS",   "level",     "%"),
-        "M2 YoY":       ("M2SL",       "pct_yoy",  "%"),
+        "CPI YoY":       ("CPIAUCSL",   "pct_yoy",  "%",   "M"),
+        "Core CPI YoY":  ("CPILFESL",   "pct_yoy",  "%",   "M"),
+        "Core PCE YoY":  ("PCEPILFE",   "pct_yoy",  "%",   "M"),
+        "Unemp":         ("UNRATE",     "level",     "%",  "M"),
+        "NFP MoM":       ("PAYEMS",     "diff_k",    "k",  "M"),
+        "10Y Yield":     ("DGS10",      "level",     "%",  "D"),
+        "2Y Yield":      ("DGS2",       "level",     "%",  "D"),
+        "2s10s":         ("T10Y2Y",     "level_bps","bps", "D"),
+        "Fed Funds":     ("FEDFUNDS",   "level",     "%",  "M"),
+        "M2 YoY":        ("M2SL",       "pct_yoy",  "%",   "M"),
     }
     results = {}
-    for name, (sid, calc, unit) in metrics.items():
+    for name, (sid, calc, unit, freq) in metrics.items():
         try:
             s = fred.get_series(sid)
             s = s.dropna()
             latest = float(s.iloc[-1])
             prev   = float(s.iloc[-2]) if len(s) > 1 else latest
             if calc == "pct_yoy":
-                val = s.pct_change(12).iloc[-1] * 100
-                delta = val - s.pct_change(12).iloc[-2] * 100
+                transformed = s.pct_change(12) * 100
+                val = transformed.iloc[-1]
+                delta = val - transformed.iloc[-2]
             elif calc == "diff_k":
-                val = s.diff().iloc[-1]
-                delta = val - s.diff().iloc[-2]
+                transformed = s.diff()
+                val = transformed.iloc[-1]
+                delta = val - transformed.iloc[-2]
             elif calc == "level_bps":
                 # FRED reports this series in percentage points (e.g. 0.51 = 51bps)
+                transformed = s * 100
                 val, delta = latest * 100, (latest - prev) * 100
             else:
+                transformed = s
                 val, delta = latest, latest - prev
-            results[name] = (val, delta, unit)
+            windows = Z_WINDOWS_DAILY if freq == "D" else Z_WINDOWS_MONTHLY
+            z = _zscores(transformed, windows)
+            results[name] = (val, delta, unit, z)
         except:
-            results[name] = (None, None, "")
+            results[name] = (None, None, "", {})
 
     try:
         d2  = fred.get_series("DGS2").dropna()
@@ -856,12 +883,14 @@ def get_summary_metrics(end):
         d30 = fred.get_series("DGS30").dropna()
         curve = pd.concat([d2, d5, d10, d30], axis=1, keys=["2Y", "5Y", "10Y", "30Y"]).ffill().dropna()
         fly = (2 * curve["5Y"] - curve["10Y"] - curve["2Y"]) * 100  # bps
-        results["2s5s10s Fly"] = (float(fly.iloc[-1]), float(fly.iloc[-1] - fly.iloc[-2]), "bps")
+        results["2s5s10s Fly"] = (float(fly.iloc[-1]), float(fly.iloc[-1] - fly.iloc[-2]), "bps",
+                                   _zscores(fly, Z_WINDOWS_DAILY))
         curve_5s30s = (curve["30Y"] - curve["5Y"]) * 100  # bps
-        results["5s30s"] = (float(curve_5s30s.iloc[-1]), float(curve_5s30s.iloc[-1] - curve_5s30s.iloc[-2]), "bps")
+        results["5s30s"] = (float(curve_5s30s.iloc[-1]), float(curve_5s30s.iloc[-1] - curve_5s30s.iloc[-2]), "bps",
+                             _zscores(curve_5s30s, Z_WINDOWS_DAILY))
     except Exception:
-        results["2s5s10s Fly"] = (None, None, "")
-        results["5s30s"] = (None, None, "")
+        results["2s5s10s Fly"] = (None, None, "", {})
+        results["5s30s"] = (None, None, "", {})
 
     return results
 
@@ -873,7 +902,7 @@ ROW_SIZE = 6
 for row_start in range(0, len(summary_items), ROW_SIZE):
     row_items = summary_items[row_start:row_start + ROW_SIZE]
     cols = st.columns(ROW_SIZE)
-    for col, (name, (val, delta, unit)) in zip(cols, row_items):
+    for col, (name, (val, delta, unit, z)) in zip(cols, row_items):
         with col:
             if val is None:
                 st.markdown(f'<div class="metric-card"><div class="metric-label">{name}</div><div class="metric-value neutral">N/A</div></div>', unsafe_allow_html=True)
@@ -884,11 +913,22 @@ for row_start in range(0, len(summary_items), ROW_SIZE):
             else:
                 delta_str = f"{delta:+.0f}{unit}" if unit in ("k", "bps") else f"{delta:+.2f}{unit}"
             delta_cls = "positive" if (delta or 0) > 0 else "negative" if (delta or 0) < 0 else "neutral"
+
+            z_spans = []
+            for zlabel, zval in (z or {}).items():
+                if zval is None:
+                    z_spans.append(f'<span class="neutral">{zlabel} n/a</span>')
+                else:
+                    zcls = "positive" if zval > 0 else "negative" if zval < 0 else "neutral"
+                    z_spans.append(f'<span class="{zcls}">{zlabel} {zval:+.1f}</span>')
+            z_line = "".join(z_spans)
+
             st.markdown(f"""
             <div class="metric-card">
               <div class="metric-label">{name}</div>
               <div class="metric-value neutral">{val_str}</div>
               <div class="metric-delta {delta_cls}">{delta_str} MoM</div>
+              <div class="metric-z">{z_line}</div>
             </div>""", unsafe_allow_html=True)
     st.markdown("<div style='margin-top:8px'></div>", unsafe_allow_html=True)
 
