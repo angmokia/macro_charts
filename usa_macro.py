@@ -796,6 +796,79 @@ def estimate_time_to_floor(series: pd.Series, floor: float, freq: str = "weekly"
     eta_date = series.index[-1] + pd.Timedelta(days=periods * unit_days)
     return {"rate_per_period": float(rate), "periods_to_floor": float(periods), "eta_date": eta_date}
 
+@st.cache_data(ttl=21600)
+def get_crude_inventories() -> pd.DataFrame:
+    """U.S. commercial crude oil inventories, excluding SPR - the market/demand-driven weekly
+    number (distinct from the SPR level, which is policy-driven), EIA series WCESTUS1, thousand
+    barrels converted to million barrels. This is the number behind the Wednesday 10:30am ET
+    EIA inventory report, one of the most market-moving weekly commodity releases."""
+    if not EIA_API_KEY:
+        return pd.DataFrame()
+    try:
+        all_rows, offset = [], 0
+        while True:
+            j = _eia_get("petroleum/stoc/wstk/data/", {
+                "frequency": "weekly", "data[0]": "value", "facets[series][]": "WCESTUS1",
+                "sort[0][column]": "period", "sort[0][direction]": "asc",
+                "length": 5000, "offset": offset,
+            })
+            rows = j["response"]["data"]
+            all_rows.extend(rows)
+            if len(rows) < 5000:
+                break
+            offset += 5000
+        df = pd.DataFrame(all_rows)
+        df["date"] = pd.to_datetime(df["period"])
+        df["Crude Stocks ex-SPR (Million Barrels)"] = pd.to_numeric(df["value"], errors="coerce") / 1000
+        return df.set_index("date")[["Crude Stocks ex-SPR (Million Barrels)"]].sort_index()
+    except Exception as e:
+        st.warning(f"Could not load crude inventory data: {e}")
+        return pd.DataFrame()
+
+@st.cache_data(ttl=21600)
+def get_refinery_utilization() -> pd.DataFrame:
+    """% of operable US refining capacity actively running, weekly, EIA series WPULEUS3.
+    Dips during spring/fall maintenance ("turnaround") season are normal; utilization near the
+    high-90s means refiners are running near-max with little slack for an unplanned outage."""
+    if not EIA_API_KEY:
+        return pd.DataFrame()
+    try:
+        all_rows, offset = [], 0
+        while True:
+            j = _eia_get("petroleum/pnp/wiup/data/", {
+                "frequency": "weekly", "data[0]": "value", "facets[series][]": "WPULEUS3",
+                "sort[0][column]": "period", "sort[0][direction]": "asc",
+                "length": 5000, "offset": offset,
+            })
+            rows = j["response"]["data"]
+            all_rows.extend(rows)
+            if len(rows) < 5000:
+                break
+            offset += 5000
+        df = pd.DataFrame(all_rows)
+        df["date"] = pd.to_datetime(df["period"])
+        df["Refinery Utilization (%)"] = pd.to_numeric(df["value"], errors="coerce")
+        return df.set_index("date")[["Refinery Utilization (%)"]].sort_index()
+    except Exception as e:
+        st.warning(f"Could not load refinery utilization data: {e}")
+        return pd.DataFrame()
+
+def get_crack_spreads(start: str, end: str = None) -> pd.DataFrame:
+    """3:2:1 crack spread (and the two single-product cracks) from WTI/RBOB/Heating-Oil futures
+    - simulates a refiner buying 3 barrels of crude and selling 2 barrels of gasoline + 1 barrel
+    of diesel: ((2 x RBOB + 1 x HO) x 42 - 3 x WTI) / 3, in $/bbl. RBOB/HO are quoted $/gallon,
+    hence x42 (gallons per barrel) to convert to the same $/bbl basis as WTI."""
+    wti  = fetch_yf_close("CL=F", "WTI", start, end)
+    rbob = fetch_yf_close("RB=F", "RBOB", start, end)
+    ho   = fetch_yf_close("HO=F", "HO", start, end)
+    df = pd.concat([wti, rbob, ho], axis=1).dropna()
+    if df.empty:
+        return pd.DataFrame()
+    df["3:2:1 Crack ($/bbl)"] = (2 * df["RBOB"] * 42 + 1 * df["HO"] * 42 - 3 * df["WTI"]) / 3
+    df["Gasoline Crack ($/bbl)"] = df["RBOB"] * 42 - df["WTI"]
+    df["Heating Oil Crack ($/bbl)"] = df["HO"] * 42 - df["WTI"]
+    return df
+
 # ── Date range ────────────────────────────────────────────────────────────────
 st.title("🇺🇸 US Macro Dashboard")
 
@@ -813,7 +886,7 @@ END   = date_range[1].strftime("%Y-%m-%d")
 recessions = fetch_recessions(START, END)
 
 # ── Summary bar ───────────────────────────────────────────────────────────────
-st.markdown('<div class="section-header">Latest Readings</div>', unsafe_allow_html=True)
+st.markdown('<div class="section-header">Latest Readings & Z-Scores</div>', unsafe_allow_html=True)
 
 Z_WINDOWS_DAILY = {"1M": 21, "3M": 63, "12M": 252}      # trading days
 Z_WINDOWS_MONTHLY = {"3M": 3, "12M": 12, "36M": 36}      # months - a literal 1-month rolling
@@ -833,6 +906,11 @@ def _zscores(series, windows):
         v = z.iloc[-1]
         out[label] = float(v) if pd.notna(v) else None
     return out
+
+# Cards where a MoM/DoD delta reads more naturally in bps than in raw percentage-point terms
+# - matches the convention already used for 2s10s/2s5s10s Fly/5s30s. The headline VALUE stays
+# in "%" (e.g. "4.75%"); only the delta line switches to bps (e.g. "+2bps" instead of "+0.02%").
+YIELD_BPS_DELTA = {"10Y Yield", "2Y Yield", "Fed Funds"}
 
 @st.cache_data(ttl=3600)
 def get_summary_metrics(end):
@@ -872,9 +950,13 @@ def get_summary_metrics(end):
                 val, delta = latest, latest - prev
             windows = Z_WINDOWS_DAILY if freq == "D" else Z_WINDOWS_MONTHLY
             z = _zscores(transformed, windows)
-            results[name] = (val, delta, unit, z)
+            if name in YIELD_BPS_DELTA and delta is not None:
+                delta, delta_unit = delta * 100, "bps"
+            else:
+                delta_unit = unit
+            results[name] = (val, delta, unit, delta_unit, z)
         except:
-            results[name] = (None, None, "", {})
+            results[name] = (None, None, "", "", {})
 
     try:
         d2  = fred.get_series("DGS2").dropna()
@@ -883,14 +965,14 @@ def get_summary_metrics(end):
         d30 = fred.get_series("DGS30").dropna()
         curve = pd.concat([d2, d5, d10, d30], axis=1, keys=["2Y", "5Y", "10Y", "30Y"]).ffill().dropna()
         fly = (2 * curve["5Y"] - curve["10Y"] - curve["2Y"]) * 100  # bps
-        results["2s5s10s Fly"] = (float(fly.iloc[-1]), float(fly.iloc[-1] - fly.iloc[-2]), "bps",
+        results["2s5s10s Fly"] = (float(fly.iloc[-1]), float(fly.iloc[-1] - fly.iloc[-2]), "bps", "bps",
                                    _zscores(fly, Z_WINDOWS_DAILY))
         curve_5s30s = (curve["30Y"] - curve["5Y"]) * 100  # bps
-        results["5s30s"] = (float(curve_5s30s.iloc[-1]), float(curve_5s30s.iloc[-1] - curve_5s30s.iloc[-2]), "bps",
+        results["5s30s"] = (float(curve_5s30s.iloc[-1]), float(curve_5s30s.iloc[-1] - curve_5s30s.iloc[-2]), "bps", "bps",
                              _zscores(curve_5s30s, Z_WINDOWS_DAILY))
     except Exception:
-        results["2s5s10s Fly"] = (None, None, "", {})
-        results["5s30s"] = (None, None, "", {})
+        results["2s5s10s Fly"] = (None, None, "", "", {})
+        results["5s30s"] = (None, None, "", "", {})
 
     return results
 
@@ -902,7 +984,7 @@ ROW_SIZE = 6
 for row_start in range(0, len(summary_items), ROW_SIZE):
     row_items = summary_items[row_start:row_start + ROW_SIZE]
     cols = st.columns(ROW_SIZE)
-    for col, (name, (val, delta, unit, z)) in zip(cols, row_items):
+    for col, (name, (val, delta, unit, delta_unit, z)) in zip(cols, row_items):
         with col:
             if val is None:
                 st.markdown(f'<div class="metric-card"><div class="metric-label">{name}</div><div class="metric-value neutral">N/A</div></div>', unsafe_allow_html=True)
@@ -911,7 +993,7 @@ for row_start in range(0, len(summary_items), ROW_SIZE):
             if delta is None:
                 delta_str = ""
             else:
-                delta_str = f"{delta:+.0f}{unit}" if unit in ("k", "bps") else f"{delta:+.2f}{unit}"
+                delta_str = f"{delta:+.0f}{delta_unit}" if delta_unit in ("k", "bps") else f"{delta:+.2f}{delta_unit}"
             delta_cls = "positive" if (delta or 0) > 0 else "negative" if (delta or 0) < 0 else "neutral"
 
             z_spans = []
@@ -1355,6 +1437,65 @@ with tabs[1]:
             ("SPR Level", fig_spr, spr),
             ("SPR Weekly Change", fig_spr_chg, spr_recent),
         ])
+
+    st.markdown('<div class="section-header">Retail Prices & Refining Margins</div>', unsafe_allow_html=True)
+    with st.spinner("Loading retail fuel prices & crack spreads…"):
+        gas_retail = fetch("GASREGW", "Gasoline Retail", START, END)
+        diesel_retail = fetch("GASDESW", "Diesel Retail", START, END)
+        crack = get_crack_spreads(START, END)
+
+    fig_retail = go.Figure()
+    if not gas_retail.empty:
+        fig_retail.add_trace(go.Scatter(x=gas_retail.index, y=gas_retail["Gasoline Retail"],
+                                        name="Gasoline (Regular)", line=dict(color="#f5a24c")))
+    if not diesel_retail.empty:
+        fig_retail.add_trace(go.Scatter(x=diesel_retail.index, y=diesel_retail["Diesel Retail"],
+                                        name="Diesel", line=dict(color="#4c8bf5")))
+    fig_retail.update_layout(**base_layout("US Retail Gasoline & Diesel Prices ($/gal)"))
+    fig_retail.update_yaxes(title="$/gallon", tickprefix="$")
+    add_recessions(fig_retail, recessions)
+
+    fig_crack = go.Figure()
+    if not crack.empty:
+        fig_crack.add_trace(go.Scatter(x=crack.index, y=crack["3:2:1 Crack ($/bbl)"],
+                                       name="3:2:1 Crack", line=dict(color="#26a69a", width=2.5)))
+        fig_crack.add_trace(go.Scatter(x=crack.index, y=crack["Gasoline Crack ($/bbl)"],
+                                       name="Gasoline Crack", line=dict(color="#f5a24c", width=1.3)))
+        fig_crack.add_trace(go.Scatter(x=crack.index, y=crack["Heating Oil Crack ($/bbl)"],
+                                       name="Heating Oil/Diesel Crack", line=dict(color="#c85fd6", width=1.3)))
+    fig_crack.update_layout(**base_layout("Refining Crack Spreads ($/bbl)"))
+    fig_crack.update_yaxes(title="$/bbl", tickprefix="$")
+    add_recessions(fig_crack, recessions)
+
+    st.markdown('<div class="section-header">Supply & Refinery Capacity</div>', unsafe_allow_html=True)
+    with st.spinner("Loading crude inventories & refinery utilization…"):
+        crude_inv = get_crude_inventories()
+        refinery_util = get_refinery_utilization()
+
+    fig_crude_inv = go.Figure()
+    if not crude_inv.empty:
+        fig_crude_inv.add_trace(go.Scatter(x=crude_inv.index, y=crude_inv["Crude Stocks ex-SPR (Million Barrels)"],
+                                           name="Crude Stocks ex-SPR", line=dict(color="#ef5350"),
+                                           fill="tozeroy", fillcolor="rgba(239,83,80,0.10)"))
+    fig_crude_inv.update_layout(**base_layout("US Commercial Crude Inventories, ex-SPR (Weekly)"))
+    fig_crude_inv.update_yaxes(title="Million Barrels")
+    add_recessions(fig_crude_inv, recessions)
+
+    fig_refinery = go.Figure()
+    if not refinery_util.empty:
+        fig_refinery.add_trace(go.Scatter(x=refinery_util.index, y=refinery_util["Refinery Utilization (%)"],
+                                          name="Refinery Utilization", line=dict(color="#6bbf8f"),
+                                          fill="tozeroy", fillcolor="rgba(107,191,143,0.10)"))
+    fig_refinery.update_layout(**base_layout("Refinery Utilization Rate (% of Operable Capacity)"))
+    fig_refinery.update_yaxes(title="%", ticksuffix="%")
+    add_recessions(fig_refinery, recessions)
+
+    render_two_col([
+        ("US Retail Gas & Diesel", fig_retail, pd.concat([gas_retail, diesel_retail], axis=1)),
+        ("Crack Spreads", fig_crack, crack),
+        ("Crude Inventories ex-SPR", fig_crude_inv, crude_inv),
+        ("Refinery Utilization", fig_refinery, refinery_util),
+    ])
 
 # ════════════════════════════════════════════════════════════════════════════════
 # TAB 3 — Labour Market
