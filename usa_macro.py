@@ -912,6 +912,24 @@ def _zscores(series, windows):
 # in "%" (e.g. "4.75%"); only the delta line switches to bps (e.g. "+2bps" instead of "+0.02%").
 YIELD_BPS_DELTA = {"10Y Yield", "2Y Yield", "Fed Funds"}
 
+def _fred_series_retry(sid, label):
+    """Same retry-on-any-exception + surfaced-warning pattern as fetch(), but returns a raw,
+    full-history Series (no start/end bound) instead of a DataFrame - used by
+    get_summary_metrics(), whose z-score windows (up to 252 trading days / 36 months) need more
+    history than the user's date-range slider might cover. Confirmed live: T10Y2Y going N/A in
+    the summary card while still working fine in the Treasury Spreads chart was this exact bug -
+    a raw fred.get_series() call with a bare `except:` silently caching a transient FRED hiccup
+    as None for the full 1hr TTL, with no retry and no warning, unlike fetch() everywhere else."""
+    last_exc = None
+    for attempt in range(3):
+        try:
+            return fred.get_series(sid).dropna()
+        except Exception as e:
+            last_exc = e
+            time.sleep(2 ** attempt)
+    st.warning(f"Could not load {label} ({sid}) after 3 attempts: {last_exc}")
+    return pd.Series(dtype=float)
+
 @st.cache_data(ttl=3600)
 def get_summary_metrics(end):
     metrics = {
@@ -928,11 +946,13 @@ def get_summary_metrics(end):
     }
     results = {}
     for name, (sid, calc, unit, freq) in metrics.items():
+        s = _fred_series_retry(sid, name)
+        if len(s) < 2:
+            results[name] = (None, None, "", "", {})
+            continue
         try:
-            s = fred.get_series(sid)
-            s = s.dropna()
             latest = float(s.iloc[-1])
-            prev   = float(s.iloc[-2]) if len(s) > 1 else latest
+            prev   = float(s.iloc[-2])
             if calc == "pct_yoy":
                 transformed = s.pct_change(12) * 100
                 val = transformed.iloc[-1]
@@ -955,24 +975,30 @@ def get_summary_metrics(end):
             else:
                 delta_unit = unit
             results[name] = (val, delta, unit, delta_unit, z)
-        except:
+        except Exception as e:
+            st.warning(f"Could not compute {name}: {e}")
             results[name] = (None, None, "", "", {})
 
-    try:
-        d2  = fred.get_series("DGS2").dropna()
-        d5  = fred.get_series("DGS5").dropna()
-        d10 = fred.get_series("DGS10").dropna()
-        d30 = fred.get_series("DGS30").dropna()
-        curve = pd.concat([d2, d5, d10, d30], axis=1, keys=["2Y", "5Y", "10Y", "30Y"]).ffill().dropna()
-        fly = (2 * curve["5Y"] - curve["10Y"] - curve["2Y"]) * 100  # bps
-        results["2s5s10s Fly"] = (float(fly.iloc[-1]), float(fly.iloc[-1] - fly.iloc[-2]), "bps", "bps",
-                                   _zscores(fly, Z_WINDOWS_DAILY))
-        curve_5s30s = (curve["30Y"] - curve["5Y"]) * 100  # bps
-        results["5s30s"] = (float(curve_5s30s.iloc[-1]), float(curve_5s30s.iloc[-1] - curve_5s30s.iloc[-2]), "bps", "bps",
-                             _zscores(curve_5s30s, Z_WINDOWS_DAILY))
-    except Exception:
+    d2  = _fred_series_retry("DGS2", "2Y (for Fly/5s30s)")
+    d5  = _fred_series_retry("DGS5", "5Y (for Fly/5s30s)")
+    d10 = _fred_series_retry("DGS10", "10Y (for Fly/5s30s)")
+    d30 = _fred_series_retry("DGS30", "30Y (for Fly/5s30s)")
+    if min(len(d2), len(d5), len(d10), len(d30)) < 2:
         results["2s5s10s Fly"] = (None, None, "", "", {})
         results["5s30s"] = (None, None, "", "", {})
+    else:
+        try:
+            curve = pd.concat([d2, d5, d10, d30], axis=1, keys=["2Y", "5Y", "10Y", "30Y"]).ffill().dropna()
+            fly = (2 * curve["5Y"] - curve["10Y"] - curve["2Y"]) * 100  # bps
+            results["2s5s10s Fly"] = (float(fly.iloc[-1]), float(fly.iloc[-1] - fly.iloc[-2]), "bps", "bps",
+                                       _zscores(fly, Z_WINDOWS_DAILY))
+            curve_5s30s = (curve["30Y"] - curve["5Y"]) * 100  # bps
+            results["5s30s"] = (float(curve_5s30s.iloc[-1]), float(curve_5s30s.iloc[-1] - curve_5s30s.iloc[-2]), "bps", "bps",
+                                 _zscores(curve_5s30s, Z_WINDOWS_DAILY))
+        except Exception as e:
+            st.warning(f"Could not compute 2s5s10s Fly / 5s30s: {e}")
+            results["2s5s10s Fly"] = (None, None, "", "", {})
+            results["5s30s"] = (None, None, "", "", {})
 
     return results
 
