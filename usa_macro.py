@@ -1925,16 +1925,19 @@ with tabs[4]:
     # M2
     m2_data = pd.DataFrame(index=m2.index) if not m2.empty else pd.DataFrame()
     if not m2.empty:
-        m2_data["M2 (Billions)"] = m2["M2"] / 1e3
+        # M2SL is published in Billions of Dollars - /1e3 converts to Trillions (M2 is
+        # currently ~$22T, so /1e3 on a ~22,000 billions reading is correct; the column/axis
+        # just need to say Trillions, not Billions).
+        m2_data["M2 (Trillions)"] = m2["M2"] / 1e3
         m2_data["YoY %"] = (m2["M2"].pct_change(12) * 100).round(3)
         m2_data["MoM %"] = (m2["M2"].pct_change() * 100).round(3)
     fig_m2 = go.Figure()
     if not m2_data.empty:
-        fig_m2.add_trace(go.Scatter(x=m2_data.index, y=m2_data["M2 (Billions)"],
+        fig_m2.add_trace(go.Scatter(x=m2_data.index, y=m2_data["M2 (Trillions)"],
                                     name="M2 Level", line=dict(color="#26a69a"), yaxis="y"))
         fig_m2.add_trace(go.Scatter(x=m2_data.index, y=m2_data["YoY %"],
                                     name="YoY %", line=dict(color="#ff9800"), yaxis="y2"))
-    fig_m2.update_layout(**dual_axis_layout("M2 Money Supply", "Billions $", "YoY %"))
+    fig_m2.update_layout(**dual_axis_layout("M2 Money Supply", "Trillions $", "YoY %"))
     add_recessions(fig_m2, recessions)
 
     # Policy rates
@@ -2064,6 +2067,7 @@ with tabs[4]:
         with st.spinner("Loading historical Fed Funds futures…"):
             fedwatch_hist_df, fedwatch_full_df = get_fedwatch_history(years_ahead=2)
         fedwatch_hist_df = fedwatch_hist_df.round(3)
+        fedwatch_full_df = fedwatch_full_df.round(3)
 
         if fedwatch_full_df.empty:
             st.info("Historical Fed Funds futures data unavailable - showing today's snapshot only.")
@@ -2106,6 +2110,10 @@ with tabs[4]:
             fig_fedwatch.add_trace(go.Bar(
                 x=meetings, y=[as_of_row[m] for m in meetings], name=as_of_label,
                 marker_color=asof_colors, text=[round(as_of_row[m], 3) for m in meetings], textposition="outside",
+                # Explicit hovertemplate so the tooltip matches the on-bar text label instead of
+                # showing Plotly's default full-precision float (e.g. "4.169998%") stacked right
+                # next to the rounded "4.17" label.
+                hovertemplate="%{x}<br>Implied Rate: %{y:.3f}%<extra></extra>",
             ))
             fig_fedwatch.add_hline(y=as_of_effr, line_dash="dash", line_color="#e0e0e0",
                                     annotation_text=f"EFFR on {as_of.strftime('%b %d')} ({as_of_effr:.2f}%)", annotation_position="top left")
