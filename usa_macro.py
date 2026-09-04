@@ -254,28 +254,43 @@ SNAPSHOT_OFFSETS = {"Today": 0, "1W Ago": -5, "1M Ago": -21, "3M Ago": -63}
 SNAPSHOT_COLORS = {"Today": "cyan", "1W Ago": "orange", "1M Ago": "green", "3M Ago": "magenta"}
 
 @st.cache_data(ttl=21600)
-def get_fedwatch_history(years_ahead=2):
-    # Same meetings/clean-month read as get_fedwatch_probabilities, but pulls each
-    # contract's own price history to snapshot the implied curve at past points in time -
-    # i.e. what the market was pricing for these same meetings, as of each snapshot date.
+def get_fedwatch_history(years_ahead=2, full_period="2y"):
+    # Same meetings/clean-month read as get_fedwatch_probabilities (no day-weighted fallback -
+    # that's only worth solving for "today", not for every historical day), but pulls each
+    # contract's own price history to snapshot the implied curve at past points in time - i.e.
+    # what the market was pricing for these same meetings, as of each snapshot date.
+    #
+    # Returns (snapshot_df, full_df): snapshot_df keeps the original 4 fixed-offset columns
+    # (Today/1W/3M/1M Ago) for the "Snapshots" chart; full_df is date-indexed with one column
+    # per meeting and every trading day the contract has priced, so a slider can scrub through
+    # any date instead of just those 4. A meeting whose contract wasn't listed yet on some early
+    # date just has NaN there - same "missing point" behavior the 3M-ago snapshot already has.
     today = pd.Timestamp.today().normalize()
     window_end = today + pd.DateOffset(years=years_ahead)
     meetings = [pd.Timestamp(d) for d in get_fomc_dates() if today <= pd.Timestamp(d) <= window_end]
 
-    rows = []
+    rows, full_cols = [], {}
     for meeting in meetings:
-        series = _zq_close_series(_zq_ticker(_month_after(meeting)))
-        row = {"Meeting": meeting.strftime("%Y-%m-%d")}
+        meeting_label = meeting.strftime("%Y-%m-%d")
+        series = _zq_close_series(_zq_ticker(_month_after(meeting)), period=full_period)
+        row = {"Meeting": meeting_label}
         if series is not None:
+            implied = (100 - series).dropna()
+            full_cols[meeting_label] = implied
             for label, offset in SNAPSHOT_OFFSETS.items():
-                idx = len(series) - 1 + offset
-                row[label] = 100 - float(series.iloc[idx]) if idx >= 0 else None
+                idx = len(implied) - 1 + offset
+                row[label] = float(implied.iloc[idx]) if idx >= 0 else None
         rows.append(row)
-    return pd.DataFrame(rows)
+    full_df = pd.DataFrame(full_cols) if full_cols else pd.DataFrame()
+    return pd.DataFrame(rows), full_df
+
+@st.cache_data(ttl=21600)
+def get_effr_history():
+    return fred.get_series("EFFR").dropna()
 
 @st.cache_data(ttl=21600)
 def get_fedwatch_probabilities(years_ahead=2):
-    effr = fred.get_series("EFFR").dropna()
+    effr = get_effr_history()
     current_rate = float(effr.iloc[-1])
 
     today = pd.Timestamp.today().normalize()
@@ -2042,64 +2057,138 @@ with tabs[4]:
     if not fedwatch_df.empty:
         st.markdown(f"**Current EFFR:** {current_effr:.2f}%  |  **Meetings shown:** next {len(fedwatch_df)} (through {fedwatch_df['Meeting'].iloc[-1]})")
 
-        bar_colors = ["#26a69a" if r > current_effr else "#ef5350" if r < current_effr else "#8a94a6"
-                      for r in fedwatch_df["Implied Rate"]]
-        fig_fedwatch = go.Figure(go.Bar(
-            x=fedwatch_df["Meeting"], y=fedwatch_df["Implied Rate"], marker_color=bar_colors,
-            text=fedwatch_df["Implied Rate"].round(3), textposition="outside"
-        ))
-        fig_fedwatch.add_hline(y=current_effr, line_dash="dash", line_color="#e0e0e0",
-                                annotation_text=f"Current EFFR ({current_effr:.2f}%)", annotation_position="top left")
-        fig_fedwatch.update_layout(**base_layout("Market-Implied Fed Funds"))
-        # Plotly bars default to a 0-anchored y-axis, which buries a tight cluster of implied
-        # rates (e.g. 3.6-4.3%) in the top sliver of the chart. Bloomberg's WIRP view zooms to
-        # the data instead - do the same: range from just below the lowest of (current EFFR,
-        # implied rates) to just above the highest, not from zero.
-        y_vals = list(fedwatch_df["Implied Rate"]) + [current_effr]
-        y_min, y_max = min(y_vals), max(y_vals)
-        y_pad = (y_max - y_min) * 0.15 or 0.25
-        fig_fedwatch.update_yaxes(ticksuffix="%", title="Implied Rate",
-                                  range=[y_min - y_pad, y_max + y_pad * 1.6])  # extra headroom for outside bar labels
-        fig_fedwatch.update_xaxes(title="FOMC Meeting Date")
-
-        # How the implied path for these same meetings has shifted over time - same
-        # Today/1W/1M/3M snapshot pattern as the Treasury Yield Curve Snapshots chart.
+        # How the implied path for these same meetings has shifted over time - same clean-month
+        # read as get_fedwatch_probabilities (no day-weighted fallback; see get_fedwatch_history's
+        # own docstring), but with the FULL daily history per meeting so the "As Of" slider below
+        # can scrub through any trading day, not just 4 fixed offsets.
         with st.spinner("Loading historical Fed Funds futures…"):
-            fedwatch_hist_df = get_fedwatch_history(years_ahead=2).round(3)
-        fig_fedwatch_hist = go.Figure()
-        for label in SNAPSHOT_OFFSETS:
-            if label not in fedwatch_hist_df.columns:
-                continue
-            fig_fedwatch_hist.add_trace(go.Scatter(
-                x=fedwatch_hist_df["Meeting"], y=fedwatch_hist_df[label],
-                mode="lines+markers", name=label,
-                line=dict(color=SNAPSHOT_COLORS[label], width=2 if label == "Today" else 1,
-                           dash="solid" if label == "Today" else "dash"),
+            fedwatch_hist_df, fedwatch_full_df = get_fedwatch_history(years_ahead=2)
+        fedwatch_hist_df = fedwatch_hist_df.round(3)
+
+        if fedwatch_full_df.empty:
+            st.info("Historical Fed Funds futures data unavailable - showing today's snapshot only.")
+            bar_colors = ["#26a69a" if r > current_effr else "#ef5350" if r < current_effr else "#8a94a6"
+                          for r in fedwatch_df["Implied Rate"]]
+            fig_fedwatch = go.Figure(go.Bar(
+                x=fedwatch_df["Meeting"], y=fedwatch_df["Implied Rate"], marker_color=bar_colors,
+                text=fedwatch_df["Implied Rate"].round(3), textposition="outside"
             ))
-        fig_fedwatch_hist.update_layout(**base_layout("Fed Funds Rate — Snapshots"))
-        fig_fedwatch_hist.update_xaxes(title="Dates")
-        fig_fedwatch_hist.update_yaxes(title="Implied Rate", ticksuffix="%")
+            fig_fedwatch.add_hline(y=current_effr, line_dash="dash", line_color="#e0e0e0",
+                                    annotation_text=f"Current EFFR ({current_effr:.2f}%)", annotation_position="top left")
+            fig_fedwatch.update_layout(**base_layout("Market-Implied Fed Funds"))
+            y_vals = list(fedwatch_df["Implied Rate"]) + [current_effr]
+            y_min, y_max = min(y_vals), max(y_vals)
+            y_pad = (y_max - y_min) * 0.15 or 0.25
+            fig_fedwatch.update_yaxes(ticksuffix="%", title="Implied Rate", range=[y_min - y_pad, y_max + y_pad * 1.6])
+            fig_fedwatch.update_xaxes(title="FOMC Meeting Date")
+            st.plotly_chart(fig_fedwatch, use_container_width=True)
+        else:
+            meetings = list(fedwatch_full_df.columns)
+            effr_hist = get_effr_history().reindex(fedwatch_full_df.index, method="ffill")
+            as_of = st.select_slider(
+                "As of date", options=list(fedwatch_full_df.index), value=fedwatch_full_df.index[-1],
+                format_func=lambda d: d.strftime("%b %d, %Y"), key="fedwatch_as_of",
+            )
+            today_row = fedwatch_full_df.iloc[-1]
+            as_of_row = fedwatch_full_df.loc[as_of]
+            as_of_effr = float(effr_hist.loc[as_of])
+            as_of_label = as_of.strftime("%b %d, %Y")
 
-        render_two_col([
-            ("Market-Implied Fed Funds Rate", fig_fedwatch, fedwatch_df[["Meeting", "Implied Rate"]]),
-            ("Market-Implied Fed Funds Rate Snapshots", fig_fedwatch_hist, fedwatch_hist_df),
-        ])
+            # Single slider-driven bar chart: today's bars ghosted behind for reference,
+            # colored bars (vs that date's own EFFR) for the selected date.
+            fig_fedwatch = go.Figure()
+            fig_fedwatch.add_trace(go.Bar(
+                x=meetings, y=[today_row[m] for m in meetings], name="Today",
+                marker_color="rgba(230,233,240,0.16)", hoverinfo="skip",
+            ))
+            asof_colors = ["#26a69a" if as_of_row[m] > as_of_effr else "#ef5350" if as_of_row[m] < as_of_effr else "#8a94a6"
+                           for m in meetings]
+            fig_fedwatch.add_trace(go.Bar(
+                x=meetings, y=[as_of_row[m] for m in meetings], name=as_of_label,
+                marker_color=asof_colors, text=[round(as_of_row[m], 3) for m in meetings], textposition="outside",
+            ))
+            fig_fedwatch.add_hline(y=as_of_effr, line_dash="dash", line_color="#e0e0e0",
+                                    annotation_text=f"EFFR on {as_of.strftime('%b %d')} ({as_of_effr:.2f}%)", annotation_position="top left")
+            fig_fedwatch.update_layout(**base_layout(f"Market-Implied Fed Funds — As Of {as_of_label}"))
+            fig_fedwatch.update_layout(barmode="overlay")
+            # Same zero-avoiding y-range logic as before, widened to cover both Today and the
+            # selected date so the ghost bars never clip off the top/bottom.
+            y_vals = list(today_row[meetings]) + [as_of_row[m] for m in meetings] + [as_of_effr, current_effr]
+            y_min, y_max = min(y_vals), max(y_vals)
+            y_pad = (y_max - y_min) * 0.15 or 0.25
+            fig_fedwatch.update_yaxes(ticksuffix="%", title="Implied Rate", range=[y_min - y_pad, y_max + y_pad * 1.6])
+            fig_fedwatch.update_xaxes(title="FOMC Meeting Date")
 
-        # Detail table, Bloomberg WIRP-style: implied rate path + cumulative and
-        # this-meeting-only move sizes.
-        detail = fedwatch_df[["Meeting", "Implied Rate", "Imp. Rate Delta", "Hikes/Cuts", "This-Meeting Move (bps)"]].copy()
-        detail["Implied Rate"] = detail["Implied Rate"].round(3)
-        detail["Imp. Rate Delta"] = detail["Imp. Rate Delta"].round(3)
-        detail["Hikes/Cuts"] = detail["Hikes/Cuts"].round(2)
-        detail["%Hike/Cut (this meeting)"] = (detail["This-Meeting Move (bps)"] / (RATE_STEP * 100) * 100).round(1)
-        detail = detail.drop(columns="This-Meeting Move (bps)")
-        detail = detail.rename(columns={"Imp. Rate Delta": "Imp. Rate Δ (cum.)", "Hikes/Cuts": "#Hikes/Cuts (cum.)"})
-        st.dataframe(detail, use_container_width=True, hide_index=True)
-        st.caption("A.R.M. (step size): 25bps. \"#Hikes/Cuts (cum.)\" and \"Imp. Rate Δ (cum.)\" are relative to today's "
-                   "EFFR; \"%Hike/Cut (this meeting)\" is the incremental move priced in at that specific meeting only "
-                   "(chained off the previous meeting's implied rate) - the same simplified 2-outcome-per-meeting view "
-                   "as the chart above, not CME's full joint multi-meeting solve.")
-        csv_download(detail, "fedwatch_probabilities")
+            # Snapshots chart: the original Today/1W/1M/3M Ago fixed lines, plus a 5th
+            # slider-driven "As Of" line shaded against Today the same way the bar chart
+            # shades its selected date against today's ghost bars.
+            fig_fedwatch_hist = go.Figure()
+            fig_fedwatch_hist.add_trace(go.Scatter(
+                x=meetings, y=[today_row[m] for m in meetings], mode="lines+markers", name="Today",
+                line=dict(color=SNAPSHOT_COLORS["Today"], width=2),
+            ))
+            fig_fedwatch_hist.add_trace(go.Scatter(
+                x=meetings, y=[as_of_row[m] for m in meetings], mode="lines+markers", name=f"As of {as_of_label}",
+                line=dict(color="#ffffff", width=2.2), fill="tonexty", fillcolor="rgba(255,255,255,0.08)",
+            ))
+            for label in ["1W Ago", "1M Ago", "3M Ago"]:
+                if label not in fedwatch_hist_df.columns:
+                    continue
+                fig_fedwatch_hist.add_trace(go.Scatter(
+                    x=fedwatch_hist_df["Meeting"], y=fedwatch_hist_df[label], mode="lines+markers", name=label,
+                    line=dict(color=SNAPSHOT_COLORS[label], width=1, dash="dash"),
+                ))
+            fig_fedwatch_hist.update_layout(**base_layout("Fed Funds Rate — Snapshots"))
+            fig_fedwatch_hist.update_xaxes(title="Dates")
+            fig_fedwatch_hist.update_yaxes(title="Implied Rate", ticksuffix="%")
+
+            render_two_col([
+                (f"Market-Implied Fed Funds Rate — As Of {as_of_label}", fig_fedwatch,
+                 pd.DataFrame({"Meeting": meetings, "Today": [today_row[m] for m in meetings],
+                               as_of_label: [as_of_row[m] for m in meetings]})),
+                ("Market-Implied Fed Funds Rate Snapshots", fig_fedwatch_hist, fedwatch_hist_df),
+            ])
+
+            # Full history over calendar time, one line per meeting, with a marker at the
+            # slider date - shown beside the probability/hikes-cuts detail table below.
+            fig_fedwatch_full = go.Figure()
+            meeting_colors = ["#4fc3f7", "#ffa726", "#26a69a", "#ba68c8", "#5c9eff", "#ff8a65", "#9ccc65"]
+            for i, m in enumerate(meetings):
+                fig_fedwatch_full.add_trace(go.Scatter(
+                    x=fedwatch_full_df.index, y=fedwatch_full_df[m], mode="lines", name=m,
+                    line=dict(color=meeting_colors[i % len(meeting_colors)], width=1.6),
+                ))
+            fig_fedwatch_full.add_trace(go.Scatter(
+                x=effr_hist.index, y=effr_hist.values, mode="lines", name="EFFR",
+                line=dict(color="#e0e0e0", width=1.2, dash="dot"),
+            ))
+            fig_fedwatch_full.add_vline(x=as_of, line_dash="solid", line_color="#4fc3f7", line_width=1.5)
+            fig_fedwatch_full.update_layout(**base_layout("Fed Funds Rate — Full History (marker = slider date)", height=440))
+            fig_fedwatch_full.update_xaxes(title="Date")
+            fig_fedwatch_full.update_yaxes(title="Implied Rate", ticksuffix="%")
+
+            # Detail table, Bloomberg WIRP-style: implied rate path + cumulative and
+            # this-meeting-only move sizes. Always "as of today" (unaffected by the slider),
+            # matching the "Today" reference used throughout the rest of this section.
+            detail = fedwatch_df[["Meeting", "Implied Rate", "Imp. Rate Delta", "Hikes/Cuts", "This-Meeting Move (bps)"]].copy()
+            detail["Implied Rate"] = detail["Implied Rate"].round(3)
+            detail["Imp. Rate Delta"] = detail["Imp. Rate Delta"].round(3)
+            detail["Hikes/Cuts"] = detail["Hikes/Cuts"].round(2)
+            detail["%Hike/Cut (this meeting)"] = (detail["This-Meeting Move (bps)"] / (RATE_STEP * 100) * 100).round(1)
+            detail = detail.drop(columns="This-Meeting Move (bps)")
+            detail = detail.rename(columns={"Imp. Rate Delta": "Imp. Rate Δ (cum.)", "Hikes/Cuts": "#Hikes/Cuts (cum.)"})
+
+            col_full, col_detail = st.columns(2)
+            with col_full:
+                st.plotly_chart(fig_fedwatch_full, use_container_width=True)
+            with col_detail:
+                st.markdown("**Probabilities / Hikes-Cuts Detail**")
+                st.dataframe(detail, use_container_width=True, hide_index=True, height=440)
+            st.caption("A.R.M. (step size): 25bps. \"#Hikes/Cuts (cum.)\" and \"Imp. Rate Δ (cum.)\" are relative to today's "
+                       "EFFR; \"%Hike/Cut (this meeting)\" is the incremental move priced in at that specific meeting only "
+                       "(chained off the previous meeting's implied rate) - the same simplified 2-outcome-per-meeting view "
+                       "as the chart above, not CME's full joint multi-meeting solve.")
+            csv_download(detail, "fedwatch_probabilities")
     else:
         st.info("No FOMC meetings in the selected window, or Fed Funds futures data unavailable.")
 
