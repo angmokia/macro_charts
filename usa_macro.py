@@ -2368,7 +2368,11 @@ with tabs[5]:
         z = calculate_price_zscores(full[name])
         idx_z_rows.append({"Index": name, **{f"{k} Z-Score": v for k, v in z.items()}})
     idx_df = pd.DataFrame(idx_rows).sort_values("1M Return %")
-    idx_z_df = pd.DataFrame(idx_z_rows).sort_values("1M Z-Score")
+    idx_z_df = pd.DataFrame(idx_z_rows)
+    if not idx_z_df.empty:
+        # Match the returns chart's row order (not its own z-score sort) so both bar charts
+        # place the same index on the same y-level - otherwise "row-for-row comparable" is false.
+        idx_z_df = idx_z_df.set_index("Index").reindex(idx_df["Index"]).reset_index()
 
     fig_idx_ret = go.Figure()
     for label, color in [("1M Return %", "#42a5f5"), ("3M Return %", "#ab47bc"), ("1Y Return %", "#ff9800")]:
@@ -2409,7 +2413,11 @@ with tabs[5]:
         spy_z = calculate_price_zscores(spy_full["SPY"])
         sec_z_rows.append({"Sector": "S&P 500 (SPY)", **{f"{k} Z-Score": v for k, v in spy_z.items()}})
     sec_df = pd.DataFrame(sec_rows).sort_values("1M Return %")
-    sec_z_df = pd.DataFrame(sec_z_rows).sort_values("1M Z-Score") if sec_z_rows else pd.DataFrame()
+    sec_z_df = pd.DataFrame(sec_z_rows)
+    if not sec_z_df.empty:
+        # Match the returns chart's row order (not its own z-score sort) so both bar charts
+        # place the same sector on the same y-level.
+        sec_z_df = sec_z_df.set_index("Sector").reindex(sec_df["Sector"]).reset_index()
 
     fig_sec_ret = go.Figure()
     for label, color in [("1M Return %", "#42a5f5"), ("3M Return %", "#ab47bc"), ("1Y Return %", "#ff9800")]:
