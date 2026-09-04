@@ -2065,7 +2065,7 @@ with tabs[4]:
         # How the implied path for these same meetings has shifted over time - same
         # Today/1W/1M/3M snapshot pattern as the Treasury Yield Curve Snapshots chart.
         with st.spinner("Loading historical Fed Funds futures…"):
-            fedwatch_hist_df = get_fedwatch_history(years_ahead=2)
+            fedwatch_hist_df = get_fedwatch_history(years_ahead=2).round(3)
         fig_fedwatch_hist = go.Figure()
         for label in SNAPSHOT_OFFSETS:
             if label not in fedwatch_hist_df.columns:
@@ -2316,7 +2316,7 @@ with tabs[5]:
         rets = combo.pct_change().dropna()
         corr_60 = rets["SPY"].rolling(21 * 3).corr(rets["TLT"])  # ~60 trading days
         corr_252 = rets["SPY"].rolling(252).corr(rets["TLT"])
-        corr_df = _clip_mkt(pd.DataFrame({"60D": corr_60, "1Y": corr_252}).dropna())
+        corr_df = _clip_mkt(pd.DataFrame({"60D": corr_60, "1Y": corr_252}).dropna()).round(3)
         fig_corr.add_trace(go.Scatter(x=corr_df.index, y=corr_df["60D"], name="60D", line=dict(color="#42a5f5")))
         fig_corr.add_trace(go.Scatter(x=corr_df.index, y=corr_df["1Y"], name="1Y", line=dict(color="#ab47bc")))
     fig_corr.add_hline(y=0, line_dash="dot", line_color="#555")
@@ -2367,12 +2367,12 @@ with tabs[5]:
         idx_rows.append({"Index": name, "Level": full[name].iloc[-1], **{f"{k} Return %": v for k, v in ret.items()}})
         z = calculate_price_zscores(full[name])
         idx_z_rows.append({"Index": name, **{f"{k} Z-Score": v for k, v in z.items()}})
-    idx_df = pd.DataFrame(idx_rows).sort_values("1M Return %")
+    idx_df = pd.DataFrame(idx_rows).sort_values("1M Return %").round(3)
     idx_z_df = pd.DataFrame(idx_z_rows)
     if not idx_z_df.empty:
         # Match the returns chart's row order (not its own z-score sort) so both bar charts
         # place the same index on the same y-level - otherwise "row-for-row comparable" is false.
-        idx_z_df = idx_z_df.set_index("Index").reindex(idx_df["Index"]).reset_index()
+        idx_z_df = idx_z_df.set_index("Index").reindex(idx_df["Index"]).reset_index().round(3)
 
     fig_idx_ret = go.Figure()
     for label, color in [("1M Return %", "#42a5f5"), ("3M Return %", "#ab47bc"), ("1Y Return %", "#ff9800")]:
@@ -2412,12 +2412,12 @@ with tabs[5]:
         sec_rows.append({"Sector": "S&P 500 (SPY)", **{f"{k} Return %": v for k, v in spy_ret.items()}})
         spy_z = calculate_price_zscores(spy_full["SPY"])
         sec_z_rows.append({"Sector": "S&P 500 (SPY)", **{f"{k} Z-Score": v for k, v in spy_z.items()}})
-    sec_df = pd.DataFrame(sec_rows).sort_values("1M Return %")
+    sec_df = pd.DataFrame(sec_rows).sort_values("1M Return %").round(3)
     sec_z_df = pd.DataFrame(sec_z_rows)
     if not sec_z_df.empty:
         # Match the returns chart's row order (not its own z-score sort) so both bar charts
         # place the same sector on the same y-level.
-        sec_z_df = sec_z_df.set_index("Sector").reindex(sec_df["Sector"]).reset_index()
+        sec_z_df = sec_z_df.set_index("Sector").reindex(sec_df["Sector"]).reset_index().round(3)
 
     fig_sec_ret = go.Figure()
     for label, color in [("1M Return %", "#42a5f5"), ("3M Return %", "#ab47bc"), ("1Y Return %", "#ff9800")]:
