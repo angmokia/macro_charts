@@ -1876,7 +1876,7 @@ with tabs[4]:
         sofr       = fetch("SOFR",         "SOFR", START, END)
         iorb       = fetch("IORB",         "IORB", START, END)
         rrp        = fetch("RRPONTSYAWARD","ON RRP", START, END)
-        effr       = fetch("FEDFUNDS",     "EFFR", START, END)
+        effr       = fetch("EFFR",         "EFFR", START, END)
 
         maturities = {
             "1M":"DGS1MO","3M":"DGS3MO","6M":"DGS6MO","1Y":"DGS1",
@@ -2698,14 +2698,18 @@ with tabs[7]:
 # ════════════════════════════════════════════════════════════════════════════════
 with tabs[8]:
     st.header("Economic Calendar")
-    st.caption("Live Investing.com economic calendar widget — US (USD) events, Medium + High importance only. "
-               "Scrollable and date-navigable inside the widget itself; use its own timezone selector to switch "
-               "off the default. To widen the country/importance mix, edit the countries=/importance= params below "
-               "(country codes and the widget builder live at investing.com/webmaster-tools/economic-calendar).")
+    st.caption("Live Investing.com economic calendar widget — US (USD) events, Medium + High importance only, "
+               "times shown in GMT+8 (Singapore). Scrollable and date-navigable inside the widget itself; use "
+               "its own timezone selector to switch off the default. To widen the country/importance mix, edit "
+               "the countries=/importance= params below (country codes and the widget builder live at "
+               "investing.com/webmaster-tools/economic-calendar).")
 
+    # timeZone=113 is investing.com's internal id for "(GMT +8:00) Singapore" - confirmed via the
+    # widget builder's own dropdown (its ids aren't the UTC offset itself: the previously-used
+    # timeZone=8 actually resolves to "(GMT -4:00) Eastern Time (US & Canada)", not GMT+8).
     INVESTING_CALENDAR_SRC = ("https://sslecal2.investing.com?"
         "columns=exc_flags,exc_currency,exc_importance,exc_actual,exc_forecast,exc_previous"
-        "&importance=2,3&features=datepicker,timezone&countries=5&calType=week&timeZone=8&lang=1")
+        "&importance=2,3&features=datepicker,timezone&countries=5&calType=week&timeZone=113&lang=1")
     components.html(f"""
         <iframe src="{INVESTING_CALENDAR_SRC}" width="100%" height="700" frameborder="0"
                 allowtransparency="true" marginwidth="0" marginheight="0"></iframe>
