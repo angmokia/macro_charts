@@ -887,14 +887,37 @@ def get_crack_spreads(start: str, end: str = None) -> pd.DataFrame:
 # ── Date range ────────────────────────────────────────────────────────────────
 st.title("🇺🇸 US Macro Dashboard")
 
-col_d1, col_d2 = st.columns([3,1])
+DATE_MIN = datetime.date(1990, 1, 1)
+DATE_MAX = datetime.date.today()
+
+# date_range_slider is the single source of truth. Once a widget's key is written to via a
+# callback (as the two date_inputs below do), Streamlit warns if that SAME widget is also given
+# a `value=` on the next render ("created with a default value but also had its value set via
+# the Session State API") - so seed it once via setdefault, then never pass `value=` to the
+# slider itself.
+st.session_state.setdefault("date_range_slider", (DATE_MAX.replace(year=DATE_MAX.year - 5), DATE_MAX))
+
+def _sync_date_range_start():
+    _, hi = st.session_state.date_range_slider
+    st.session_state.date_range_slider = (st.session_state.date_range_start_input, hi)
+
+def _sync_date_range_end():
+    lo, _ = st.session_state.date_range_slider
+    st.session_state.date_range_slider = (lo, st.session_state.date_range_end_input)
+
+col_d1, col_d2, col_d3 = st.columns([3, 1, 1])
 with col_d1:
     date_range = st.slider(
-        "Date Range", min_value=datetime.date(1990, 1, 1),
-        max_value=datetime.date.today(),
-        value=(datetime.date.today().replace(year=datetime.date.today().year - 5), datetime.date.today()),
-        format="YYYY-MM-DD"
+        "Date Range", min_value=DATE_MIN, max_value=DATE_MAX,
+        format="YYYY-MM-DD", key="date_range_slider",
     )
+with col_d2:
+    st.date_input("Start (exact)", value=date_range[0], min_value=DATE_MIN, max_value=DATE_MAX,
+                   key="date_range_start_input", on_change=_sync_date_range_start)
+with col_d3:
+    st.date_input("End (exact)", value=date_range[1], min_value=DATE_MIN, max_value=DATE_MAX,
+                   key="date_range_end_input", on_change=_sync_date_range_end)
+date_range = st.session_state.date_range_slider
 START = date_range[0].strftime("%Y-%m-%d")
 END   = date_range[1].strftime("%Y-%m-%d")
 
@@ -1601,11 +1624,14 @@ with tabs[2]:
     fig_wages.update_layout(**dual_axis_layout("Avg Hourly Earnings", "YoY %", "MoM %"))
     add_recessions(fig_wages, recessions)
 
-    # NFP bar
+    # NFP bar + 12-month moving average trendline
     fig_nfp = go.Figure()
     colors_nfp = ["#26a69a" if v >= 0 else "#ef5350" for v in nfp["NFP MoM Change (k)"].fillna(0)]
     fig_nfp.add_trace(go.Bar(x=nfp.index, y=nfp["NFP MoM Change (k)"],
                              marker_color=colors_nfp, name="NFP MoM"))
+    nfp_12m_ma = nfp["NFP MoM Change (k)"].rolling(12).mean().round(1)
+    fig_nfp.add_trace(go.Scatter(x=nfp.index, y=nfp_12m_ma, name="12M MA",
+                                  mode="lines", line=dict(color="#ffb74d", width=2)))
     fig_nfp.update_layout(**base_layout("Nonfarm Payrolls MoM Change (k)"))
     add_recessions(fig_nfp, recessions)
 
@@ -1695,11 +1721,12 @@ with tabs[2]:
     else:
         fig_bev = go.Figure()
 
-    # ADP sectors
+    # ADP sectors - stacked bar (no trendline)
     fig_adp = go.Figure()
     for col in adp_sectors.columns:
-        fig_adp.add_trace(go.Scatter(x=adp_sectors.index, y=adp_sectors[col], name=col, mode="lines"))
+        fig_adp.add_trace(go.Bar(x=adp_sectors.index, y=adp_sectors[col], name=col))
     fig_adp.update_layout(**base_layout("ADP Employment by Sector (MoM, k)"))
+    fig_adp.update_layout(barmode="relative")
     add_recessions(fig_adp, recessions)
 
 
@@ -2089,10 +2116,27 @@ with tabs[4]:
         else:
             meetings = list(fedwatch_full_df.columns)
             effr_hist = get_effr_history().reindex(fedwatch_full_df.index, method="ffill")
-            as_of = st.select_slider(
-                "As of date", options=list(fedwatch_full_df.index), value=fedwatch_full_df.index[-1],
-                format_func=lambda d: d.strftime("%b %d, %Y"), key="fedwatch_as_of",
-            )
+
+            st.session_state.setdefault("fedwatch_as_of_slider", fedwatch_full_df.index[-1])
+
+            def _sync_fedwatch_from_picker():
+                picked = st.session_state.fedwatch_as_of_picker
+                idx = fedwatch_full_df.index.get_indexer([pd.Timestamp(picked)], method="nearest")[0]
+                st.session_state.fedwatch_as_of_slider = fedwatch_full_df.index[idx]
+
+            col_fw_slider, col_fw_date = st.columns([3, 1])
+            with col_fw_slider:
+                as_of = st.select_slider(
+                    "As of date (For snapshot comparison)", options=list(fedwatch_full_df.index),
+                    format_func=lambda d: d.strftime("%b %d, %Y"), key="fedwatch_as_of_slider",
+                )
+            with col_fw_date:
+                st.date_input(
+                    "Or pick a date", value=as_of.date(),
+                    min_value=fedwatch_full_df.index.min().date(), max_value=fedwatch_full_df.index.max().date(),
+                    key="fedwatch_as_of_picker", on_change=_sync_fedwatch_from_picker,
+                )
+            as_of = st.session_state.fedwatch_as_of_slider
             today_row = fedwatch_full_df.iloc[-1]
             as_of_row = fedwatch_full_df.loc[as_of]
             as_of_effr = float(effr_hist.loc[as_of])
