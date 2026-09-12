@@ -15,6 +15,7 @@ import requests
 import calendar
 import math
 import yfinance as yf
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ── Setup ─────────────────────────────────────────────────────────────────────
 load_dotenv()
@@ -56,27 +57,59 @@ RECESSION_COLOR = "rgba(180,60,60,0.12)"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-@st.cache_data(ttl=3600)
-def fetch(series_id: str, label: str, start: str, end: str = None) -> pd.DataFrame:
-    # Retry on ANY failure, not just rate-limit-shaped ones - fredapi occasionally raises a
-    # bare ValueError(None) (str(e) == "None") on a transient FRED-side hiccup (a malformed
-    # response during a brief server restart, a dropped connection), which is not a rate-limit
-    # message and would previously skip the retry entirely and fail on the very first attempt.
-    # Confirmed live: DGS1 (1-Year Treasury) failed this way once while being a completely
-    # healthy, currently-published series - a one-off transient issue, not a broken series.
+def _fred_fetch_core(series_id: str, start: str, end: str = None):
+    """Thread-safe core of fetch() - no Streamlit calls (st.warning isn't safe to call from a
+    worker thread - it silently no-ops without a ScriptRunContext), so this is what fetch_many()
+    below calls from inside a ThreadPoolExecutor. Retry on ANY failure, not just rate-limit-shaped
+    ones - fredapi occasionally raises a bare ValueError(None) (str(e) == "None") on a transient
+    FRED-side hiccup (a malformed response during a brief server restart, a dropped connection),
+    which is not a rate-limit message and would previously skip the retry entirely and fail on
+    the very first attempt. Confirmed live: DGS1 (1-Year Treasury) failed this way once while
+    being a completely healthy, currently-published series - a one-off transient issue, not a
+    broken series. Returns (series_or_None, error_or_None)."""
     last_exc = None
     for attempt in range(3):
         try:
             s = fred.get_series(series_id, observation_start=start, observation_end=end)
-            df = pd.DataFrame({label: s.values}, index=pd.to_datetime(s.index))
-            df.index.name = "date"
             time.sleep(0.15)
-            return df
+            return s, None
         except Exception as e:
             last_exc = e
             time.sleep(2 ** attempt)  # 1s, 2s, 4s backoff
-    st.warning(f"Could not load {label} ({series_id}) after 3 attempts: {last_exc}")
-    return pd.DataFrame()
+    return None, last_exc
+
+@st.cache_data(ttl=3600)
+def fetch(series_id: str, label: str, start: str, end: str = None) -> pd.DataFrame:
+    s, err = _fred_fetch_core(series_id, start, end)
+    if err is not None:
+        st.warning(f"Could not load {label} ({series_id}) after 3 attempts: {err}")
+        return pd.DataFrame()
+    df = pd.DataFrame({label: s.values}, index=pd.to_datetime(s.index))
+    df.index.name = "date"
+    return df
+
+def fetch_many(jobs, max_workers=8):
+    """Fetch several independent FRED series concurrently instead of one at a time in a loop -
+    these are unrelated network calls, so sequential fetching was pure added wall-clock time.
+    `jobs` is a list of (series_id, label, start, end) tuples; returns {label: DataFrame}, the
+    same per-series shape individual fetch() calls return, so this is a drop-in replacement for
+    a dict comprehension of fetch() calls (e.g. the CPI/PCE component loops). Warnings for any
+    series that ultimately failed are surfaced here, on the main thread, after all jobs finish."""
+    results = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(_fred_fetch_core, sid, start, end): (sid, label)
+                   for sid, label, start, end in jobs}
+        for fut in as_completed(futures):
+            sid, label = futures[fut]
+            s, err = fut.result()
+            if err is not None:
+                st.warning(f"Could not load {label} ({sid}) after 3 attempts: {err}")
+                results[label] = pd.DataFrame()
+            else:
+                df = pd.DataFrame({label: s.values}, index=pd.to_datetime(s.index))
+                df.index.name = "date"
+                results[label] = df
+    return results
 
 @st.cache_data(ttl=3600)
 def fetch_recessions(start: str, end: str) -> list:
@@ -729,6 +762,36 @@ def fetch_yf_close(ticker: str, label: str, start: str, end: str = None) -> pd.D
         st.warning(f"Could not load {label} ({ticker}): {e}")
         return pd.DataFrame()
 
+@st.cache_data(ttl=3600)
+def fetch_yf_close_batch(tickers_map: dict, start: str) -> dict:
+    """Fetch Close prices for several tickers in ONE yfinance request instead of one request per
+    ticker - yfinance batches multi-ticker downloads far more efficiently than N separate calls
+    (shared connection handling internally), so this cuts N network round-trips down to 1 for a
+    fixed group like MARKET_INDICES or SECTOR_ETFS. tickers_map is {ticker: friendly_label};
+    returns {ticker: DataFrame}, each with a single column named by that ticker's friendly_label
+    - the exact per-ticker shape fetch_yf_close() returns, so this is a drop-in replacement for a
+    dict comprehension of individual fetch_yf_close() calls."""
+    tickers = list(tickers_map.keys())
+    try:
+        hist = _yf_retry(lambda: yf.download(tickers, start=start, progress=False,
+                                             auto_adjust=True, group_by="ticker"))
+    except Exception as e:
+        st.warning(f"Could not load batch {tickers}: {e}")
+        return {t: pd.DataFrame() for t in tickers}
+    if hist.empty:
+        return {t: pd.DataFrame() for t in tickers}
+    result = {}
+    for t, label in tickers_map.items():
+        try:
+            close = hist["Close"] if len(tickers) == 1 else hist[t]["Close"]
+            s = close.dropna()
+            df = pd.DataFrame({label: s.values}, index=pd.to_datetime(s.index).tz_localize(None))
+            df.index.name = "date"
+            result[t] = df
+        except (KeyError, TypeError):
+            result[t] = pd.DataFrame()
+    return result
+
 Z_SCORE_WINDOWS = {"1M": 21, "3M": 63, "1Y": 252}  # trading days - same convention as the CIX
                                                      # backtester's dependent-variable z-score
 
@@ -974,6 +1037,19 @@ def _zscores(series, windows):
 # in "%" (e.g. "4.75%"); only the delta line switches to bps (e.g. "+2bps" instead of "+0.02%").
 YIELD_BPS_DELTA = {"10Y Yield", "2Y Yield", "Fed Funds"}
 
+def _fred_series_retry_core(sid):
+    """Thread-safe core of _fred_series_retry() - no Streamlit calls, safe to run in a worker
+    thread. Retry on any exception (see _fred_series_retry's docstring for why). Returns
+    (series, error_or_None)."""
+    last_exc = None
+    for attempt in range(3):
+        try:
+            return fred.get_series(sid).dropna(), None
+        except Exception as e:
+            last_exc = e
+            time.sleep(2 ** attempt)
+    return pd.Series(dtype=float), last_exc
+
 def _fred_series_retry(sid, label):
     """Same retry-on-any-exception + surfaced-warning pattern as fetch(), but returns a raw,
     full-history Series (no start/end bound) instead of a DataFrame - used by
@@ -982,15 +1058,10 @@ def _fred_series_retry(sid, label):
     the summary card while still working fine in the Treasury Spreads chart was this exact bug -
     a raw fred.get_series() call with a bare `except:` silently caching a transient FRED hiccup
     as None for the full 1hr TTL, with no retry and no warning, unlike fetch() everywhere else."""
-    last_exc = None
-    for attempt in range(3):
-        try:
-            return fred.get_series(sid).dropna()
-        except Exception as e:
-            last_exc = e
-            time.sleep(2 ** attempt)
-    st.warning(f"Could not load {label} ({sid}) after 3 attempts: {last_exc}")
-    return pd.Series(dtype=float)
+    s, err = _fred_series_retry_core(sid)
+    if err is not None:
+        st.warning(f"Could not load {label} ({sid}) after 3 attempts: {err}")
+    return s
 
 @st.cache_data(ttl=3600)
 def get_summary_metrics(end):
@@ -1006,9 +1077,27 @@ def get_summary_metrics(end):
         "Fed Funds":     ("FEDFUNDS",   "level",     "%",  "M"),
         "M2 YoY":        ("M2SL",       "pct_yoy",  "%",   "M"),
     }
+    # DGS5/DGS30 are only needed for the Fly/5s30s block below; DGS2/DGS10 are already in
+    # `metrics` above and reused there instead of being fetched a second time. All distinct
+    # series fetched concurrently instead of one at a time - independent network calls, nothing
+    # gained from serializing them (this was several seconds to tens of seconds of pure waiting
+    # on every cold-cache load before any series had even failed once).
+    sid_to_label = {sid: name for name, (sid, *_rest) in metrics.items()}
+    sid_to_label["DGS5"] = "5Y (for Fly/5s30s)"
+    sid_to_label["DGS30"] = "30Y (for Fly/5s30s)"
+    raw = {}
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {pool.submit(_fred_series_retry_core, sid): sid for sid in sid_to_label}
+        for fut in as_completed(futures):
+            sid = futures[fut]
+            series, err = fut.result()
+            raw[sid] = series
+            if err is not None:
+                st.warning(f"Could not load {sid_to_label[sid]} ({sid}) after 3 attempts: {err}")
+
     results = {}
     for name, (sid, calc, unit, freq) in metrics.items():
-        s = _fred_series_retry(sid, name)
+        s = raw[sid]
         if len(s) < 2:
             results[name] = (None, None, "", "", {})
             continue
@@ -1041,10 +1130,7 @@ def get_summary_metrics(end):
             st.warning(f"Could not compute {name}: {e}")
             results[name] = (None, None, "", "", {})
 
-    d2  = _fred_series_retry("DGS2", "2Y (for Fly/5s30s)")
-    d5  = _fred_series_retry("DGS5", "5Y (for Fly/5s30s)")
-    d10 = _fred_series_retry("DGS10", "10Y (for Fly/5s30s)")
-    d30 = _fred_series_retry("DGS30", "30Y (for Fly/5s30s)")
+    d2, d5, d10, d30 = raw["DGS2"], raw["DGS5"], raw["DGS10"], raw["DGS30"]
     if min(len(d2), len(d5), len(d10), len(d30)) < 2:
         results["2s5s10s Fly"] = (None, None, "", "", {})
         results["5s30s"] = (None, None, "", "", {})
@@ -1151,7 +1237,8 @@ with tabs[0]:
             ("Education & Communication",  "CPIEDUSL"),
             ("Other Goods & Services",     "CPIOGSSL"),
         ]
-        cpi_components = {label: mom_yoy(fetch(sid, label, START, END), label) for label, sid in CPI_COMPONENTS}
+        cpi_raw = fetch_many([(sid, label, START, END) for label, sid in CPI_COMPONENTS])
+        cpi_components = {label: mom_yoy(cpi_raw[label], label) for label, sid in CPI_COMPONENTS}
 
         # PCE components - a genuinely non-overlapping partition of PCE (BEA NIPA Table 2.4.5,
         # "Personal Consumption Expenditures by Type of Product" - verified live via FRED's
@@ -1191,15 +1278,16 @@ with tabs[0]:
             out[f"{col} YoY %"] = (df[col].pct_change(4) * 100).round(3)
             return out
 
-        pce_components = {label: qoq_yoy(fetch(f"{root}RG3Q086SBEA", label, START, END), label)
-                           for label, root in PCE_COMPONENTS}
+        pce_raw_qoq = fetch_many([(f"{root}RG3Q086SBEA", label, START, END) for label, root in PCE_COMPONENTS])
+        pce_components = {label: qoq_yoy(pce_raw_qoq[label], label) for label, root in PCE_COMPONENTS}
 
         # Weights - nominal-dollar expenditure shares. Since these 16 categories are a complete
         # partition by construction, the total is just their own sum - no separate "PCE Total"
         # series needed, and weights always sum to exactly 100%.
+        pce_raw_wt = fetch_many([(f"{root}RC1Q027SBEA", f"{label} $", START, END) for label, root in PCE_COMPONENTS])
         pce_levels = {}
         for label, root in PCE_COMPONENTS:
-            df_w = fetch(f"{root}RC1Q027SBEA", f"{label} $", START, END)
+            df_w = pce_raw_wt[f"{label} $"]
             if not df_w.empty:
                 pce_levels[label] = df_w[f"{label} $"].dropna().iloc[-1]
         pce_total = sum(pce_levels.values())
@@ -2451,8 +2539,8 @@ with tabs[5]:
         y2_full  = fetch("DGS2",  "2Y Yield",  MARKETS_HIST_START, END)
         y10_full = fetch("DGS10", "10Y Yield", MARKETS_HIST_START, END)
         y30_full = fetch("DGS30", "30Y Yield", MARKETS_HIST_START, END)
-        idx_full = {t: fetch_yf_close(t, name, MARKETS_HIST_START) for t, name in MARKET_INDICES.items()}
-        sector_full = {t: fetch_yf_close(t, name, MARKETS_HIST_START) for t, name in SECTOR_ETFS.items()}
+        idx_full = fetch_yf_close_batch(MARKET_INDICES, MARKETS_HIST_START)
+        sector_full = fetch_yf_close_batch(SECTOR_ETFS, MARKETS_HIST_START)
 
         # VIX term structure - ^VIX9D/^VIX3M only ever return their single current value via
         # yfinance (confirmed live: requesting 2 years of history still returns exactly 1 row),
