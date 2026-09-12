@@ -107,6 +107,30 @@ def add_recessions(fig, recessions, rows=None, cols=None):
                           layer="below", line_width=0)
     return fig
 
+def add_ma_overlays(fig, full_df, col_name, start, end, row=None, col=None,
+                     color_200d="#8a94a6", color_200w="#4fc3f7"):
+    """200-day and 200-week moving average overlays. Computed off the FULL (unclipped) series so
+    the rolling windows have enough trailing history regardless of the selected display range -
+    same reasoning as the z-score windows elsewhere in this file - then clipped to [start, end]
+    for display. The 200W MA resamples to weekly closes first (last close of each week), then
+    takes a 200-period rolling mean of THAT - a 200-week MA is not the same as a 1400-day MA on
+    daily data."""
+    if full_df.empty or col_name not in full_df.columns:
+        return fig
+    s = full_df[col_name].dropna()
+    ma_200d = s.rolling(200).mean()
+    ma_200w = s.resample("W").last().dropna().rolling(200).mean()
+    ma_200d = ma_200d[(ma_200d.index >= start) & (ma_200d.index <= end)]
+    ma_200w = ma_200w[(ma_200w.index >= start) & (ma_200w.index <= end)]
+    kwargs = dict(row=row, col=col) if row is not None and col is not None else {}
+    if not ma_200d.empty:
+        fig.add_trace(go.Scatter(x=ma_200d.index, y=ma_200d.values, name="200D MA",
+                                  line=dict(color=color_200d, width=1.1, dash="dot")), **kwargs)
+    if not ma_200w.empty:
+        fig.add_trace(go.Scatter(x=ma_200w.index, y=ma_200w.values, name="200W MA",
+                                  line=dict(color=color_200w, width=1.3, dash="dash")), **kwargs)
+    return fig
+
 def base_layout(title="", height=480):
     return dict(
         template=TEMPLATE, paper_bgcolor=PAPER_BG, plot_bgcolor=PLOT_BG,
@@ -2424,7 +2448,9 @@ with tabs[5]:
         vix_full = fetch_yf_close("^VIX", "VIX", MARKETS_HIST_START)
         dxy_full = fetch_yf_close("DX-Y.NYB", "DXY", MARKETS_HIST_START)
         gold_full = fetch_yf_close("GC=F", "Gold", MARKETS_HIST_START)
-        real_yield_10y = fetch("DFII10", "10Y Real Yield", MARKETS_HIST_START, END)
+        y2_full  = fetch("DGS2",  "2Y Yield",  MARKETS_HIST_START, END)
+        y10_full = fetch("DGS10", "10Y Yield", MARKETS_HIST_START, END)
+        y30_full = fetch("DGS30", "30Y Yield", MARKETS_HIST_START, END)
         idx_full = {t: fetch_yf_close(t, name, MARKETS_HIST_START) for t, name in MARKET_INDICES.items()}
         sector_full = {t: fetch_yf_close(t, name, MARKETS_HIST_START) for t, name in SECTOR_ETFS.items()}
 
@@ -2470,16 +2496,15 @@ with tabs[5]:
     # unretried fred.get_series call, so a transient FRED hiccup here behaves the same way as
     # everywhere else in the file instead of risking an unhandled exception.
     st.markdown('<div class="section-header">Equity Risk Premium</div>', unsafe_allow_html=True)
-    y10_nominal_df = fetch("DGS10", "10Y Nominal Yield", MARKETS_HIST_START, END)
     missing = []
     if not spy_pe:
         missing.append("SPY trailing P/E")
-    if y10_nominal_df.empty:
+    if y10_full.empty:
         missing.append("10Y Treasury yield")
 
     if not missing:
         earnings_yield = 100 / spy_pe
-        y10_nominal = float(y10_nominal_df["10Y Nominal Yield"].dropna().iloc[-1])
+        y10_nominal = float(y10_full["10Y Yield"].dropna().iloc[-1])
         erp = earnings_yield - y10_nominal
         erp_col1, erp_col2, erp_col3 = st.columns(3)
         with erp_col1:
@@ -2611,36 +2636,45 @@ with tabs[5]:
                "yfinance only ever returns the single latest value for ^VIX9D and ^VIX3M, regardless "
                "of how much history is requested.")
 
-    # Dollar Index
+    # Dollar Index - with 200D/200W moving averages
     fig_dxy = go.Figure()
     dxy_clipped = _clip_mkt(dxy_full)
     if not dxy_clipped.empty:
         fig_dxy.add_trace(go.Scatter(x=dxy_clipped.index, y=dxy_clipped["DXY"], name="DXY",
                                      line=dict(color="#90a4d4")))
+    add_ma_overlays(fig_dxy, dxy_full, "DXY", START, END)
     fig_dxy.update_layout(**base_layout("US Dollar Index (DXY)"))
     add_recessions(fig_dxy, recessions)
 
-    # Gold vs 10Y real yield - two panels, not one dual-axis chart: different units.
-    fig_gold = make_subplots(rows=2, cols=1, shared_xaxes=True,
-                             subplot_titles=("Gold ($/oz)", "10Y Real Yield (%)"),
-                             vertical_spacing=0.12)
+    # Gold + 2Y/10Y/30Y Yields - 4-panel grid (same layout pattern as the JOLTS 2x2 grid in the
+    # Labour Market tab), each with 200D/200W moving averages.
+    fig_gold = make_subplots(rows=2, cols=2,
+                             subplot_titles=("Gold ($/oz)", "2Y Yield (%)", "10Y Yield (%)", "30Y Yield (%)"),
+                             shared_xaxes=False, vertical_spacing=0.15)
     gold_clipped = _clip_mkt(gold_full)
-    ry_clipped = real_yield_10y[(real_yield_10y.index >= START) & (real_yield_10y.index <= END)] if not real_yield_10y.empty else real_yield_10y
-    if not gold_clipped.empty:
-        fig_gold.add_trace(go.Scatter(x=gold_clipped.index, y=gold_clipped["Gold"],
-                                      name="Gold", line=dict(color="#eda100")), row=1, col=1)
-    if not ry_clipped.empty:
-        fig_gold.add_trace(go.Scatter(x=ry_clipped.index, y=ry_clipped["10Y Real Yield"],
-                                      name="10Y Real Yield", line=dict(color="#ef5350")), row=2, col=1)
+    y2_clipped  = _clip_mkt(y2_full)
+    y10_clipped = _clip_mkt(y10_full)
+    y30_clipped = _clip_mkt(y30_full)
+    for (df_full, df_clipped, col_name, label, color), (row, col) in zip(
+        [(gold_full, gold_clipped, "Gold",      "Gold",      "#eda100"),
+         (y2_full,   y2_clipped,   "2Y Yield",  "2Y Yield",  "#42a5f5"),
+         (y10_full,  y10_clipped,  "10Y Yield", "10Y Yield", "#ef5350"),
+         (y30_full,  y30_clipped,  "30Y Yield", "30Y Yield", "#ab47bc")],
+        [(1, 1), (1, 2), (2, 1), (2, 2)]
+    ):
+        if not df_clipped.empty:
+            fig_gold.add_trace(go.Scatter(x=df_clipped.index, y=df_clipped[col_name],
+                                          name=label, line=dict(color=color)), row=row, col=col)
+        add_ma_overlays(fig_gold, df_full, col_name, START, END, row=row, col=col)
     fig_gold.update_layout(template=TEMPLATE, paper_bgcolor=PAPER_BG, plot_bgcolor=PLOT_BG,
-                           height=500, margin=dict(l=10, r=10, t=45, b=30), showlegend=False)
+                           height=560, margin=dict(l=10, r=10, t=50, b=30), showlegend=False)
     fig_gold.update_xaxes(gridcolor=GRID_COLOR)
     fig_gold.update_yaxes(gridcolor=GRID_COLOR)
-    add_recessions(fig_gold, recessions, rows=[1, 2], cols=[1, 1])
+    add_recessions(fig_gold, recessions, rows=[1, 1, 2, 2], cols=[1, 2, 1, 2])
 
     render_two_col([
         ("Dollar Index (DXY)", fig_dxy, dxy_clipped),
-        ("Gold vs 10Y Real Yield", fig_gold, pd.concat([gold_clipped, ry_clipped], axis=1)),
+        ("Gold & Treasury Yields", fig_gold, pd.concat([gold_clipped, y2_clipped, y10_clipped, y30_clipped], axis=1)),
     ])
 
 
