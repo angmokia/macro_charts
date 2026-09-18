@@ -164,6 +164,15 @@ def add_ma_overlays(fig, full_df, col_name, start, end, row=None, col=None,
                                   line=dict(color=color_200w, width=1.3, dash="dash")), **kwargs)
     return fig
 
+def add_rolling_mean_trace(fig, series, window, name, color, yaxis="y", dash="dot", width=1.3):
+    """Simple rolling-mean overlay for an already-computed series (e.g. 6M MA on a monthly YoY % column) - no resampling, unlike add_ma_overlays."""
+    ma = series.dropna().rolling(window).mean()
+    if ma.empty:
+        return fig
+    fig.add_trace(go.Scatter(x=ma.index, y=ma.values, name=name, mode="lines",
+                              yaxis=yaxis, line=dict(color=color, width=width, dash=dash)))
+    return fig
+
 def base_layout(title="", height=480):
     return dict(
         template=TEMPLATE, paper_bgcolor=PAPER_BG, plot_bgcolor=PLOT_BG,
@@ -206,12 +215,18 @@ def csv_download(df: pd.DataFrame, label: str):
                        mime="text/csv", key=f"dl_{label}_{id(df)}")
 
 def render_two_col(charts):
-    """Render (title, fig [, df]) tuples in 2-column layout."""
+    """Render (title, fig [, df]) tuples in 2-column layout. Explicit `key=` on every
+    st.plotly_chart call - without it, Streamlit auto-generates an element ID from the figure's
+    own content, and two DIFFERENT charts that both happen to render as an empty go.Figure() with
+    no layout (e.g. two charts that both fall back to a bare go.Figure() when their shared
+    upstream data is empty after a transient fetch failure) are then structurally identical and
+    collide, crashing with StreamlitDuplicateElementId - confirmed live, triggered by a real
+    transient FRED hiccup during testing. The title is already unique per render_two_col call."""
     n, i = len(charts), 0
     while i < n:
         if i == n - 1 and n % 2 != 0:
             item = charts[i]
-            st.plotly_chart(item[1], use_container_width=True)
+            st.plotly_chart(item[1], use_container_width=True, key=f"chart_{item[0]}")
             if len(item) > 2 and item[2] is not None:
                 csv_download(item[2], item[0])
             i += 1
@@ -219,7 +234,7 @@ def render_two_col(charts):
             c1, c2 = st.columns(2)
             for col, item in [(c1, charts[i]), (c2, charts[i+1])]:
                 with col:
-                    st.plotly_chart(item[1], use_container_width=True)
+                    st.plotly_chart(item[1], use_container_width=True, key=f"chart_{item[0]}")
                     if len(item) > 2 and item[2] is not None:
                         csv_download(item[2], item[0])
             i += 2
@@ -326,10 +341,28 @@ def get_fedwatch_history(years_ahead=2, full_period="2y"):
     window_end = today + pd.DateOffset(years=years_ahead)
     meetings = [pd.Timestamp(d) for d in get_fomc_dates() if today <= pd.Timestamp(d) <= window_end]
 
+    # Fetch every meeting's contract in ONE batched yfinance call instead of one at a time -
+    # same batching win as fetch_yf_close_batch() uses for MARKET_INDICES/SECTOR_ETFS. These are
+    # all different ZQ contract-month tickers, but yfinance batches an arbitrary ticker list
+    # just as well as a list of equities/ETFs.
+    tickers = [_zq_ticker(_month_after(m)) for m in meetings]
+    try:
+        hist = _yf_retry(lambda: yf.download(tickers, period=full_period, progress=False,
+                                             auto_adjust=False, group_by="ticker"))
+    except Exception:
+        hist = pd.DataFrame()
+
     rows, full_cols = [], {}
-    for meeting in meetings:
+    for meeting, ticker in zip(meetings, tickers):
         meeting_label = meeting.strftime("%Y-%m-%d")
-        series = _zq_close_series(_zq_ticker(_month_after(meeting)), period=full_period)
+        series = None
+        if not hist.empty:
+            try:
+                close = hist["Close"] if len(tickers) == 1 else hist[ticker]["Close"]
+                s = close.dropna()
+                series = s if not s.empty else None
+            except (KeyError, TypeError):
+                series = None
         row = {"Meeting": meeting_label}
         if series is not None:
             implied = (100 - series).dropna()
@@ -354,10 +387,30 @@ def get_fedwatch_probabilities(years_ahead=2):
     window_end = today + pd.DateOffset(years=years_ahead)
     meetings = [pd.Timestamp(d) for d in get_fomc_dates() if today <= pd.Timestamp(d) <= window_end]
 
+    # Batch-fetch every meeting's clean next-month contract in ONE call instead of one at a
+    # time - the day-weighted fallback path below still fetches individually, since it's rare
+    # (only triggered when the cleaner next-month contract isn't available) and depends on the
+    # previous meeting's already-computed implied rate, so it can't be batched the same way.
+    clean_tickers = [_zq_ticker(_month_after(m)) for m in meetings]
+    try:
+        _fw_batch = _yf_retry(lambda: yf.download(clean_tickers, period="5d", progress=False,
+                                                   auto_adjust=False, group_by="ticker"))
+    except Exception:
+        _fw_batch = pd.DataFrame()
+
+    def _price_from_batch(ticker):
+        if _fw_batch.empty:
+            return None
+        try:
+            close = _fw_batch["Close"] if len(clean_tickers) == 1 else _fw_batch[ticker]["Close"]
+            c = close.dropna()
+            return float(c.iloc[-1]) if not c.empty else None
+        except (KeyError, TypeError):
+            return None
+
     implied = {}  # meeting -> implied post-meeting rate, computed independently per meeting
-    for meeting in meetings:
-        clean_month = _month_after(meeting)
-        price = _zq_price(_zq_ticker(clean_month))
+    for meeting, clean_ticker in zip(meetings, clean_tickers):
+        price = _price_from_batch(clean_ticker)
         if price is None:
             # fall back to the meeting's own contract month (day-weighted solve) only if the
             # cleaner next-month contract isn't available
@@ -416,7 +469,15 @@ def _get_json(url, retries=5, backoff=2, timeout=30):
     raise RuntimeError(f"Treasury API failed after {retries} retries: {url}")
 
 def _download_all_auctions():
-    data, result = [], _get_json(f"{AUCTIONS_URL}?filter=record_date:gt:1900-01-01&page[size]=10000")
+    # Cutoff at 1990 (the global date-range slider's own DATE_MIN, so the issuance-over-time
+    # chart never loses data a user could actually select), or 32 years back if that's ever
+    # later - confirmed live this cuts the API's own response time roughly in half (~15s -> ~10s)
+    # by collapsing the result to a single page instead of two (the API's page-size cap is
+    # 10,000 records; "since 1900" returns just over that, "since 1990" comfortably under it).
+    # 32 years of margin safely covers any security that could still be outstanding today,
+    # including the longest-dated 30-Year Bond issued as far back as it can be and not yet matured.
+    cutoff_year = min(1990, pd.Timestamp.today().year - 32)
+    data, result = [], _get_json(f"{AUCTIONS_URL}?filter=record_date:gt:{cutoff_year}-01-01&page[size]=10000")
     data.extend(result["data"])
     while result["links"]["next"] is not None:
         # next link is "&page[number]=N..." with no leading "?" - must not be
@@ -1347,6 +1408,10 @@ with tabs[0]:
         ax = "y2" if "MoM" in col else "y"
         fig_cpi.add_trace(go.Scatter(x=src.index, y=src[col], name=col, mode="lines",
                                      yaxis=ax, line=dict(width=1.5 if "YoY" in col else 1, dash="solid" if "YoY" in col else "dot")))
+        if col == "CPI YoY %":
+            add_rolling_mean_trace(fig_cpi, src[col], 6, "CPI YoY 6M MA", "#8a94a6")
+        elif col == "Core CPI YoY %":
+            add_rolling_mean_trace(fig_cpi, src[col], 6, "Core CPI YoY 6M MA", "#4fc3f7")
     fig_cpi.update_layout(**dual_axis_layout("CPI vs Core CPI", "YoY %", "MoM %"))
     add_recessions(fig_cpi, recessions)
 
@@ -1359,6 +1424,10 @@ with tabs[0]:
         ax = "y2" if "MoM" in col else "y"
         fig_pce.add_trace(go.Scatter(x=src.index, y=src[col], name=col, mode="lines",
                                      yaxis=ax, line=dict(width=1.5 if "YoY" in col else 1, dash="solid" if "YoY" in col else "dot")))
+        if col == "PCE YoY %":
+            add_rolling_mean_trace(fig_pce, src[col], 6, "PCE YoY 6M MA", "#8a94a6")
+        elif col == "Core PCE YoY %":
+            add_rolling_mean_trace(fig_pce, src[col], 6, "Core PCE YoY 6M MA", "#4fc3f7")
     fig_pce.update_layout(**dual_axis_layout("PCE vs Core PCE (Fed's Preferred)", "YoY %", "MoM %"))
     add_recessions(fig_pce, recessions)
 
@@ -1679,40 +1748,6 @@ with tabs[1]:
 with tabs[2]:
     st.header("Labour Market")
     with st.spinner("Loading labour data…"):
-        wages   = mom_yoy(fetch("CES0500000003", "Avg Hourly Earnings", START, END), "Avg Hourly Earnings")
-        nfp     = nfp_change(fetch("PAYEMS", "NFP", START, END), "NFP")
-        lfpr    = fetch("CIVPART", "Labour Force Participation Rate", START, END)
-        prime_lfpr = fetch("LNS11300060", "Prime-Age LFPR (25-54)", START, END)
-
-        unemp_data = pd.concat([
-            fetch(sid, lbl, START, END)
-            for sid, lbl in [
-                ("U1RATE","U1"), ("U2RATE","U2"), ("UNRATE","U3"),
-                ("U4RATE","U4"), ("U5RATE","U5"), ("U6RATE","U6"), ("CGBD25O","U7 BA+"),
-            ]
-        ], axis=1)
-
-        demo = pd.concat([
-            fetch(sid, lbl, START, END)
-            for sid, lbl in [
-                ("LNS14000003","Men 20+"), ("LNS14000002","Women 20+"),
-                ("LNS14000006","Teenagers"), ("LNS14000009","Black/AA"),
-                ("LNS14000012","Hispanic"), ("LNS14027662","White"),
-            ]
-        ], axis=1)
-
-        claims = fetch("ICSA", "Initial Claims", START, END)
-        if not claims.empty and "Initial Claims" in claims.columns:
-            claims["4W MA"]  = claims["Initial Claims"].rolling(4).mean()
-            claims["12W MA"] = claims["Initial Claims"].rolling(12).mean()
-
-        # JOLTS
-        jolts_openings = fetch("JTSJOL",  "Job Openings (k)", START, END)
-        jolts_quits    = fetch("JTSQUR",  "Quits Rate", START, END)
-        jolts_layoffs  = fetch("JTSLDR",  "Layoffs Rate", START, END)
-        jolts_hire     = fetch("JTSHIR",  "Hire Rate", START, END)
-
-        # ADP sectors
         adp_ids = {
             "Construction":       "ADPWINDCONNERSA",
             "Information":        "ADPWINDINFONERSA",
@@ -1722,9 +1757,49 @@ with tabs[2]:
             "Trade & Transport":  "ADPWINDTTUNERSA",
             "Financial":          "ADPWINDFINNERSA",
         }
+        # 29 independent FRED series fetched concurrently instead of one at a time - this tab
+        # had the same "sequential dict-comprehension fetch" pattern as the Prices tab's CPI/PCE
+        # components, just spread across wages/NFP/LFPR/unemployment/demographics/claims/JOLTS/ADP.
+        _labor_jobs = (
+            [("CES0500000003", "Avg Hourly Earnings"), ("PAYEMS", "NFP"),
+             ("CIVPART", "Labour Force Participation Rate"), ("LNS11300060", "Prime-Age LFPR (25-54)"),
+             ("ICSA", "Initial Claims"),
+             ("JTSJOL", "Job Openings (k)"), ("JTSQUR", "Quits Rate"),
+             ("JTSLDR", "Layoffs Rate"), ("JTSHIR", "Hire Rate")]
+            + [("U1RATE","U1"), ("U2RATE","U2"), ("UNRATE","U3"),
+               ("U4RATE","U4"), ("U5RATE","U5"), ("U6RATE","U6"), ("CGBD25O","U7 BA+")]
+            + [("LNS14000003","Men 20+"), ("LNS14000002","Women 20+"),
+               ("LNS14000006","Teenagers"), ("LNS14000009","Black/AA"),
+               ("LNS14000012","Hispanic"), ("LNS14027662","White")]
+            + [(sid, name) for name, sid in adp_ids.items()]
+        )
+        _labor_raw = fetch_many([(sid, label, START, END) for sid, label in _labor_jobs])
+
+        wages   = mom_yoy(_labor_raw["Avg Hourly Earnings"], "Avg Hourly Earnings")
+        nfp     = nfp_change(_labor_raw["NFP"], "NFP")
+        lfpr    = _labor_raw["Labour Force Participation Rate"]
+        prime_lfpr = _labor_raw["Prime-Age LFPR (25-54)"]
+
+        unemp_data = pd.concat([_labor_raw[lbl] for lbl in ["U1","U2","U3","U4","U5","U6","U7 BA+"]], axis=1)
+
+        demo = pd.concat([_labor_raw[lbl] for lbl in
+                           ["Men 20+","Women 20+","Teenagers","Black/AA","Hispanic","White"]], axis=1)
+
+        claims = _labor_raw["Initial Claims"]
+        if not claims.empty and "Initial Claims" in claims.columns:
+            claims["4W MA"]  = claims["Initial Claims"].rolling(4).mean()
+            claims["12W MA"] = claims["Initial Claims"].rolling(12).mean()
+
+        # JOLTS
+        jolts_openings = _labor_raw["Job Openings (k)"]
+        jolts_quits    = _labor_raw["Quits Rate"]
+        jolts_layoffs  = _labor_raw["Layoffs Rate"]
+        jolts_hire     = _labor_raw["Hire Rate"]
+
+        # ADP sectors
         adp_sectors = pd.concat([
-            nfp_change(fetch(sid, name, START, END), name)
-            for name, sid in adp_ids.items()
+            nfp_change(_labor_raw[name], name)
+            for name in adp_ids.keys()
         ], axis=1)
 
 
@@ -2024,28 +2099,36 @@ with tabs[3]:
 with tabs[4]:
     st.header("Monetary Policy & Rates")
     with st.spinner("Loading monetary data…"):
-        fed_total  = fetch("WALCL",        "Fed Total Assets (M)", START, END)
-        fed_tres   = fetch("TREAST",       "Fed Treasuries (M)", START, END)
-        m2         = fetch("M2SL",         "M2", START, END)
-        sofr       = fetch("SOFR",         "SOFR", START, END)
-        iorb       = fetch("IORB",         "IORB", START, END)
-        rrp        = fetch("RRPONTSYAWARD","ON RRP", START, END)
-        effr       = fetch("EFFR",         "EFFR", START, END)
-
         maturities = {
             "1M":"DGS1MO","3M":"DGS3MO","6M":"DGS6MO","1Y":"DGS1",
             "2Y":"DGS2","3Y":"DGS3","5Y":"DGS5","7Y":"DGS7",
             "10Y":"DGS10","20Y":"DGS20","30Y":"DGS30"
         }
-        yc = pd.concat([fetch(code, label, START, END) for label, code in maturities.items()], axis=1)
+        # 24 independent FRED series fetched concurrently instead of one at a time - this block
+        # alone was a large share of this tab's cold-load time when done sequentially.
+        _rates_jobs = [
+            ("WALCL", "Fed Total Assets (M)"), ("TREAST", "Fed Treasuries (M)"), ("M2SL", "M2"),
+            ("SOFR", "SOFR"), ("IORB", "IORB"), ("RRPONTSYAWARD", "ON RRP"), ("EFFR", "EFFR"),
+            ("DFII5", "5Y Real Yield"), ("DFII10", "10Y Real Yield"),
+            ("T5YIE", "5Y Breakeven"), ("T10YIE", "10Y Breakeven"),
+            ("BAMLC0A0CM", "IG OAS"), ("BAMLH0A0HYM2", "HY OAS"),
+        ] + [(code, label) for label, code in maturities.items()]
+        _rates_raw = fetch_many([(sid, label, START, END) for sid, label in _rates_jobs])
 
-        tips_5y  = fetch("DFII5",  "5Y Real Yield", START, END)
-        tips_10y = fetch("DFII10", "10Y Real Yield", START, END)
-        be_5y2   = fetch("T5YIE",  "5Y Breakeven", START, END)
-        be_10y2  = fetch("T10YIE", "10Y Breakeven", START, END)
-
-        ig_oas = fetch("BAMLC0A0CM",  "IG OAS", START, END)
-        hy_oas = fetch("BAMLH0A0HYM2","HY OAS", START, END)
+        fed_total  = _rates_raw["Fed Total Assets (M)"]
+        fed_tres   = _rates_raw["Fed Treasuries (M)"]
+        m2         = _rates_raw["M2"]
+        sofr       = _rates_raw["SOFR"]
+        iorb       = _rates_raw["IORB"]
+        rrp        = _rates_raw["ON RRP"]
+        effr       = _rates_raw["EFFR"]
+        tips_5y    = _rates_raw["5Y Real Yield"]
+        tips_10y   = _rates_raw["10Y Real Yield"]
+        be_5y2     = _rates_raw["5Y Breakeven"]
+        be_10y2    = _rates_raw["10Y Breakeven"]
+        ig_oas     = _rates_raw["IG OAS"]
+        hy_oas     = _rates_raw["HY OAS"]
+        yc = pd.concat([_rates_raw[label] for label in maturities.keys()], axis=1)
 
     # Fed balance sheet breakdown
     fed_total_T = fed_total["Fed Total Assets (M)"] / 1e6 if not fed_total.empty else pd.Series()
@@ -2224,7 +2307,7 @@ with tabs[4]:
             y_pad = (y_max - y_min) * 0.15 or 0.25
             fig_fedwatch.update_yaxes(ticksuffix="%", title="Implied Rate", range=[y_min - y_pad, y_max + y_pad * 1.6])
             fig_fedwatch.update_xaxes(title="FOMC Meeting Date")
-            st.plotly_chart(fig_fedwatch, use_container_width=True)
+            st.plotly_chart(fig_fedwatch, use_container_width=True, key="chart_fedwatch_fallback")
         else:
             meetings = list(fedwatch_full_df.columns)
             effr_hist = get_effr_history().reindex(fedwatch_full_df.index, method="ffill")
@@ -2344,7 +2427,7 @@ with tabs[4]:
 
             col_full, col_detail = st.columns(2)
             with col_full:
-                st.plotly_chart(fig_fedwatch_full, use_container_width=True)
+                st.plotly_chart(fig_fedwatch_full, use_container_width=True, key="chart_fedwatch_full")
             with col_detail:
                 st.markdown("**Probabilities / Hikes-Cuts Detail**")
                 st.dataframe(detail, use_container_width=True, hide_index=True, height=440)
@@ -2605,7 +2688,7 @@ with tabs[5]:
     else:
         st.info(f"Equity risk premium unavailable this run - failed to load: {', '.join(missing)}.")
 
-    st.plotly_chart(fig_corr, use_container_width=True)
+    st.plotly_chart(fig_corr, use_container_width=True, key="chart_stock_bond_corr")
     csv_download(corr_df if not spy_full.empty and not tlt_full.empty else pd.DataFrame(), "stock_bond_correlation")
 
     # Index levels, 1M/3M/1Y returns, and z-scores - returns use the same fixed trailing
