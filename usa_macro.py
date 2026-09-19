@@ -378,6 +378,89 @@ def get_fedwatch_history(years_ahead=2, full_period="2y"):
 def get_effr_history():
     return fred.get_series("EFFR").dropna()
 
+SEP_SERIES = {"med": "FEDTARMD", "lo": "FEDTARRL", "hi": "FEDTARRH", "ctl": "FEDTARCTL", "cth": "FEDTARCTH"}
+
+@st.cache_data(ttl=21600)
+def get_sep_data():
+    """Fed SEP (dot plot) summary stats from FRED/ALFRED. Each series has one row per (release
+    vintage, projection year), so the projections in force on any past date can be rebuilt.
+    Returns ({key: all-releases DataFrame}, longer-run median Series, vintage dates) or None on failure."""
+    try:
+        with ThreadPoolExecutor(max_workers=6) as ex:
+            futs = {k: ex.submit(fred.get_series_all_releases, sid) for k, sid in SEP_SERIES.items()}
+            lr_fut = ex.submit(lambda: fred.get_series("FEDTARMDLR").dropna())
+            vd_fut = ex.submit(fred.get_series_vintage_dates, "FEDTARMD")
+            sep = {k: f.result() for k, f in futs.items()}
+            return sep, lr_fut.result(), [pd.Timestamp(d) for d in vd_fut.result()]
+    except Exception:
+        return None
+
+def _sep_in_force(df, as_of):
+    d = df[df["realtime_start"] <= pd.Timestamp(as_of)].sort_values("realtime_start").groupby("date").last()
+    return d["value"]
+
+def build_dot_plot_fig(sep_bundle, as_of, as_of_row, as_of_effr, as_of_label, meetings):
+    """Median dots / range / central tendency for the SEP in force on `as_of`, against the
+    futures-implied rate after each year's December meeting (read from that date's row of the
+    fed funds futures history). Returns None if no SEP was in force yet."""
+    sep, lr_series, vintages = sep_bundle
+    as_of = pd.Timestamp(as_of)
+    in_force = max([v for v in vintages if v <= as_of], default=None)
+    if in_force is None:
+        return None
+    med, lo, hi = (_sep_in_force(sep[k], as_of) for k in ("med", "lo", "hi"))
+    ctl, cth = _sep_in_force(sep["ctl"], as_of), _sep_in_force(sep["cth"], as_of)
+    years = [d.year for d in med.index if d.year >= as_of.year and d in lo.index and d in hi.index]
+    if not years:
+        return None
+    yr_key = {y: pd.Timestamp(f"{y}-01-01") for y in years}
+    xs = [str(y) for y in years]
+    lr_hist = lr_series[lr_series.index <= as_of]
+    lr = float(lr_hist.iloc[-1]) if len(lr_hist) else None
+
+    def _ranges(lo_s, hi_s):
+        x, y = [], []
+        for yr in years:
+            k = yr_key[yr]
+            if k in lo_s.index and k in hi_s.index:
+                x += [str(yr), str(yr), None]; y += [lo_s[k], hi_s[k], None]
+        return x, y
+
+    fig = go.Figure()
+    cx, cy = _ranges(ctl, cth)
+    fig.add_trace(go.Scatter(x=cx, y=cy, mode="lines", name="Central tendency", connectgaps=False,
+                             line=dict(color="#4fc3f7", width=14), opacity=0.45, hoverinfo="skip"))
+    rx, ry = _ranges(lo, hi)
+    fig.add_trace(go.Scatter(x=rx, y=ry, mode="lines+markers", name="Range (low-high)", connectgaps=False,
+                             line=dict(color="#8a94a6", width=2), marker=dict(symbol="line-ew", size=12, line=dict(width=2, color="#8a94a6")),
+                             hoverinfo="skip"))
+    fig.add_trace(go.Scatter(x=xs, y=[med[yr_key[y]] for y in years], mode="markers+text", name="Median dot",
+                             marker=dict(color="#ff9800", symbol="diamond", size=13, line=dict(width=1, color="#ffffff")),
+                             text=[f"{med[yr_key[y]]:.1f}" for y in years], textposition="middle right",
+                             hovertemplate="%{x} median: %{y:.2f}%<extra></extra>"))
+    if lr is not None:
+        fig.add_trace(go.Scatter(x=["Longer run"], y=[lr], mode="markers+text", name="Longer-run median",
+                                 marker=dict(color="#ff9800", symbol="diamond-open", size=13, line=dict(width=2)),
+                                 text=[f"{lr:.1f}"], textposition="middle right",
+                                 hovertemplate="Longer run: %{y:.2f}%<extra></extra>"))
+    mk_x, mk_y = [], []
+    for y in years:
+        dec = [m for m in meetings if str(m).startswith(f"{y}-12")]
+        if dec and pd.notna(as_of_row[dec[-1]]):
+            mk_x.append(str(y)); mk_y.append(float(as_of_row[dec[-1]]))
+    if mk_x:
+        fig.add_trace(go.Scatter(x=mk_x, y=mk_y, mode="markers+text", name="Futures-implied (after Dec meeting)",
+                                 marker=dict(color="#26a69a", size=11, line=dict(width=1, color="#ffffff")),
+                                 text=[f"{v:.2f}" for v in mk_y], textposition="middle left",
+                                 hovertemplate="%{x} futures-implied: %{y:.3f}%<extra></extra>"))
+    fig.add_hline(y=as_of_effr, line_dash="dash", line_color="#e0e0e0",
+                  annotation_text=f"EFFR ({as_of_effr:.2f}%)", annotation_position="bottom left")
+    fig.update_layout(**base_layout(f"Fed Dot Plot vs Market-Implied Path — As Of {as_of_label}", height=440))
+    fig.update_xaxes(title=f"Year-end (SEP of {in_force.strftime('%b %d, %Y')})", type="category", categoryorder="array",
+                     categoryarray=xs + (["Longer run"] if lr is not None else []))
+    fig.update_yaxes(title="Fed funds rate", ticksuffix="%")
+    return fig
+
 @st.cache_data(ttl=21600)
 def get_fedwatch_probabilities(years_ahead=2):
     effr = get_effr_history()
@@ -2425,9 +2508,16 @@ with tabs[4]:
             detail = detail.drop(columns="This-Meeting Move (bps)")
             detail = detail.rename(columns={"Imp. Rate Delta": "Imp. Rate Δ (cum.)", "Hikes/Cuts": "#Hikes/Cuts (cum.)"})
 
-            col_full, col_detail = st.columns(2)
-            with col_full:
-                st.plotly_chart(fig_fedwatch_full, use_container_width=True, key="chart_fedwatch_full")
+            sep_bundle = get_sep_data()
+            fig_dots = (build_dot_plot_fig(sep_bundle, as_of, as_of_row, as_of_effr, as_of_label, meetings)
+                        if sep_bundle else None)
+
+            col_dots, col_detail = st.columns(2)
+            with col_dots:
+                if fig_dots is not None:
+                    st.plotly_chart(fig_dots, use_container_width=True, key="chart_fed_dot_plot")
+                else:
+                    st.info("Fed dot plot (SEP) data unavailable for the selected date.")
             with col_detail:
                 st.markdown("**Probabilities / Hikes-Cuts Detail**")
                 st.dataframe(detail, use_container_width=True, hide_index=True, height=440)
@@ -2436,6 +2526,9 @@ with tabs[4]:
                        "(chained off the previous meeting's implied rate) - the same simplified 2-outcome-per-meeting view "
                        "as the chart above, not CME's full joint multi-meeting solve.")
             csv_download(detail, "fedwatch_probabilities")
+
+            # Full history gets its own full-width row below the dot plot / probability table.
+            st.plotly_chart(fig_fedwatch_full, use_container_width=True, key="chart_fedwatch_full")
     else:
         st.info("No FOMC meetings in the selected window, or Fed Funds futures data unavailable.")
 
