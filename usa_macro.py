@@ -1294,6 +1294,51 @@ def get_summary_metrics(end):
 
     return results
 
+# ── ISM Manufacturing/Services PMI (scraped from ISM's own PR Newswire distribution) ────────
+# ISM stopped feeding FRED years ago (confirmed live: the old NAPM/NAPMPI series no longer
+# exist on FRED at all, and the ALFRED datalist that used to host "USA ISM Manufacturing - PMI
+# Composite Index" now says "No series in this list"). Full ISM history is subscription-only
+# via ismworld.org (their own report pages 404/redirect to an SSO login) and DBnomics' claimed
+# ISM mirror (db.nomics.world/ISM/pmi) is broken - confirmed live, its values collapse from a
+# real ~48.7 (Aug 2025) to an impossible 11.1 (Sep 2025) onward, clearly a broken scraper, not
+# real PMI data (PMI has never printed anywhere near that low). What IS legitimately free: ISM
+# distributes its own monthly headline press release via PR Newswire (a public newswire meant
+# for redistribution, not a paywalled commercial data vendor like Trading Economics, which also
+# carries the real number but under a data-resale license this app has no right to scrape) -
+# confirmed live at prnewswire.com/news/institute-for-supply-management/, which lists each
+# month's "Manufacturing PMI® at XX.X%; <Month> <Year> ISM® Manufacturing/Services PMI® Report"
+# headline directly in the listing itself. History is limited to however far back that listing
+# page's titles still match this exact phrasing (~13 months confirmed live 2026-09-28) - ISM
+# doesn't publish a free full back-history the way it used to on FRED.
+ISM_PR_NEWSWIRE_URL = "https://www.prnewswire.com/news/institute-for-supply-management/"
+ISM_PR_PAGES_TO_SCAN = 10  # ~10 pages x 25 items/page comfortably covers the ~13 months found
+
+@st.cache_data(ttl=21600)
+def fetch_ism_pmi() -> pd.DataFrame:
+    mfg_months, svc_months = {}, {}
+    try:
+        for page in range(1, ISM_PR_PAGES_TO_SCAN + 1):
+            r = requests.get(ISM_PR_NEWSWIRE_URL, params={"page": page, "pagesize": 25},
+                              headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                                     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"},
+                              timeout=20)
+            r.raise_for_status()
+            for val, mon, yr in re.findall(r"Manufacturing PMI[\xae]*\s*at\s*([\d.]+)%;\s*(\w+)\s*(\d{4})\s*ISM", r.text):
+                mfg_months.setdefault((mon, yr), float(val))
+            for val, mon, yr in re.findall(r"Services PMI[\xae]*\s*at\s*([\d.]+)%;\s*(\w+)\s*(\d{4})\s*ISM", r.text):
+                svc_months.setdefault((mon, yr), float(val))
+        if not mfg_months and not svc_months:
+            st.warning("Could not parse ISM Manufacturing/Services PMI from PR Newswire (page layout may have changed).")
+            return pd.DataFrame()
+        mfg_s = pd.Series({pd.Timestamp(f"{m} 1, {y}"): v for (m, y), v in mfg_months.items()}).sort_index()
+        svc_s = pd.Series({pd.Timestamp(f"{m} 1, {y}"): v for (m, y), v in svc_months.items()}).sort_index()
+        df = pd.concat([mfg_s.rename("ISM Manufacturing PMI"), svc_s.rename("ISM Services PMI")], axis=1)
+        df.index.name = "date"
+        return df
+    except Exception as e:
+        st.warning(f"Could not load ISM Manufacturing/Services PMI: {e}")
+        return pd.DataFrame()
+
 with st.spinner("Loading summary metrics…"):
     summary = get_summary_metrics(END)
 
@@ -1339,6 +1384,7 @@ tabs = st.tabs([
     "Prices",
     "Oil & Gas",
     "Labour Market",
+    "Economic Activity",
     "Housing",
     "Treasury & Rates",
     "US Markets",
@@ -1466,21 +1512,6 @@ with tabs[0]:
                 df_pw = fetch(wid, f"{label} $ (Monthly)", START, END)
                 if not df_pw.empty:
                     pce_parent_weights[label] = df_pw[f"{label} $ (Monthly)"].dropna().iloc[-1] / pce_total_monthly * 100
-
-        # GDP vs 30Y Treasury yield - Real & Nominal GDP YoY (quarterly pct_change(4), since
-        # mom_yoy() above assumes monthly cadence) plotted as grouped bars against the 30Y
-        # yield as a line, all on one shared % axis (levels would need a $ vs % dual axis,
-        # which fights against reading the yield line cleanly against the bars).
-        real_gdp = fetch("GDPC1", "Real GDP", START, END)
-        nom_gdp  = fetch("GDP", "Nominal GDP", START, END)
-        gdp_dgs30 = fetch("DGS30", "30Y Treasury", START, END)
-        real_gdp_yoy = (real_gdp["Real GDP"].pct_change(4) * 100).round(3).dropna() if not real_gdp.empty else pd.Series(dtype=float)
-        nom_gdp_yoy  = (nom_gdp["Nominal GDP"].pct_change(4) * 100).round(3).dropna() if not nom_gdp.empty else pd.Series(dtype=float)
-        gdp_y30_aligned = pd.Series(dtype=float)
-        if not gdp_dgs30.empty and not real_gdp_yoy.empty:
-            dgs30_sorted = gdp_dgs30.rename(columns={"30Y Treasury": "y30"}).dropna().reset_index().sort_values("date")
-            gdp_dates = pd.DataFrame({"date": real_gdp_yoy.index}).sort_values("date")
-            gdp_y30_aligned = pd.merge_asof(gdp_dates, dgs30_sorted, on="date", direction="forward").set_index("date")["y30"]
 
     # CPI vs Core CPI
     fig_cpi = go.Figure()
@@ -1661,20 +1692,6 @@ with tabs[0]:
     fig_pce_comp_snap.update_xaxes(ticksuffix="%")
     fig_pce_comp_snap.update_yaxes(tickfont=dict(size=10))
 
-    # Real & Nominal GDP (YoY %) vs 30Y Treasury yield - GDP as grouped bars, yield as an
-    # overlaid line, all on one shared % axis so the growth-vs-borrowing-cost read (is nominal
-    # GDP outgrowing the 30Y yield) doesn't require a dual-axis.
-    fig_gdp_30y = go.Figure()
-    fig_gdp_30y.add_trace(go.Bar(x=real_gdp_yoy.index, y=real_gdp_yoy.values, name="Real GDP YoY %", marker_color="#4c8bf5"))
-    fig_gdp_30y.add_trace(go.Bar(x=nom_gdp_yoy.index, y=nom_gdp_yoy.values, name="Nominal GDP YoY %", marker_color="#f5a24c"))
-    if not gdp_y30_aligned.empty:
-        fig_gdp_30y.add_trace(go.Scatter(x=gdp_y30_aligned.index, y=gdp_y30_aligned.values, name="30Y Treasury Yield",
-                                          mode="lines+markers", line=dict(color="#c85fd6", width=2)))
-    fig_gdp_30y.update_layout(**base_layout("Real & Nominal GDP (YoY %) vs. 30Y Treasury Yield"))
-    fig_gdp_30y.update_layout(barmode="group")
-    fig_gdp_30y.update_yaxes(ticksuffix="%")
-    add_recessions(fig_gdp_30y, recessions)
-
     inflation_charts = [
         ("CPI vs Core CPI", fig_cpi, pd.concat([cpi, core_cpi], axis=1)),
         ("PCE vs Core PCE", fig_pce, pd.concat([pce, core_pce], axis=1)),
@@ -1687,9 +1704,6 @@ with tabs[0]:
         ("CPI Components Snapshot", fig_cpi_comp_snap, comp_df),
         ("PCE Components History", fig_pce_comp_hist, pd.concat([pce_components[l] for l, _ in PCE_COMPONENTS], axis=1)),
         ("PCE Components Snapshot", fig_pce_comp_snap, pce_comp_df),
-        ("GDP vs 30Y Treasury Yield", fig_gdp_30y, pd.DataFrame({
-            "Real GDP YoY %": real_gdp_yoy, "Nominal GDP YoY %": nom_gdp_yoy, "30Y Treasury Yield": gdp_y30_aligned,
-        })),
     ]
     render_two_col(inflation_charts)
 
@@ -1965,7 +1979,7 @@ with tabs[2]:
     add_recessions(fig_jolts, recessions, rows=[1,1,2,2], cols=[1,2,1,2])
 
     # Beveridge curve
-    if not jolts_openings.empty and not unemp_data.empty:
+    if not jolts_openings.empty and "U3" in unemp_data.columns:
         merged_bev = pd.concat([
             jolts_openings["Job Openings (k)"] / 1000,
             unemp_data["U3"]
@@ -2014,9 +2028,107 @@ with tabs[2]:
     render_two_col(labor_charts)
 
 # ════════════════════════════════════════════════════════════════════════════════
-# TAB 4 — Housing
+# TAB 4 — Economic Activity
 # ════════════════════════════════════════════════════════════════════════════════
 with tabs[3]:
+    st.header("Economic Activity")
+    st.caption("GDP and the Atlanta Fed's real-time GDPNow estimate, each paired against the 30Y "
+               "Treasury yield as a full daily line (not snapped to the lower-frequency series' own "
+               "print dates, the way an earlier version of the GDP chart did) - plus the real ISM "
+               "Manufacturing/Services PMI (0-100 scale, scraped from ISM's own PR Newswire release "
+               "- see caption below) and the Chicago Fed's regional survey (a different, zero-centered "
+               "scale, not literally PMI).")
+    with st.spinner("Loading economic activity data…"):
+        real_gdp   = fetch("GDPC1", "Real GDP", START, END)
+        nom_gdp    = fetch("GDP", "Nominal GDP", START, END)
+        gdp_now    = fetch("GDPNOW", "GDPNow", START, END)
+        dgs30      = fetch("DGS30", "30Y Treasury", START, END)
+        ism_pmi    = fetch_ism_pmi()
+        chi_mfg    = fetch("CFSBCACTIVITYMFG", "Chicago Fed Mfg Activity", START, END)
+        chi_nonmfg = fetch("CFSBCACTIVITYNMFG", "Chicago Fed Services Activity", START, END)
+
+        real_gdp_yoy = (real_gdp["Real GDP"].pct_change(4) * 100).round(3).dropna() if not real_gdp.empty else pd.Series(dtype=float)
+        nom_gdp_yoy  = (nom_gdp["Nominal GDP"].pct_change(4) * 100).round(3).dropna() if not nom_gdp.empty else pd.Series(dtype=float)
+        dgs30_clip   = dgs30["30Y Treasury"].dropna() if not dgs30.empty else pd.Series(dtype=float)
+
+    # Real & Nominal GDP (YoY %) vs 30Y Treasury yield - GDP as grouped quarterly bars, yield as
+    # its own full daily line (previously snapped to GDP's own quarterly dates via merge_asof;
+    # now plotted at its native daily frequency) - both series share one % axis.
+    fig_gdp_30y = go.Figure()
+    fig_gdp_30y.add_trace(go.Bar(x=real_gdp_yoy.index, y=real_gdp_yoy.values, name="Real GDP YoY %", marker_color="#4c8bf5"))
+    fig_gdp_30y.add_trace(go.Bar(x=nom_gdp_yoy.index, y=nom_gdp_yoy.values, name="Nominal GDP YoY %", marker_color="#f5a24c"))
+    if not dgs30_clip.empty:
+        fig_gdp_30y.add_trace(go.Scatter(x=dgs30_clip.index, y=dgs30_clip.values, name="30Y Treasury Yield (Daily)",
+                                          mode="lines", line=dict(color="#c85fd6", width=1.5)))
+    fig_gdp_30y.update_layout(**base_layout("Real & Nominal GDP (YoY %) vs. 30Y Treasury Yield (Daily)"))
+    fig_gdp_30y.update_layout(barmode="group")
+    fig_gdp_30y.update_yaxes(ticksuffix="%")
+    add_recessions(fig_gdp_30y, recessions)
+
+    # Atlanta Fed GDPNow (current-quarter real-time nowcast) vs 30Y Treasury yield, daily. FRED's
+    # GDPNOW series only carries one snapshot per quarter (the live/most-recent nowcast for that
+    # quarter), not GDPNow's own full within-quarter daily revision path - so this bars-by-quarter
+    # treatment matches what's actually available, same caveat as GDP itself being quarterly.
+    fig_gdpnow_30y = go.Figure()
+    if not gdp_now.empty:
+        gdpnow_s = gdp_now["GDPNow"].dropna()
+        gdpnow_colors = ["#26a69a" if v >= 0 else "#ef5350" for v in gdpnow_s.values]
+        fig_gdpnow_30y.add_trace(go.Bar(x=gdpnow_s.index, y=gdpnow_s.values, name="GDPNow (SAAR %)", marker_color=gdpnow_colors))
+    if not dgs30_clip.empty:
+        fig_gdpnow_30y.add_trace(go.Scatter(x=dgs30_clip.index, y=dgs30_clip.values, name="30Y Treasury Yield (Daily)",
+                                             mode="lines", line=dict(color="#c85fd6", width=1.5)))
+    fig_gdpnow_30y.add_hline(y=0, line_dash="dot", line_color="#555")
+    fig_gdpnow_30y.update_layout(**base_layout("Atlanta Fed GDPNow (Current-Quarter Nowcast) vs. 30Y Treasury Yield (Daily)"))
+    fig_gdpnow_30y.update_yaxes(ticksuffix="%")
+    add_recessions(fig_gdpnow_30y, recessions)
+
+    # ISM Manufacturing & Services PMI - the real thing, 0-100 scale, 50 = breakeven. FRED no
+    # longer carries this (see fetch_ism_pmi's own comment for what was checked live), so this
+    # is scraped from ISM's own PR Newswire release listing - real ISM data, just limited to
+    # however many recent months that listing page still covers (~13 as of 2026-09-28).
+    fig_ism = go.Figure()
+    if not ism_pmi.empty:
+        if "ISM Manufacturing PMI" in ism_pmi.columns:
+            mfg_s = ism_pmi["ISM Manufacturing PMI"].dropna()
+            fig_ism.add_trace(go.Scatter(x=mfg_s.index, y=mfg_s.values, name="ISM Manufacturing PMI",
+                                          mode="lines+markers", line=dict(color="#42a5f5")))
+        if "ISM Services PMI" in ism_pmi.columns:
+            svc_s = ism_pmi["ISM Services PMI"].dropna()
+            fig_ism.add_trace(go.Scatter(x=svc_s.index, y=svc_s.values, name="ISM Services PMI",
+                                          mode="lines+markers", line=dict(color="#ff9800")))
+    fig_ism.add_hline(y=50, line_dash="dot", line_color="#555", annotation_text="50 = breakeven")
+    fig_ism.update_layout(**base_layout("ISM Manufacturing & Services PMI"))
+    fig_ism.update_yaxes(range=[35, 65])
+
+    # Chicago Fed Survey of Economic Conditions - manufacturing vs. nonmanufacturing (services)
+    # activity index for Federal Reserve District 7 (Chicago). Diffusion-index-style, zero-centered,
+    # same convention as CFNAI on the Indicators tab.
+    fig_chicago = go.Figure()
+    for df_c, chi_label, chi_color in [(chi_mfg, "Manufacturing", "#42a5f5"),
+                                        (chi_nonmfg, "Services (Nonmanufacturing)", "#ff9800")]:
+        if not df_c.empty:
+            fig_chicago.add_trace(go.Scatter(x=df_c.index, y=df_c.iloc[:, 0], name=chi_label, line=dict(color=chi_color)))
+    fig_chicago.add_hline(y=0, line_dash="dot", line_color="#555")
+    fig_chicago.update_layout(**base_layout("Chicago Fed Survey — Manufacturing vs. Services Activity Index"))
+    add_recessions(fig_chicago, recessions)
+
+    render_two_col([
+        ("GDP vs 30Y Treasury Yield", fig_gdp_30y, pd.DataFrame({
+            "Real GDP YoY %": real_gdp_yoy, "Nominal GDP YoY %": nom_gdp_yoy, "30Y Treasury Yield": dgs30_clip,
+        })),
+        ("GDPNow vs 30Y Treasury Yield", fig_gdpnow_30y, pd.concat([gdp_now, dgs30], axis=1)),
+        ("ISM Manufacturing & Services PMI", fig_ism, ism_pmi),
+        ("Chicago Fed Mfg vs Services", fig_chicago, pd.concat([chi_mfg, chi_nonmfg], axis=1)),
+    ])
+    st.caption("ISM PMI history above is limited to what's still parseable from ISM's own PR "
+               "Newswire release listing (prnewswire.com/news/institute-for-supply-management) - "
+               "real ISM data, not a substitute, but not a full multi-year back-history the way "
+               "FRED used to provide before ISM stopped feeding it for free.")
+
+# ════════════════════════════════════════════════════════════════════════════════
+# TAB 5 — Housing
+# ════════════════════════════════════════════════════════════════════════════════
+with tabs[4]:
     st.header("Housing")
     with st.spinner("Loading housing data…"):
         home_sales  = fetch("EXHOSLUSM495S", "Existing Home Sales", START, END)
@@ -2177,9 +2289,9 @@ with tabs[3]:
                "Existing Home Sales series above, which also only carries recent history.")
 
 # ════════════════════════════════════════════════════════════════════════════════
-# TAB 5 — Monetary & Rates
+# TAB 6 — Monetary & Rates
 # ════════════════════════════════════════════════════════════════════════════════
-with tabs[4]:
+with tabs[5]:
     st.header("Monetary Policy & Rates")
     with st.spinner("Loading monetary data…"):
         maturities = {
@@ -2694,9 +2806,9 @@ with tabs[4]:
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-# TAB 6 — US Markets
+# TAB 7 — US Markets
 # ════════════════════════════════════════════════════════════════════════════════
-with tabs[5]:
+with tabs[6]:
     st.header("US Markets")
     st.caption("Equities and cross-asset - a different data domain from the rest of this dashboard "
                "(yfinance, not FRED, for most of this tab). Charts respect the global date range above; "
@@ -2943,9 +3055,9 @@ with tabs[5]:
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-# TAB 7 — Fiscal Policy & Government Spending
+# TAB 8 — Fiscal Policy & Government Spending
 # ════════════════════════════════════════════════════════════════════════════════
-with tabs[6]:
+with tabs[7]:
     st.header("Fiscal Policy & Government Spending")
     st.caption("US Treasury Fiscal Data API — Daily Treasury Statement, Debt Subject to Limit, "
                "Monthly Treasury Statement.")
@@ -3057,30 +3169,17 @@ with tabs[6]:
                "reset, not a real spending spike.")
 
 # ════════════════════════════════════════════════════════════════════════════════
-# TAB 8 — Leading Indicators
+# TAB 9 — Leading Indicators
 # ════════════════════════════════════════════════════════════════════════════════
-with tabs[7]:
+with tabs[8]:
     st.header("Leading Indicators")
     with st.spinner("Loading leading indicator data…"):
-        ism_mfg  = fetch("MANEMP",    "ISM Mfg Employment", START, END)
-        lei          = fetch("USSLIND",   "Conference Board LEI", START, END)
         cfnai        = fetch("CFNAI",     "CFNAI", START, END)
         wei          = fetch("WEI",       "Weekly Economic Index", START, END)
         rec_prob     = fetch("RECPROUSM156N","Recession Probability (12M)", START, END)
         philly_fed   = fetch("GACDFSA066MSFRBPHI", "Philly Fed Business Outlook", START, END)
         empire_state = fetch("GAFDISA066MSFRBNY","Empire State Mfg", START, END)
 
-
-    # LEI
-    fig_lei = go.Figure()
-    if not lei.empty:
-        lei_yoy = (lei["Conference Board LEI"].pct_change(12) * 100).round(3)
-        fig_lei.add_trace(go.Scatter(x=lei.index, y=lei["Conference Board LEI"],
-                                     name="LEI Level", line=dict(color="#26a69a"), yaxis="y"))
-        fig_lei.add_trace(go.Scatter(x=lei.index, y=lei_yoy,
-                                     name="YoY %", line=dict(color="#ff9800", dash="dot"), yaxis="y2"))
-    fig_lei.update_layout(**dual_axis_layout("Conference Board Leading Economic Index", "Level", "YoY %"))
-    add_recessions(fig_lei, recessions)
 
     # CFNAI
     fig_cfnai = go.Figure()
@@ -3132,7 +3231,6 @@ with tabs[7]:
     add_recessions(fig_regional, recessions)
 
     leading_charts = [
-        ("Conference Board LEI", fig_lei, lei),
         ("CFNAI", fig_cfnai, cfnai),
         ("Weekly Economic Index", fig_wei, wei),
         ("Recession Probability", fig_rec, rec_prob),
@@ -3141,9 +3239,9 @@ with tabs[7]:
     render_two_col(leading_charts)
 
 # ════════════════════════════════════════════════════════════════════════════════
-# TAB 9 — Economic Calendar
+# TAB 10 — Economic Calendar
 # ════════════════════════════════════════════════════════════════════════════════
-with tabs[8]:
+with tabs[9]:
     st.header("Economic Calendar")
     st.caption("Live Investing.com economic calendar widget — US (USD) events, Medium + High importance only, "
                "times shown in GMT+8 (Singapore). Scrollable and date-navigable inside the widget itself; use "
