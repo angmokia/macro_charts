@@ -737,6 +737,44 @@ def _interp_yield_curve(row_vals, target_years):
     xs, ys = zip(*pairs)
     return list(np.interp(target_years, xs, ys))
 
+@st.cache_data(ttl=3600)
+def compute_rolldown_series(yc: pd.DataFrame, tenors: tuple) -> pd.DataFrame:
+    """1Y outright rolldown - Rolldown(T) = InterpolatedYield(T) - InterpolatedYield(T-1) on
+    that SAME date's own curve - computed for every date in yc so rolldown can be charted as
+    its own time series (how the curve's rolldown profile itself has shifted), not just a
+    single latest snapshot. One combined interpolation call per row (tenors + tenors-1
+    together) instead of two, since sorting/interpolating is the expensive part."""
+    combined = list(tenors) + [t - 1 for t in tenors]
+    n = len(tenors)
+    rows = []
+    for _, row in yc.iterrows():
+        vals = _interp_yield_curve(row, combined)
+        if vals[0] is None:
+            rows.append({f"{t}Y": np.nan for t in tenors})
+            continue
+        now_vals, less_vals = vals[:n], vals[n:]
+        rows.append({f"{t}Y": (nv - lv) * 100 for t, nv, lv in zip(tenors, now_vals, less_vals)})
+    return pd.DataFrame(rows, index=yc.index)
+
+@st.cache_data(ttl=3600)
+def compute_spread_rolldown_series(yc: pd.DataFrame, legs: tuple) -> pd.DataFrame:
+    """1Y spread rolldown - for spread(A,B): [Yield(B-1)-Yield(A-1)] - [Yield(B)-Yield(A)] on
+    that same date's curve, i.e. the spread's own projected 1Y-forward value (same static
+    curve) minus today's actual spread. Positive = rolldown alone is expected to widen the
+    spread over the year. Computed across every date in yc, one combined interpolation call
+    per row for all legs together."""
+    all_tenors = sorted(set(t for _, a, b in legs for t in (a, b, a - 1, b - 1)))
+    rows = []
+    for _, row in yc.iterrows():
+        vals = _interp_yield_curve(row, all_tenors)
+        if vals[0] is None:
+            rows.append({name: np.nan for name, _, _ in legs})
+            continue
+        lookup = dict(zip(all_tenors, vals))
+        rows.append({name: ((lookup[b - 1] - lookup[a - 1]) - (lookup[b] - lookup[a])) * 100
+                     for name, a, b in legs})
+    return pd.DataFrame(rows, index=yc.index)
+
 # ── Fiscal accounts (TGA, debt limit, interest expense, MTS, spending by category) ─────
 
 FISCAL_BASE = "https://api.fiscaldata.treasury.gov/services/api/fiscal_service"
@@ -1550,6 +1588,36 @@ with tabs[0]:
     fig_spreads.update_yaxes(ticksuffix=" bps")
     add_recessions(fig_spreads, recessions)
 
+    # 1Y Rolldown, as a time series - Rolldown(T) = InterpolatedYield(T) - InterpolatedYield(T-1)
+    # on EACH date's own curve (see compute_rolldown_series docstring), so this shows how the
+    # curve's rolldown profile has itself evolved, not just where it stands today. Skips the 1Y
+    # tenor since its T-1 (0Y) sits right at the edge of the curve's interpolation range.
+    ROLLDOWN_TENORS = (2, 3, 5, 7, 10, 20, 30)
+    SPREAD_ROLLDOWN_LEGS = (("2s5s", 2, 5), ("2s10s", 2, 10), ("5s30s", 5, 30), ("10s30s", 10, 30))
+    fig_rolldown_yields = go.Figure()
+    fig_rolldown_spreads = go.Figure()
+    rolldown_df = pd.DataFrame()
+    rolldown_spread_df = pd.DataFrame()
+    if not yc.empty:
+        rolldown_df = compute_rolldown_series(yc, ROLLDOWN_TENORS)
+        for col in rolldown_df.columns:
+            fig_rolldown_yields.add_trace(go.Scatter(x=rolldown_df.index, y=rolldown_df[col], name=col, mode="lines"))
+        fig_rolldown_yields.add_hline(y=0, line_dash="dot", line_color="#555")
+        fig_rolldown_yields.update_layout(**base_layout("Outright Yields — 1Y Rolldown (bps)"))
+        fig_rolldown_yields.update_yaxes(ticksuffix=" bps")
+        add_recessions(fig_rolldown_yields, recessions)
+
+        # Spread rolldown = the spread's own projected 1Y-forward value (on that date's static
+        # curve) minus that date's actual spread - i.e. how much rolldown alone is widening or
+        # narrowing the spread over time, independent of any actual level/shape change.
+        rolldown_spread_df = compute_spread_rolldown_series(yc, SPREAD_ROLLDOWN_LEGS)
+        for col in rolldown_spread_df.columns:
+            fig_rolldown_spreads.add_trace(go.Scatter(x=rolldown_spread_df.index, y=rolldown_spread_df[col], name=col, mode="lines"))
+        fig_rolldown_spreads.add_hline(y=0, line_dash="dot", line_color="#555")
+        fig_rolldown_spreads.update_layout(**base_layout("Yield Spreads — 1Y Rolldown (bps)"))
+        fig_rolldown_spreads.update_yaxes(ticksuffix=" bps")
+        add_recessions(fig_rolldown_spreads, recessions)
+
     # Real yields vs Breakevens
     fig_real = go.Figure()
     for df_r, col, color in [
@@ -1589,6 +1657,8 @@ with tabs[0]:
         ("Yield Curve",       fig_yc,  yc),
         ("Yield Curve Changes", fig_yc_chg, None),
         ("Treasury Spreads",  fig_spreads, spreads),
+        ("Outright Yields 1Y Rolldown", fig_rolldown_yields, rolldown_df),
+        ("Yield Spreads 1Y Rolldown", fig_rolldown_spreads, rolldown_spread_df),
         ("Real Yields vs Breakevens", fig_real, pd.concat([tips_5y, tips_10y, be_5y2, be_10y2], axis=1)),
         ("Credit Spreads",    fig_credit, pd.concat([ig_oas, hy_oas, credit_diff_df], axis=1)),
     ]
