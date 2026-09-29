@@ -758,21 +758,28 @@ def compute_rolldown_series(yc: pd.DataFrame, tenors: tuple) -> pd.DataFrame:
 
 @st.cache_data(ttl=3600)
 def compute_spread_rolldown_series(yc: pd.DataFrame, legs: tuple) -> pd.DataFrame:
-    """1Y spread rolldown - for spread(A,B): [Yield(B-1)-Yield(A-1)] - [Yield(B)-Yield(A)] on
-    that same date's curve, i.e. the spread's own projected 1Y-forward value (same static
-    curve) minus today's actual spread. Positive = rolldown alone is expected to widen the
-    spread over the year. Computed across every date in yc, one combined interpolation call
-    per row for all legs together."""
-    all_tenors = sorted(set(t for _, a, b in legs for t in (a, b, a - 1, b - 1)))
+    """1Y rolldown for an arbitrary weighted combination of curve points - a plain 2-point
+    spread like 2s10s is {2: -1, 10: 1}; a butterfly like 2s5s10s Fly is {2: -1, 5: 2, 10: -1},
+    the exact same weights as the Treasury Spreads chart's own Fly definition (2x the belly
+    minus both wings). For weights w on tenors t: [sum(w * Yield(t-1))] - [sum(w * Yield(t))]
+    on that date's curve - i.e. the combination's own projected 1Y-forward value (same static
+    curve) minus its actual value today. Positive = rolldown alone is expected to widen/steepen
+    the combination over the year. Computed across every date in yc, one combined interpolation
+    call per row covering every tenor (and tenor-1) any leg needs."""
+    all_tenors = sorted(set(t for _, weights in legs for tenor in weights for t in (tenor, tenor - 1)))
     rows = []
     for _, row in yc.iterrows():
         vals = _interp_yield_curve(row, all_tenors)
         if vals[0] is None:
-            rows.append({name: np.nan for name, _, _ in legs})
+            rows.append({name: np.nan for name, _ in legs})
             continue
         lookup = dict(zip(all_tenors, vals))
-        rows.append({name: ((lookup[b - 1] - lookup[a - 1]) - (lookup[b] - lookup[a])) * 100
-                     for name, a, b in legs})
+        row_out = {}
+        for name, weights in legs:
+            now_val = sum(w * lookup[t] for t, w in weights.items())
+            fwd_val = sum(w * lookup[t - 1] for t, w in weights.items())
+            row_out[name] = (fwd_val - now_val) * 100
+        rows.append(row_out)
     return pd.DataFrame(rows, index=yc.index)
 
 # ── Fiscal accounts (TGA, debt limit, interest expense, MTS, spending by category) ─────
@@ -1608,7 +1615,11 @@ with tabs[0]:
     # curve's rolldown profile has itself evolved, not just where it stands today. Skips the 1Y
     # tenor since its T-1 (0Y) sits right at the edge of the curve's interpolation range.
     ROLLDOWN_TENORS = (2, 3, 5, 7, 10, 20, 30)
-    SPREAD_ROLLDOWN_LEGS = (("2s5s", 2, 5), ("2s10s", 2, 10), ("5s30s", 5, 30), ("10s30s", 10, 30))
+    SPREAD_ROLLDOWN_LEGS = (
+        ("2s5s", {2: -1, 5: 1}), ("2s10s", {2: -1, 10: 1}),
+        ("5s30s", {5: -1, 30: 1}), ("10s30s", {10: -1, 30: 1}),
+        ("2s5s10s Fly", {2: -1, 5: 2, 10: -1}),  # same weights as the Treasury Spreads Fly
+    )
     fig_rolldown_yields = go.Figure()
     fig_rolldown_spreads = go.Figure()
     rolldown_df = pd.DataFrame()
