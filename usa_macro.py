@@ -16,11 +16,121 @@ import calendar
 import math
 import yfinance as yf
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+import logging
+import collections
 
 # ── Setup ─────────────────────────────────────────────────────────────────────
 load_dotenv()
-fred = Fred(api_key=os.getenv("FRED_API_KEY"))
+
+# FRED hard-limits each API key to 120 requests/minute - confirmed live: a 152-request burst got
+# exactly 120 through and 31 "Too Many Requests" back (plus one malformed 429 page that fredapi
+# surfaces as "mismatched tag: line 9, column 2" - the same ValueError-shaped "transient hiccup"
+# the retry comments below describe). A full cold load needs ~150 FRED requests, and the old
+# 1s/2s/4s retry backoff is far shorter than the 60s window, so exceeding it cascaded into a wall
+# of "Could not load X" warnings (confirmed: moving the date slider did exactly that). This
+# process-wide sliding-window limiter keeps every FRED request - fetch(), summary, SEP/ALFRED -
+# under the cap, so requests queue briefly instead of failing. Lives in cache_resource so it
+# survives reruns and is shared by every session and worker thread in this process.
+FRED_MAX_PER_MIN = 110  # a little headroom under 120 for other dashboards sharing the key
+
+class _SlidingWindowLimiter:
+    def __init__(self, max_calls, period):
+        self.max_calls, self.period = max_calls, period
+        self.calls = collections.deque()
+        self.lock = threading.Lock()
+        self.blocked_until = 0.0
+
+    def penalize(self, seconds):
+        """FRED answered 429 anyway (another dashboard/session on the same key): pause ALL
+        FRED requests together for a moment, so every thread waits out the same window in
+        parallel instead of each series sleeping through its own stacked backoff."""
+        with self.lock:
+            self.blocked_until = max(self.blocked_until, time.monotonic() + seconds)
+
+    def acquire(self):
+        while True:
+            with self.lock:
+                now = time.monotonic()
+                if now < self.blocked_until:
+                    wait = self.blocked_until - now
+                else:
+                    while self.calls and now - self.calls[0] >= self.period:
+                        self.calls.popleft()
+                    if len(self.calls) < self.max_calls:
+                        self.calls.append(now)
+                        return
+                    wait = self.period - (now - self.calls[0])
+            time.sleep(max(wait, 0.05))
+
+@st.cache_resource
+def _fred_limiter():
+    return _SlidingWindowLimiter(FRED_MAX_PER_MIN, 60.0)
+
+class _RateLimitedFred(Fred):
+    # every fredapi call (get_series, get_series_all_releases, vintage dates...) goes through
+    # this one private method, so limiting here covers all of them
+    def _Fred__fetch_data(self, url):
+        _fred_limiter().acquire()
+        return super()._Fred__fetch_data(url)
+
+fred = _RateLimitedFred(api_key=os.getenv("FRED_API_KEY"))
 EIA_API_KEY = os.getenv("EIA_API_KEY")
+
+# ── Background prefetch ───────────────────────────────────────────────────────
+# st.tabs renders every tab on every run (Streamlit has no lazy tabs), so a cold load used to
+# walk all ~10 tabs' network calls one tab after another. Instead, the moment START/END are
+# known, every independent loader is kicked off in background threads - the tabs then find
+# their data already cached (or wait on the in-flight fetch; st.cache_data dedupes concurrent
+# calls for the same key, confirmed live). ONLY side-effect-free loaders go through here: the
+# threads have no ScriptRunContext, so an st.warning inside a prefetched function would be
+# silently dropped instead of shown in its tab.
+class _NoCtxWarningFilter(logging.Filter):
+    # background cache fills log a harmless "missing ScriptRunContext" line per call
+    def filter(self, record):
+        return not (threading.current_thread().name.startswith("usa_bg")
+                    and "missing ScriptRunContext" in record.getMessage())
+
+@st.cache_resource
+def _bg_pools():
+    for name in ("streamlit.runtime.scriptrunner_utils.script_run_context",
+                 "streamlit.runtime.scriptrunner.script_run_context"):
+        logging.getLogger(name).addFilter(_NoCtxWarningFilter())
+    # FRED gets its own pool so rate-limit queuing there can't starve the other sources
+    return {"fred": ThreadPoolExecutor(max_workers=10, thread_name_prefix="usa_bg_fred"),
+            "misc": ThreadPoolExecutor(max_workers=10, thread_name_prefix="usa_bg_misc")}
+
+@st.cache_resource
+def _bg_submitted():
+    return {}
+
+def _bg_call(fn, *args):
+    try:
+        fn(*args)
+    except Exception:
+        pass  # the tab's own call retries and surfaces the warning in the right place
+
+def prefetch(fn, *args, pool="misc", every=1800):
+    """Warm fn(*args)'s cache in the background, at most once per `every` seconds per key (so
+    reruns don't keep re-submitting hundreds of cache hits that would compete for the GIL)."""
+    key = (fn.__name__, args)
+    seen = _bg_submitted()
+    now = time.time()
+    if now - seen.get(key, 0) < every:
+        return
+    seen[key] = now
+    _bg_pools()[pool].submit(_bg_call, fn, *args)
+
+# yf.download is NOT thread-safe: every call resets the module-global yfinance.shared._DFS
+# dict it collects results into, so two overlapping downloads (a background prefetch and a tab,
+# or two browser sessions) can hand one call the other's tickers. Serialize them process-wide.
+@st.cache_resource
+def _yf_lock():
+    return threading.Lock()
+
+def _yf_download(*args, **kwargs):
+    with _yf_lock():
+        return yf.download(*args, **kwargs)
 
 st.set_page_config(page_title="US Macro Dashboard", layout="wide", page_icon="🇺🇸")
 
@@ -60,23 +170,80 @@ RECESSION_COLOR = "rgba(180,60,60,0.12)"
 def _fred_fetch_core(series_id: str, start: str, end: str = None):
     """Thread-safe core of fetch() - no Streamlit calls (st.warning isn't safe to call from a
     worker thread - it silently no-ops without a ScriptRunContext), so this is what fetch_many()
-    below calls from inside a ThreadPoolExecutor. Retry on ANY failure, not just rate-limit-shaped
+    below calls from inside a ThreadPoolExecutor. The download + retry lives in _fred_full(),
+    which retries on ANY failure, not just rate-limit-shaped
     ones - fredapi occasionally raises a bare ValueError(None) (str(e) == "None") on a transient
     FRED-side hiccup (a malformed response during a brief server restart, a dropped connection),
     which is not a rate-limit message and would previously skip the retry entirely and fail on
     the very first attempt. Confirmed live: DGS1 (1-Year Treasury) failed this way once while
     being a completely healthy, currently-published series - a one-off transient issue, not a
     broken series. Returns (series_or_None, error_or_None)."""
+    try:
+        s = _fred_full(series_id)
+    except Exception as e:
+        return None, e
+    return _slice_like_fred(s, start, end), None
+
+def _slice_like_fred(s: pd.Series, start, end):
+    """Cut a cached full history down to exactly what FRED's own observation_start/
+    observation_end would have returned, so every downstream calc sees identical data. FRED
+    rounds observation_start DOWN to the start of the period for monthly/quarterly/annual
+    series (asking a monthly series for data from 2021-09-29 still returns the 2021-09-01
+    point); daily and weekly series are a plain inclusive cut. Verified live against FRED's
+    bounded responses: 112/112 identical across monthly, quarterly, weekly and daily series
+    and awkward start dates (mid-month, 1st of month, Feb 29, a Sunday)."""
+    idx = s.index
+    pos = idx.searchsorted(pd.Timestamp(start)) if start else 0
+    if start and pos > 0 and len(idx) > 2:
+        step_days = pd.Series(idx[-25:]).diff().dt.days.median()
+        if step_days >= 25:
+            months = max(1, round(step_days / 30.44))
+            if idx[pos - 1] + pd.DateOffset(months=months) > pd.Timestamp(start):
+                pos -= 1
+    out = s.iloc[pos:]
+    return out.loc[:end] if end else out
+
+def _is_fred_rate_limit(e):
+    msg = str(e)
+    return "Too Many Requests" in msg or "mismatched tag" in msg
+
+FRED_FAILURE_MEMO_SECS = 120
+
+@st.cache_resource
+def _fred_recent_failures():
+    return {}  # series_id -> (time, exception) of its last failed download
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _fred_full(series_id: str) -> pd.Series:
+    """ONE cached full-history download per FRED series, shared by every caller: fetch(),
+    fetch_many(), the summary cards and the FedWatch EFFR anchor. Callers slice to their own
+    date range in memory, so (a) moving the date slider no longer re-downloads anything, and
+    (b) a series used in several places (DGS10/DGS2/DGS30/M2SL were each downloaded up to 6x
+    per cold load) is fetched once. Raises after 3 failed attempts - st.cache_data doesn't cache
+    exceptions, so a transient failure is retried on the next call instead of being pinned as
+    "no data" for the full TTL. Pure (no st.* calls), so it's safe to prefetch from a thread."""
+    failures = _fred_recent_failures()
+    recent = failures.get(series_id)
+    if recent and time.time() - recent[0] < FRED_FAILURE_MEMO_SECS:
+        # just failed (e.g. in the background prefetch) - fail fast with the same error instead
+        # of making the tab sit through another full round of retries
+        raise recent[1]
     last_exc = None
     for attempt in range(3):
         try:
-            s = fred.get_series(series_id, observation_start=start, observation_end=end)
-            time.sleep(0.15)
-            return s, None
+            s = fred.get_series(series_id)
+            failures.pop(series_id, None)
+            return s
         except Exception as e:
             last_exc = e
-            time.sleep(2 ** attempt)  # 1s, 2s, 4s backoff
-    return None, last_exc
+            if attempt == 2:
+                break
+            if _is_fred_rate_limit(e):
+                _fred_limiter().penalize(20)  # shared pause; acquire() waits it out
+            else:
+                time.sleep(2 ** attempt)  # 1s, 2s backoff for ordinary transient hiccups
+    failures[series_id] = (time.time(), last_exc)
+    raise last_exc
 
 @st.cache_data(ttl=3600)
 def fetch(series_id: str, label: str, start: str, end: str = None) -> pd.DataFrame:
@@ -88,15 +255,19 @@ def fetch(series_id: str, label: str, start: str, end: str = None) -> pd.DataFra
     df.index.name = "date"
     return df
 
-def fetch_many(jobs, max_workers=8):
-    """Fetch several independent FRED series concurrently instead of one at a time in a loop -
-    these are unrelated network calls, so sequential fetching was pure added wall-clock time.
-    `jobs` is a list of (series_id, label, start, end) tuples; returns {label: DataFrame}, the
-    same per-series shape individual fetch() calls return, so this is a drop-in replacement for
-    a dict comprehension of fetch() calls (e.g. the CPI/PCE component loops). Warnings for any
-    series that ultimately failed are surfaced here, on the main thread, after all jobs finish."""
+def fetch_many(jobs, max_workers=10):
+    """Fetch several independent FRED series concurrently - drop-in for a dict comprehension of
+    fetch() calls. `jobs` is a list of (series_id, label, start, end) tuples; returns
+    {label: DataFrame}. Cached as a whole (it previously wasn't, so these ~70 series were
+    re-downloaded on EVERY rerun - every widget click anywhere on the page)."""
+    return _fetch_many_cached(tuple(tuple(j) for j in jobs), max_workers)
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _fetch_many_cached(jobs, max_workers):
     results = {}
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+    # Workers only call the pure _fred_fetch_core; warnings are raised here on the calling
+    # thread after all jobs finish (st.warning is a silent no-op inside a worker thread).
+    with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="usa_bg_many") as pool:
         futures = {pool.submit(_fred_fetch_core, sid, start, end): (sid, label)
                    for sid, label, start, end in jobs}
         for fut in as_completed(futures):
@@ -109,7 +280,9 @@ def fetch_many(jobs, max_workers=8):
                 df = pd.DataFrame({label: s.values}, index=pd.to_datetime(s.index))
                 df.index.name = "date"
                 results[label] = df
-    return results
+    # as_completed order is nondeterministic; return in job order so any code iterating the
+    # dict sees the same order every run
+    return {label: results[label] for _sid, label, _s, _e in jobs}
 
 @st.cache_data(ttl=3600)
 def fetch_recessions(start: str, end: str) -> list:
@@ -310,13 +483,13 @@ def _month_after(date):
     return pd.Timestamp(year=date.year + (date.month == 12), month=1 if date.month == 12 else date.month + 1, day=1)
 
 def _zq_price(ticker):
-    hist = yf.download(ticker, period="5d", progress=False, auto_adjust=False)
+    hist = _yf_download(ticker, period="5d", progress=False, auto_adjust=False)
     if hist.empty:
         return None
     return float(hist["Close"].iloc[-1].iloc[0] if hasattr(hist["Close"].iloc[-1], "iloc") else hist["Close"].iloc[-1])
 
 def _zq_close_series(ticker, period="4mo"):
-    hist = yf.download(ticker, period=period, progress=False, auto_adjust=False)
+    hist = _yf_download(ticker, period=period, progress=False, auto_adjust=False)
     if hist.empty:
         return None
     close = hist["Close"]
@@ -347,7 +520,7 @@ def get_fedwatch_history(years_ahead=2, full_period="2y"):
     # just as well as a list of equities/ETFs.
     tickers = [_zq_ticker(_month_after(m)) for m in meetings]
     try:
-        hist = _yf_retry(lambda: yf.download(tickers, period=full_period, progress=False,
+        hist = _yf_retry(lambda: _yf_download(tickers, period=full_period, progress=False,
                                              auto_adjust=False, group_by="ticker"))
     except Exception:
         hist = pd.DataFrame()
@@ -376,7 +549,7 @@ def get_fedwatch_history(years_ahead=2, full_period="2y"):
 
 @st.cache_data(ttl=21600)
 def get_effr_history():
-    return fred.get_series("EFFR").dropna()
+    return _fred_full("EFFR").dropna()
 
 SEP_SERIES = {"med": "FEDTARMD", "lo": "FEDTARRL", "hi": "FEDTARRH", "ctl": "FEDTARCTL", "cth": "FEDTARCTH"}
 
@@ -388,7 +561,7 @@ def get_sep_data():
     try:
         with ThreadPoolExecutor(max_workers=6) as ex:
             futs = {k: ex.submit(fred.get_series_all_releases, sid) for k, sid in SEP_SERIES.items()}
-            lr_fut = ex.submit(lambda: fred.get_series("FEDTARMDLR").dropna())
+            lr_fut = ex.submit(lambda: _fred_full("FEDTARMDLR").dropna())
             vd_fut = ex.submit(fred.get_series_vintage_dates, "FEDTARMD")
             sep = {k: f.result() for k, f in futs.items()}
             return sep, lr_fut.result(), [pd.Timestamp(d) for d in vd_fut.result()]
@@ -476,7 +649,7 @@ def get_fedwatch_probabilities(years_ahead=2):
     # previous meeting's already-computed implied rate, so it can't be batched the same way.
     clean_tickers = [_zq_ticker(_month_after(m)) for m in meetings]
     try:
-        _fw_batch = _yf_retry(lambda: yf.download(clean_tickers, period="5d", progress=False,
+        _fw_batch = _yf_retry(lambda: _yf_download(clean_tickers, period="5d", progress=False,
                                                    auto_adjust=False, group_by="ticker"))
     except Exception:
         _fw_batch = pd.DataFrame()
@@ -935,11 +1108,37 @@ def _yf_retry(fn, retries=3, backoff=1.5):
             time.sleep(backoff * (attempt + 1))
     raise last_exc if last_exc else RuntimeError("yfinance call failed")
 
+# Raw download layers for fetch_yf_close / fetch_yf_close_batch: pure (raise on failure, no
+# st.* calls), so the background prefetch can warm them - the wrappers below keep all of the
+# original parsing and warning behavior, run on the script thread.
+@st.cache_data(ttl=3600, show_spinner=False)
+def _yf_close_raw(ticker: str, start: str, end: str = None) -> pd.DataFrame:
+    return _yf_retry(lambda: _yf_download(ticker, start=start, end=end, progress=False,
+                                          auto_adjust=True))
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _yf_batch_raw(tickers: tuple, start: str) -> pd.DataFrame:
+    return _yf_retry(lambda: _yf_download(list(tickers), start=start, progress=False,
+                                          auto_adjust=True, group_by="ticker"))
+
+# Live snapshot reads for the US Markets tab (VIX term structure, SPY P/E). These used to be
+# uncached, so every rerun anywhere on the page paid for 3 Yahoo round-trips; a 15-minute cache
+# keeps them far fresher than the tab's own 1hr-cached price history. Failures raise (not cached).
+@st.cache_data(ttl=900, show_spinner=False)
+def _yf_last_close(ticker: str) -> float:
+    def _hist():
+        with _yf_lock():  # Ticker.history also writes yfinance.shared._DFS on its error paths
+            return yf.Ticker(ticker).history(period="5d")
+    return float(_yf_retry(_hist)["Close"].iloc[-1])
+
+@st.cache_data(ttl=900, show_spinner=False)
+def _yf_trailing_pe(ticker: str):
+    return _yf_retry(lambda: yf.Ticker(ticker).info.get("trailingPE"))
+
 @st.cache_data(ttl=3600)
 def fetch_yf_close(ticker: str, label: str, start: str, end: str = None) -> pd.DataFrame:
     try:
-        hist = _yf_retry(lambda: yf.download(ticker, start=start, end=end, progress=False,
-                                             auto_adjust=True))
+        hist = _yf_close_raw(ticker, start, end)
         if hist.empty:
             return pd.DataFrame()
         close = hist["Close"]
@@ -962,8 +1161,7 @@ def fetch_yf_close_batch(tickers_map: dict, start: str) -> dict:
     dict comprehension of individual fetch_yf_close() calls."""
     tickers = list(tickers_map.keys())
     try:
-        hist = _yf_retry(lambda: yf.download(tickers, start=start, progress=False,
-                                             auto_adjust=True, group_by="ticker"))
+        hist = _yf_batch_raw(tuple(tickers), start)
     except Exception as e:
         st.warning(f"Could not load batch {tickers}: {e}")
         return {t: pd.DataFrame() for t in tickers}
@@ -1014,6 +1212,8 @@ SECTOR_ETFS = {
     "XLB": "Materials", "XLU": "Utilities", "XLRE": "Real Estate", "XLC": "Comm. Services",
 }
 MARKET_INDICES = {"^GSPC": "S&P 500", "^IXIC": "Nasdaq", "^RUT": "Russell 2000", "^DJI": "Dow Jones"}
+MARKETS_HIST_START = "2015-01-01"  # independent of the global slider - z-scores need a
+                                    # trailing window regardless of the selected display range
 
 # ── Oil & Gas (EIA) ──────────────────────────────────────────────────────────────
 EIA_BASE = "https://api.eia.gov/v2"
@@ -1031,6 +1231,25 @@ def _eia_get(path, params, retries=3, backoff=1.5):
             time.sleep(backoff * (attempt + 1))
     raise last_exc
 
+@st.cache_data(ttl=21600, show_spinner=False)
+def _eia_weekly_rows(path: str, series_id: str) -> list:
+    """Full weekly history for one EIA series (paged 5000 rows at a time). Pure - raises on
+    failure, no st.* calls - so the background prefetch can warm it; the get_* wrappers below
+    keep their own parsing and warnings."""
+    all_rows, offset = [], 0
+    while True:
+        j = _eia_get(path, {
+            "frequency": "weekly", "data[0]": "value", "facets[series][]": series_id,
+            "sort[0][column]": "period", "sort[0][direction]": "asc",
+            "length": 5000, "offset": offset,
+        })
+        rows = j["response"]["data"]
+        all_rows.extend(rows)
+        if len(rows) < 5000:
+            break
+        offset += 5000
+    return all_rows
+
 @st.cache_data(ttl=21600)  # SPR data only updates weekly
 def get_spr_level() -> pd.DataFrame:
     """U.S. Strategic Petroleum Reserve crude oil ending stocks, weekly, full history since
@@ -1039,18 +1258,7 @@ def get_spr_level() -> pd.DataFrame:
         st.warning("EIA_API_KEY not set - Oil & Gas tab needs a free key from eia.gov/opendata/register.php")
         return pd.DataFrame()
     try:
-        all_rows, offset = [], 0
-        while True:
-            j = _eia_get("petroleum/stoc/wstk/data/", {
-                "frequency": "weekly", "data[0]": "value", "facets[series][]": "WCSSTUS1",
-                "sort[0][column]": "period", "sort[0][direction]": "asc",
-                "length": 5000, "offset": offset,
-            })
-            rows = j["response"]["data"]
-            all_rows.extend(rows)
-            if len(rows) < 5000:
-                break
-            offset += 5000
+        all_rows = _eia_weekly_rows("petroleum/stoc/wstk/data/", "WCSSTUS1")
         df = pd.DataFrame(all_rows)
         df["date"] = pd.to_datetime(df["period"])
         df["SPR (Million Barrels)"] = pd.to_numeric(df["value"], errors="coerce") / 1000
@@ -1096,18 +1304,7 @@ def get_crude_inventories() -> pd.DataFrame:
     if not EIA_API_KEY:
         return pd.DataFrame()
     try:
-        all_rows, offset = [], 0
-        while True:
-            j = _eia_get("petroleum/stoc/wstk/data/", {
-                "frequency": "weekly", "data[0]": "value", "facets[series][]": "WCESTUS1",
-                "sort[0][column]": "period", "sort[0][direction]": "asc",
-                "length": 5000, "offset": offset,
-            })
-            rows = j["response"]["data"]
-            all_rows.extend(rows)
-            if len(rows) < 5000:
-                break
-            offset += 5000
+        all_rows = _eia_weekly_rows("petroleum/stoc/wstk/data/", "WCESTUS1")
         df = pd.DataFrame(all_rows)
         df["date"] = pd.to_datetime(df["period"])
         df["Crude Stocks ex-SPR (Million Barrels)"] = pd.to_numeric(df["value"], errors="coerce") / 1000
@@ -1124,18 +1321,7 @@ def get_refinery_utilization() -> pd.DataFrame:
     if not EIA_API_KEY:
         return pd.DataFrame()
     try:
-        all_rows, offset = [], 0
-        while True:
-            j = _eia_get("petroleum/pnp/wiup/data/", {
-                "frequency": "weekly", "data[0]": "value", "facets[series][]": "WPULEUS3",
-                "sort[0][column]": "period", "sort[0][direction]": "asc",
-                "length": 5000, "offset": offset,
-            })
-            rows = j["response"]["data"]
-            all_rows.extend(rows)
-            if len(rows) < 5000:
-                break
-            offset += 5000
+        all_rows = _eia_weekly_rows("petroleum/pnp/wiup/data/", "WPULEUS3")
         df = pd.DataFrame(all_rows)
         df["date"] = pd.to_datetime(df["period"])
         df["Refinery Utilization (%)"] = pd.to_numeric(df["value"], errors="coerce")
@@ -1242,14 +1428,10 @@ def _fred_series_retry_core(sid):
     """Thread-safe core of _fred_series_retry() - no Streamlit calls, safe to run in a worker
     thread. Retry on any exception (see _fred_series_retry's docstring for why). Returns
     (series, error_or_None)."""
-    last_exc = None
-    for attempt in range(3):
-        try:
-            return fred.get_series(sid).dropna(), None
-        except Exception as e:
-            last_exc = e
-            time.sleep(2 ** attempt)
-    return pd.Series(dtype=float), last_exc
+    try:
+        return _fred_full(sid).dropna(), None
+    except Exception as e:
+        return pd.Series(dtype=float), e
 
 def _fred_series_retry(sid, label):
     """Same retry-on-any-exception + surfaced-warning pattern as fetch(), but returns a raw,
@@ -1298,7 +1480,7 @@ def get_summary_metrics(end):
     sid_to_label["DGS5"] = "5Y (for Fly/5s30s)"
     sid_to_label["DGS30"] = "30Y (for Fly/5s30s)"
     raw = {}
-    with ThreadPoolExecutor(max_workers=8) as pool:
+    with ThreadPoolExecutor(max_workers=8, thread_name_prefix="usa_bg_summary") as pool:
         futures = {pool.submit(_fred_series_retry_core, sid): sid for sid in sid_to_label}
         for fut in as_completed(futures):
             sid = futures[fut]
@@ -1390,19 +1572,31 @@ def get_summary_metrics(end):
 ISM_PR_NEWSWIRE_URL = "https://www.prnewswire.com/news/institute-for-supply-management/"
 ISM_PR_PAGES_TO_SCAN = 10  # ~10 pages x 25 items/page comfortably covers the ~13 months found
 
+def _ism_page(page):
+    r = requests.get(ISM_PR_NEWSWIRE_URL, params={"page": page, "pagesize": 25},
+                      headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"},
+                      timeout=20)
+    r.raise_for_status()
+    return r.text
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def _ism_pages_raw() -> list:
+    """All listing pages' HTML, fetched concurrently - PR Newswire takes ~3-9s per page, so the
+    old one-page-at-a-time loop was 35-90s (confirmed live: the single slowest thing on the
+    whole dashboard). Returned in page order so fetch_ism_pmi's setdefault() still lets the
+    newest page win, exactly as before. Pure (raises on failure), so safe to prefetch."""
+    with ThreadPoolExecutor(max_workers=ISM_PR_PAGES_TO_SCAN, thread_name_prefix="usa_bg_ism") as pool:
+        return list(pool.map(_ism_page, range(1, ISM_PR_PAGES_TO_SCAN + 1)))
+
 @st.cache_data(ttl=21600)
 def fetch_ism_pmi() -> pd.DataFrame:
     mfg_months, svc_months = {}, {}
     try:
-        for page in range(1, ISM_PR_PAGES_TO_SCAN + 1):
-            r = requests.get(ISM_PR_NEWSWIRE_URL, params={"page": page, "pagesize": 25},
-                              headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                                                     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"},
-                              timeout=20)
-            r.raise_for_status()
-            for val, mon, yr in re.findall(r"Manufacturing PMI[\xae]*\s*at\s*([\d.]+)%;\s*(\w+)\s*(\d{4})\s*ISM", r.text):
+        for page_html in _ism_pages_raw():
+            for val, mon, yr in re.findall(r"Manufacturing PMI[\xae]*\s*at\s*([\d.]+)%;\s*(\w+)\s*(\d{4})\s*ISM", page_html):
                 mfg_months.setdefault((mon, yr), float(val))
-            for val, mon, yr in re.findall(r"Services PMI[\xae]*\s*at\s*([\d.]+)%;\s*(\w+)\s*(\d{4})\s*ISM", r.text):
+            for val, mon, yr in re.findall(r"Services PMI[\xae]*\s*at\s*([\d.]+)%;\s*(\w+)\s*(\d{4})\s*ISM", page_html):
                 svc_months.setdefault((mon, yr), float(val))
         if not mfg_months and not svc_months:
             st.warning("Could not parse ISM Manufacturing/Services PMI from PR Newswire (page layout may have changed).")
@@ -1415,6 +1609,63 @@ def fetch_ism_pmi() -> pd.DataFrame:
     except Exception as e:
         st.warning(f"Could not load ISM Manufacturing/Services PMI: {e}")
         return pd.DataFrame()
+
+# Kick off every tab's independent loaders now, in the order the tabs render, so network time
+# overlaps instead of adding up tab by tab. Only side-effect-free (pure) loaders go here - see
+# prefetch(). A series/loader missing from these lists still loads normally in its tab, it
+# just doesn't get the head start.
+# In render order (header cards, then tab by tab) - ~142 series against FRED's 110/min budget
+# here, so the first tabs' series go first and the last ~30 fill in as the rate window rolls.
+PREFETCH_FRED_SERIES = [
+    "USREC", "EFFR", "FEDTARMDLR", "CPIAUCSL", "CPILFESL", "PCEPILFE", "UNRATE", "PAYEMS",
+    "DGS10", "DGS2", "T10Y2Y", "FEDFUNDS", "M2SL", "DGS5", "DGS30", "WALCL", "TREAST", "SOFR",
+    "IORB", "RRPONTSYAWARD", "DFII5", "DFII10", "T5YIE", "T10YIE", "BAMLC0A0CM", "BAMLH0A0HYM2",
+    "DGS1MO", "DGS3MO", "DGS6MO", "DGS1", "DGS3", "DGS7", "DGS20", "PCEPI", "PPIACO", "RSAFS",
+    "IQ", "IR", "UMCSENT", "MICH", "EXPINF5YR", "CPIUFDSL", "CPIENGSL", "CUSR0000SAH1",
+    "CPIAPPSL", "CPITRNSL", "CPIMEDSL", "CPIRECSL", "CPIEDUSL", "CPIOGSSL", "DMOTRG3Q086SBEA",
+    "DFDHRG3Q086SBEA", "DREQRG3Q086SBEA", "DODGRG3Q086SBEA", "DFXARG3Q086SBEA",
+    "DCLORG3Q086SBEA", "DGOERG3Q086SBEA", "DONGRG3Q086SBEA", "DHUTRG3Q086SBEA",
+    "DHLCRG3Q086SBEA", "DTRSRG3Q086SBEA", "DRCARG3Q086SBEA", "DFSARG3Q086SBEA",
+    "DIFSRG3Q086SBEA", "DOTSRG3Q086SBEA", "DNPIRG3Q086SBEA", "DMOTRC1Q027SBEA",
+    "DFDHRC1Q027SBEA", "DREQRC1Q027SBEA", "DODGRC1Q027SBEA", "DFXARC1Q027SBEA",
+    "DCLORC1Q027SBEA", "DGOERC1Q027SBEA", "DONGRC1Q027SBEA", "DHUTRC1Q027SBEA",
+    "DHLCRC1Q027SBEA", "DTRSRC1Q027SBEA", "DRCARC1Q027SBEA", "DFSARC1Q027SBEA",
+    "DIFSRC1Q027SBEA", "DOTSRC1Q027SBEA", "DNPIRC1Q027SBEA", "DDURRG3M086SBEA",
+    "DNDGRG3M086SBEA", "DSERRG3M086SBEA", "PCE", "PCEDG", "PCEND", "PCES", "GASREGW", "GASDESW",
+    "CES0500000003", "CIVPART", "LNS11300060", "ICSA", "JTSJOL", "JTSQUR", "JTSLDR", "JTSHIR",
+    "U1RATE", "U2RATE", "U4RATE", "U5RATE", "U6RATE", "CGBD25O", "LNS14000003", "LNS14000002",
+    "LNS14000006", "LNS14000009", "LNS14000012", "LNS14027662", "ADPWINDCONNERSA",
+    "ADPWINDINFONERSA", "ADPWINDPROBUSNERSA", "ADPWINDLSHPNERSA", "ADPWINDEDHLTNERSA",
+    "ADPWINDTTUNERSA", "ADPWINDFINNERSA", "GDPC1", "GDP", "GDPNOW", "CFSBCACTIVITYMFG",
+    "CFSBCACTIVITYNMFG", "EXHOSLUSM495S", "HSN1F", "HOUST", "PERMIT", "COMPUTSA", "CSUSHPINSA",
+    "MORTGAGE30US", "MORTGAGE15US", "MSACSR", "HOSSUPUSM673N", "MSPUS", "RHORUSQ156N", "FIXHAI",
+    "RRPONTSYD", "CFNAI", "WEI", "RECPROUSM156N", "GACDFSA066MSFRBPHI", "GAFDISA066MSFRBNY",
+]
+
+for _sid in PREFETCH_FRED_SERIES:
+    prefetch(_fred_full, _sid, pool="fred", every=3000)
+prefetch(get_fedwatch_probabilities, 2)
+prefetch(get_fedwatch_history, 2)
+prefetch(get_sep_data)
+prefetch(load_auctions_data)
+prefetch(_ism_pages_raw)
+if EIA_API_KEY:
+    prefetch(_eia_weekly_rows, "petroleum/stoc/wstk/data/", "WCSSTUS1")
+    prefetch(_eia_weekly_rows, "petroleum/stoc/wstk/data/", "WCESTUS1")
+    prefetch(_eia_weekly_rows, "petroleum/pnp/wiup/data/", "WPULEUS3")
+for _tkr in ("CL=F", "RB=F", "HO=F"):  # crack spreads - follow the date slider
+    prefetch(_yf_close_raw, _tkr, START, END)
+prefetch(get_tga_balance, START, END)
+prefetch(get_debt_subject_to_limit, START, END)
+prefetch(get_mts_monthly)
+prefetch(get_category_spend, tuple(FISCAL_SPEND_GROUPS[next(iter(FISCAL_SPEND_GROUPS))]), "2022-01-01")
+for _tkr in ("SPY", "TLT", "^VIX", "DX-Y.NYB", "GC=F"):
+    prefetch(_yf_close_raw, _tkr, MARKETS_HIST_START, None)
+prefetch(_yf_batch_raw, tuple(MARKET_INDICES), MARKETS_HIST_START)
+prefetch(_yf_batch_raw, tuple(SECTOR_ETFS), MARKETS_HIST_START)
+prefetch(_yf_last_close, "^VIX9D", every=600)
+prefetch(_yf_last_close, "^VIX3M", every=600)
+prefetch(_yf_trailing_pe, "SPY", every=600)
 
 with st.spinner("Loading summary metrics…"):
     summary = get_summary_metrics(END)
@@ -1711,7 +1962,14 @@ with tabs[0]:
     # ── Fed Funds implied-probability (WIRP/FedWatch-style) ─────────────────────
     st.markdown('<div class="section-header">Fed Funds Implied Probabilities</div>', unsafe_allow_html=True)
     with st.spinner("Loading Fed Funds futures…"):
-        fedwatch_df, current_effr = get_fedwatch_probabilities(years_ahead=2)
+        # get_fedwatch_probabilities needs the EFFR anchor from FRED; if FRED is throttling the
+        # key it raises - show a warning for this section instead of crashing the whole page
+        # (which previously stopped every tab after this point from rendering).
+        try:
+            fedwatch_df, current_effr = get_fedwatch_probabilities(years_ahead=2)
+        except Exception as e:
+            st.warning(f"Could not load Fed Funds implied probabilities: {e}")
+            fedwatch_df, current_effr = pd.DataFrame(), None
 
     if not fedwatch_df.empty:
         st.markdown(f"**Current EFFR:** {current_effr:.2f}%  |  **Meetings shown:** next {len(fedwatch_df)} (through {fedwatch_df['Meeting'].iloc[-1]})")
@@ -2949,9 +3207,6 @@ with tabs[6]:
                "z-scores and period returns use a longer fixed lookback under the hood so the latest "
                "reading stays valid even if you narrow the date range.")
 
-    MARKETS_HIST_START = "2015-01-01"  # independent of the global slider - z-scores need a
-                                        # trailing window regardless of the selected display range
-
     with st.spinner("Loading market data…"):
         spy_full = fetch_yf_close("SPY", "SPY", MARKETS_HIST_START)
         tlt_full = fetch_yf_close("TLT", "TLT", MARKETS_HIST_START)
@@ -2968,15 +3223,15 @@ with tabs[6]:
         # yfinance (confirmed live: requesting 2 years of history still returns exactly 1 row),
         # so this can only ever be a snapshot, never a time series, with this data source.
         try:
-            vix9d_now = float(_yf_retry(lambda: yf.Ticker("^VIX9D").history(period="5d"))["Close"].iloc[-1])
+            vix9d_now = _yf_last_close("^VIX9D")
         except Exception:
             vix9d_now = None
         try:
-            vix3m_now = float(_yf_retry(lambda: yf.Ticker("^VIX3M").history(period="5d"))["Close"].iloc[-1])
+            vix3m_now = _yf_last_close("^VIX3M")
         except Exception:
             vix3m_now = None
         try:
-            spy_pe = _yf_retry(lambda: yf.Ticker("SPY").info.get("trailingPE"))
+            spy_pe = _yf_trailing_pe("SPY")
         except Exception:
             spy_pe = None
 
