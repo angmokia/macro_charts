@@ -1207,6 +1207,17 @@ def _fred_series_retry(sid, label):
         st.warning(f"Could not load {label} ({sid}) after 3 attempts: {err}")
     return s
 
+def _value_one_month_ago(s: pd.Series):
+    """Value at the nearest trading/reporting date at-or-before exactly one calendar month
+    before the series' latest date (e.g. latest = Sep 25 -> looks up Aug 25, or the closest
+    earlier date if Aug 25 wasn't a trading day). For a DAILY series, a naive .iloc[-2] is just
+    the previous DAY, not a month ago - that was a real bug (confirmed live: 2Y/10Y/2s10s/
+    2s5s10s Fly/5s30s "MoM" deltas were actually day-over-day). Returns None if the target
+    predates the series' own history."""
+    target = s.index[-1] - pd.DateOffset(months=1)
+    v = s.asof(target)
+    return float(v) if pd.notna(v) else None
+
 @st.cache_data(ttl=3600)
 def get_summary_metrics(end):
     metrics = {
@@ -1247,7 +1258,10 @@ def get_summary_metrics(end):
             continue
         try:
             latest = float(s.iloc[-1])
-            prev   = float(s.iloc[-2])
+            if calc in ("level", "level_bps") and freq == "D":
+                prev = _value_one_month_ago(s)  # true MoM for daily series - see helper docstring
+            else:
+                prev = float(s.iloc[-2])
             if calc == "pct_yoy":
                 transformed = s.pct_change(12) * 100
                 val = transformed.iloc[-1]
@@ -1259,10 +1273,12 @@ def get_summary_metrics(end):
             elif calc == "level_bps":
                 # FRED reports this series in percentage points (e.g. 0.51 = 51bps)
                 transformed = s * 100
-                val, delta = latest * 100, (latest - prev) * 100
+                val = latest * 100
+                delta = (latest - prev) * 100 if prev is not None else None
             else:
                 transformed = s
-                val, delta = latest, latest - prev
+                val = latest
+                delta = (latest - prev) if prev is not None else None
             windows = Z_WINDOWS_DAILY if freq == "D" else Z_WINDOWS_MONTHLY
             z = _zscores(transformed, windows)
             if name in YIELD_BPS_DELTA and delta is not None:
@@ -1282,11 +1298,15 @@ def get_summary_metrics(end):
         try:
             curve = pd.concat([d2, d5, d10, d30], axis=1, keys=["2Y", "5Y", "10Y", "30Y"]).ffill().dropna()
             fly = (2 * curve["5Y"] - curve["10Y"] - curve["2Y"]) * 100  # bps
-            results["2s5s10s Fly"] = (float(fly.iloc[-1]), float(fly.iloc[-1] - fly.iloc[-2]), "bps", "bps",
-                                       _zscores(fly, Z_WINDOWS_DAILY))
+            fly_prev = _value_one_month_ago(fly)
+            results["2s5s10s Fly"] = (float(fly.iloc[-1]),
+                                       float(fly.iloc[-1] - fly_prev) if fly_prev is not None else None,
+                                       "bps", "bps", _zscores(fly, Z_WINDOWS_DAILY))
             curve_5s30s = (curve["30Y"] - curve["5Y"]) * 100  # bps
-            results["5s30s"] = (float(curve_5s30s.iloc[-1]), float(curve_5s30s.iloc[-1] - curve_5s30s.iloc[-2]), "bps", "bps",
-                                 _zscores(curve_5s30s, Z_WINDOWS_DAILY))
+            c5s30s_prev = _value_one_month_ago(curve_5s30s)
+            results["5s30s"] = (float(curve_5s30s.iloc[-1]),
+                                 float(curve_5s30s.iloc[-1] - c5s30s_prev) if c5s30s_prev is not None else None,
+                                 "bps", "bps", _zscores(curve_5s30s, Z_WINDOWS_DAILY))
         except Exception as e:
             st.warning(f"Could not compute 2s5s10s Fly / 5s30s: {e}")
             results["2s5s10s Fly"] = (None, None, "", "", {})
