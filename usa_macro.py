@@ -1214,6 +1214,18 @@ def _zscores(series, windows):
         out[label] = float(v) if pd.notna(v) else None
     return out
 
+def _z1y(series: pd.Series) -> np.ndarray:
+    """Full rolling 1Y (252-trading-day) z-score time series, reindexed back to `series`'s own
+    original index - used as hover customdata so a chart can show each point's own trailing-1Y
+    z-score alongside its value. Unlike _zscores() above (which only returns the single latest
+    reading, for the summary cards), this keeps the whole history so every point on a line
+    chart gets its own z-score on hover."""
+    clean = series.dropna()
+    roll_mean = clean.rolling(252).mean()
+    roll_std = clean.rolling(252).std()
+    z = (clean - roll_mean) / roll_std
+    return z.reindex(series.index).values
+
 # Cards where a MoM/DoD delta reads more naturally in bps than in raw percentage-point terms
 # - matches the convention already used for 2s10s/2s5s10s Fly/5s30s. The headline VALUE stays
 # in "%" (e.g. "4.75%"); only the delta line switches to bps (e.g. "+2bps" instead of "+0.02%").
@@ -1582,7 +1594,10 @@ with tabs[0]:
         spreads = spreads.dropna(how="all")
     fig_spreads = go.Figure()
     for col in spreads.columns:
-        fig_spreads.add_trace(go.Scatter(x=spreads.index, y=spreads[col], name=col, mode="lines"))
+        fig_spreads.add_trace(go.Scatter(
+            x=spreads.index, y=spreads[col], name=col, mode="lines",
+            customdata=_z1y(spreads[col]),
+            hovertemplate=f"%{{x|%Y-%m-%d}}<br>{col}: %{{y:.1f}} bps<br>Z (1Y): %{{customdata:.2f}}<extra></extra>"))
     fig_spreads.add_hline(y=0, line_dash="dot", line_color="#555")
     fig_spreads.update_layout(**base_layout("Treasury Yield Spreads (bps)"))
     fig_spreads.update_yaxes(ticksuffix=" bps")
@@ -1601,7 +1616,10 @@ with tabs[0]:
     if not yc.empty:
         rolldown_df = compute_rolldown_series(yc, ROLLDOWN_TENORS)
         for col in rolldown_df.columns:
-            fig_rolldown_yields.add_trace(go.Scatter(x=rolldown_df.index, y=rolldown_df[col], name=col, mode="lines"))
+            fig_rolldown_yields.add_trace(go.Scatter(
+                x=rolldown_df.index, y=rolldown_df[col], name=col, mode="lines",
+                customdata=_z1y(rolldown_df[col]),
+                hovertemplate=f"%{{x|%Y-%m-%d}}<br>{col} Rolldown: %{{y:.1f}} bps<br>Z (1Y): %{{customdata:.2f}}<extra></extra>"))
         fig_rolldown_yields.add_hline(y=0, line_dash="dot", line_color="#555")
         fig_rolldown_yields.update_layout(**base_layout("Outright Yields — 1Y Rolldown (bps)"))
         fig_rolldown_yields.update_yaxes(ticksuffix=" bps")
@@ -1612,7 +1630,10 @@ with tabs[0]:
         # narrowing the spread over time, independent of any actual level/shape change.
         rolldown_spread_df = compute_spread_rolldown_series(yc, SPREAD_ROLLDOWN_LEGS)
         for col in rolldown_spread_df.columns:
-            fig_rolldown_spreads.add_trace(go.Scatter(x=rolldown_spread_df.index, y=rolldown_spread_df[col], name=col, mode="lines"))
+            fig_rolldown_spreads.add_trace(go.Scatter(
+                x=rolldown_spread_df.index, y=rolldown_spread_df[col], name=col, mode="lines",
+                customdata=_z1y(rolldown_spread_df[col]),
+                hovertemplate=f"%{{x|%Y-%m-%d}}<br>{col} Rolldown: %{{y:.1f}} bps<br>Z (1Y): %{{customdata:.2f}}<extra></extra>"))
         fig_rolldown_spreads.add_hline(y=0, line_dash="dot", line_color="#555")
         fig_rolldown_spreads.update_layout(**base_layout("Yield Spreads — 1Y Rolldown (bps)"))
         fig_rolldown_spreads.update_yaxes(ticksuffix=" bps")
@@ -1625,8 +1646,11 @@ with tabs[0]:
         (be_5y2,  "5Y Breakeven","#ff9800"),  (be_10y2, "10Y Breakeven","#ef5350"),
     ]:
         if not df_r.empty:
-            fig_real.add_trace(go.Scatter(x=df_r.index, y=df_r.iloc[:,0],
-                                          name=col, line=dict(color=color)))
+            real_series = df_r.iloc[:, 0]
+            fig_real.add_trace(go.Scatter(
+                x=df_r.index, y=real_series, name=col, line=dict(color=color),
+                customdata=_z1y(real_series),
+                hovertemplate=f"%{{x|%Y-%m-%d}}<br>{col}: %{{y:.2f}}%<br>Z (1Y): %{{customdata:.2f}}<extra></extra>"))
     fig_real.add_hline(y=0, line_dash="dot", line_color="#555")
     fig_real.update_layout(**base_layout("Real Yields vs Breakevens"))
     add_recessions(fig_real, recessions)
@@ -1636,17 +1660,26 @@ with tabs[0]:
     # gets its own axis since it moves on a much smaller scale than either level.
     fig_credit = go.Figure()
     if not ig_oas.empty:
-        fig_credit.add_trace(go.Scatter(x=ig_oas.index, y=ig_oas["IG OAS"] * 100,
-                                        name="IG OAS", line=dict(color="#26a69a"), yaxis="y"))
+        ig_series = ig_oas["IG OAS"] * 100
+        fig_credit.add_trace(go.Scatter(
+            x=ig_oas.index, y=ig_series, name="IG OAS", line=dict(color="#26a69a"), yaxis="y",
+            customdata=_z1y(ig_series),
+            hovertemplate="%{x|%Y-%m-%d}<br>IG OAS: %{y:.0f} bps<br>Z (1Y): %{customdata:.2f}<extra></extra>"))
     if not hy_oas.empty:
-        fig_credit.add_trace(go.Scatter(x=hy_oas.index, y=hy_oas["HY OAS"] * 100,
-                                        name="HY OAS", line=dict(color="#ef5350"), yaxis="y"))
+        hy_series = hy_oas["HY OAS"] * 100
+        fig_credit.add_trace(go.Scatter(
+            x=hy_oas.index, y=hy_series, name="HY OAS", line=dict(color="#ef5350"), yaxis="y",
+            customdata=_z1y(hy_series),
+            hovertemplate="%{x|%Y-%m-%d}<br>HY OAS: %{y:.0f} bps<br>Z (1Y): %{customdata:.2f}<extra></extra>"))
     credit_diff_df = pd.DataFrame()
     if not ig_oas.empty and not hy_oas.empty:
         credit_diff = ((hy_oas["HY OAS"] - ig_oas["IG OAS"]) * 100).dropna()
         credit_diff_df = pd.DataFrame({"HY-IG Diff (bps)": credit_diff})
-        fig_credit.add_trace(go.Scatter(x=credit_diff.index, y=credit_diff.values,
-                                        name="HY − IG Differential", line=dict(color="#ff9800", dash="dot"), yaxis="y2"))
+        fig_credit.add_trace(go.Scatter(
+            x=credit_diff.index, y=credit_diff.values, name="HY − IG Differential",
+            line=dict(color="#ff9800", dash="dot"), yaxis="y2",
+            customdata=_z1y(credit_diff),
+            hovertemplate="%{x|%Y-%m-%d}<br>HY−IG Diff: %{y:.0f} bps<br>Z (1Y): %{customdata:.2f}<extra></extra>"))
     fig_credit.update_layout(**dual_axis_layout("Credit Spreads — IG & HY OAS vs. HY−IG Differential (bps)", "IG & HY OAS (bps)", "HY − IG Differential (bps)"))
     add_recessions(fig_credit, recessions)
 
