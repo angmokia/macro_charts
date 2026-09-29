@@ -2987,15 +2987,31 @@ with tabs[6]:
     # based, not yield-based, so positive = "stocks and bonds moving together", matching how
     # this is conventionally reported - a yield-diff version would read with the opposite sign
     # since bond prices and yields move inversely).
+    corr_window = st.number_input("Short-term rolling window (trading days)", min_value=5,
+                                   max_value=252, value=60, step=5, key="corr_window")
+    corr_short_label = f"{int(corr_window)}D"
     fig_corr = go.Figure()
+    corr_df = pd.DataFrame()
     if not spy_full.empty and not tlt_full.empty:
         combo = pd.concat([spy_full, tlt_full], axis=1).dropna()
         rets = combo.pct_change().dropna()
-        corr_60 = rets["SPY"].rolling(21 * 3).corr(rets["TLT"])  # ~60 trading days
-        corr_252 = rets["SPY"].rolling(252).corr(rets["TLT"])
-        corr_df = _clip_mkt(pd.DataFrame({"60D": corr_60, "1Y": corr_252}).dropna()).round(3)
-        fig_corr.add_trace(go.Scatter(x=corr_df.index, y=corr_df["60D"], name="60D", line=dict(color="#42a5f5")))
-        fig_corr.add_trace(go.Scatter(x=corr_df.index, y=corr_df["1Y"], name="1Y", line=dict(color="#ab47bc")))
+        # Rolling correlation AND its z-score are both computed on the full, unclipped history
+        # (MARKETS_HIST_START, back to 2015) before clipping for display - otherwise early dates
+        # in a narrowed display range would show a NaN z-score from insufficient trailing history
+        # inside just the clipped window, even though real history exists further back.
+        corr_short_full = rets["SPY"].rolling(int(corr_window)).corr(rets["TLT"])
+        corr_252_full = rets["SPY"].rolling(252).corr(rets["TLT"])
+        corr_df = _clip_mkt(pd.DataFrame({corr_short_label: corr_short_full, "1Y": corr_252_full}).dropna()).round(3)
+        corr_short_z = pd.Series(_z1y(corr_short_full), index=corr_short_full.index).reindex(corr_df.index)
+        corr_252_z = pd.Series(_z1y(corr_252_full), index=corr_252_full.index).reindex(corr_df.index)
+        fig_corr.add_trace(go.Scatter(
+            x=corr_df.index, y=corr_df[corr_short_label], name=corr_short_label, line=dict(color="#42a5f5"),
+            customdata=corr_short_z.values,
+            hovertemplate=f"%{{x|%Y-%m-%d}}<br>{corr_short_label}: %{{y:.2f}}<br>Z (1Y): %{{customdata:.2f}}<extra></extra>"))
+        fig_corr.add_trace(go.Scatter(
+            x=corr_df.index, y=corr_df["1Y"], name="1Y", line=dict(color="#ab47bc"),
+            customdata=corr_252_z.values,
+            hovertemplate="%{x|%Y-%m-%d}<br>1Y: %{y:.2f}<br>Z (1Y): %{customdata:.2f}<extra></extra>"))
     fig_corr.add_hline(y=0, line_dash="dot", line_color="#555")
     fig_corr.update_layout(**base_layout("Stock/Bond Rolling Correlation (SPY vs TLT)"))
     add_recessions(fig_corr, recessions)
@@ -3121,8 +3137,12 @@ with tabs[6]:
     fig_vix = go.Figure()
     vix_clipped = _clip_mkt(vix_full)
     if not vix_clipped.empty:
-        fig_vix.add_trace(go.Scatter(x=vix_clipped.index, y=vix_clipped["VIX"], name="VIX",
-                                     line=dict(color="#ef5350"), fill="tozeroy", fillcolor="rgba(239,83,80,0.12)"))
+        vix_z = pd.Series(_z1y(vix_full["VIX"]), index=vix_full.index).reindex(vix_clipped.index)
+        fig_vix.add_trace(go.Scatter(
+            x=vix_clipped.index, y=vix_clipped["VIX"], name="VIX",
+            line=dict(color="#ef5350"), fill="tozeroy", fillcolor="rgba(239,83,80,0.12)",
+            customdata=vix_z.values,
+            hovertemplate="%{x|%Y-%m-%d}<br>VIX: %{y:.1f}<br>Z (1Y): %{customdata:.2f}<extra></extra>"))
     fig_vix.update_layout(**base_layout("VIX (Implied Volatility)"))
     add_recessions(fig_vix, recessions)
 
@@ -3150,8 +3170,11 @@ with tabs[6]:
     fig_dxy = go.Figure()
     dxy_clipped = _clip_mkt(dxy_full)
     if not dxy_clipped.empty:
-        fig_dxy.add_trace(go.Scatter(x=dxy_clipped.index, y=dxy_clipped["DXY"], name="DXY",
-                                     line=dict(color="#90a4d4")))
+        dxy_z = pd.Series(_z1y(dxy_full["DXY"]), index=dxy_full.index).reindex(dxy_clipped.index)
+        fig_dxy.add_trace(go.Scatter(
+            x=dxy_clipped.index, y=dxy_clipped["DXY"], name="DXY", line=dict(color="#90a4d4"),
+            customdata=dxy_z.values,
+            hovertemplate="%{x|%Y-%m-%d}<br>DXY: %{y:.2f}<br>Z (1Y): %{customdata:.2f}<extra></extra>"))
     add_ma_overlays(fig_dxy, dxy_full, "DXY", START, END)
     fig_dxy.update_layout(**base_layout("US Dollar Index (DXY)"))
     add_recessions(fig_dxy, recessions)
@@ -3173,8 +3196,13 @@ with tabs[6]:
         [(1, 1), (1, 2), (2, 1), (2, 2)]
     ):
         if not df_clipped.empty:
-            fig_gold.add_trace(go.Scatter(x=df_clipped.index, y=df_clipped[col_name],
-                                          name=label, line=dict(color=color)), row=row, col=col)
+            gold_fmt = "$%{y:,.0f}" if col_name == "Gold" else "%{y:.2f}%"
+            gold_z = pd.Series(_z1y(df_full[col_name]), index=df_full.index).reindex(df_clipped.index)
+            fig_gold.add_trace(go.Scatter(
+                x=df_clipped.index, y=df_clipped[col_name], name=label, line=dict(color=color),
+                customdata=gold_z.values,
+                hovertemplate=f"%{{x|%Y-%m-%d}}<br>{label}: {gold_fmt}<br>Z (1Y): %{{customdata:.2f}}<extra></extra>"
+            ), row=row, col=col)
         add_ma_overlays(fig_gold, df_full, col_name, START, END, row=row, col=col)
     fig_gold.update_layout(template=TEMPLATE, paper_bgcolor=PAPER_BG, plot_bgcolor=PLOT_BG,
                            height=560, margin=dict(l=10, r=10, t=50, b=30), showlegend=False)
