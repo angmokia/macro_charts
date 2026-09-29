@@ -1381,12 +1381,12 @@ st.markdown("<br>", unsafe_allow_html=True)
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 tabs = st.tabs([
+    "Treasury & Rates",
     "Prices",
     "Oil & Gas",
     "Labour Market",
     "Economic Activity",
     "Housing",
-    "Treasury & Rates",
     "US Markets",
     "Fiscal",
     "Indicators",
@@ -1394,904 +1394,9 @@ tabs = st.tabs([
 ])
 
 # ════════════════════════════════════════════════════════════════════════════════
-# TAB 1 — Inflation & Consumer
+# TAB 1 — Monetary & Rates
 # ════════════════════════════════════════════════════════════════════════════════
 with tabs[0]:
-    st.header("Inflation & Consumer")
-    with st.spinner("Loading inflation data…"):
-        cpi      = mom_yoy(fetch("CPIAUCSL", "CPI", START, END), "CPI")
-        core_cpi = mom_yoy(fetch("CPILFESL", "Core CPI", START, END), "Core CPI")
-        pce      = mom_yoy(fetch("PCEPI", "PCE", START, END), "PCE")
-        core_pce = mom_yoy(fetch("PCEPILFE", "Core PCE", START, END), "Core PCE")
-        ppi      = mom_yoy(fetch("PPIACO", "PPI", START, END), "PPI")
-        rsa      = mom_yoy(fetch("RSAFS", "Retail Sales", START, END), "Retail Sales")
-        exp_pi   = mom_yoy(fetch("IQ", "Export Price Index", START, END), "Export Price Index")
-        imp_pi   = mom_yoy(fetch("IR", "Import Price Index", START, END), "Import Price Index")
-        be_5y    = fetch("T5YIE",  "5Y Breakeven", START, END)
-        be_10y   = fetch("T10YIE", "10Y Breakeven", START, END)
-        umich    = fetch("UMCSENT", "UMich Sentiment", START, END)
-        inf_exp1 = fetch("MICH", "1Y Inf Expectation", START, END)
-        inf_exp5 = fetch("EXPINF5YR", "5Y Inf Expectation", START, END)
-
-        # CPI components - the standard BLS major expenditure groups (SA), each verified
-        # live against FRED. Not exhaustive (BLS publishes finer subcomponents too), but this
-        # is the standard "CPI component breakdown" level of granularity.
-        CPI_COMPONENTS = [
-            ("Food",                       "CPIUFDSL"),
-            ("Energy",                     "CPIENGSL"),
-            ("Shelter",                    "CUSR0000SAH1"),
-            ("Apparel",                    "CPIAPPSL"),
-            ("Transportation",             "CPITRNSL"),
-            ("Medical Care",               "CPIMEDSL"),
-            ("Recreation",                 "CPIRECSL"),
-            ("Education & Communication",  "CPIEDUSL"),
-            ("Other Goods & Services",     "CPIOGSSL"),
-        ]
-        cpi_raw = fetch_many([(sid, label, START, END) for label, sid in CPI_COMPONENTS])
-        cpi_components = {label: mom_yoy(cpi_raw[label], label) for label, sid in CPI_COMPONENTS}
-
-        # PCE components - a genuinely non-overlapping partition of PCE (BEA NIPA Table 2.4.5,
-        # "Personal Consumption Expenditures by Type of Product" - verified live via FRED's
-        # release/tables API, not guessed). The previous 7-category set mixed a clean
-        # Goods/Durable/Nondurable/Services split with cross-cutting memo categories (Food,
-        # Energy, Services-Excl-Energy&Housing) that overlapped both the clean split and each
-        # other, so weights never summed to 100% and nothing here was meant to be added up -
-        # confusing without a caption explaining it. This 16-category set IS BEA's actual leaf
-        # level of the Goods/Services tree, so every dollar of PCE falls into exactly one row.
-        # Only available quarterly at BEA/FRED (confirmed - no monthly series at this
-        # granularity exists), so this section runs at quarterly cadence unlike the rest of
-        # the Prices tab.
-        PCE_COMPONENTS = [
-            ("Motor Vehicles & Parts",             "DMOT"),
-            ("Furnishings & Durable HH Equipment",  "DFDH"),
-            ("Recreational Goods & Vehicles",       "DREQ"),
-            ("Other Durable Goods",                 "DODG"),
-            ("Food & Beverages (Off-Premises)",     "DFXA"),
-            ("Clothing & Footwear",                 "DCLO"),
-            ("Gasoline & Other Energy Goods",       "DGOE"),
-            ("Other Nondurable Goods",              "DONG"),
-            ("Housing & Utilities",                 "DHUT"),
-            ("Health Care",                         "DHLC"),
-            ("Transportation Services",             "DTRS"),
-            ("Recreation Services",                 "DRCA"),
-            ("Food Services & Accommodations",      "DFSA"),
-            ("Financial Services & Insurance",       "DIFS"),
-            ("Other Services",                      "DOTS"),
-            ("Nonprofit Institutions (NPISH)",      "DNPI"),
-        ]
-
-        def qoq_yoy(df: pd.DataFrame, col: str) -> pd.DataFrame:
-            if df.empty or col not in df.columns:
-                return pd.DataFrame(columns=[f"{col} QoQ %", f"{col} YoY %"])
-            out = pd.DataFrame(index=df.index)
-            out[f"{col} QoQ %"] = (df[col].pct_change() * 100).round(3)
-            out[f"{col} YoY %"] = (df[col].pct_change(4) * 100).round(3)
-            return out
-
-        pce_raw_qoq = fetch_many([(f"{root}RG3Q086SBEA", label, START, END) for label, root in PCE_COMPONENTS])
-        pce_components = {label: qoq_yoy(pce_raw_qoq[label], label) for label, root in PCE_COMPONENTS}
-
-        # Weights - nominal-dollar expenditure shares. Since these 16 categories are a complete
-        # partition by construction, the total is just their own sum - no separate "PCE Total"
-        # series needed, and weights always sum to exactly 100%.
-        pce_raw_wt = fetch_many([(f"{root}RC1Q027SBEA", f"{label} $", START, END) for label, root in PCE_COMPONENTS])
-        pce_levels = {}
-        for label, root in PCE_COMPONENTS:
-            df_w = pce_raw_wt[f"{label} $"]
-            if not df_w.empty:
-                pce_levels[label] = df_w[f"{label} $"].dropna().iloc[-1]
-        pce_total = sum(pce_levels.values())
-        pce_weights = {label: val / pce_total * 100 for label, val in pce_levels.items()} if pce_total else {}
-
-        # Monthly "parent" categories - Durable Goods, Nondurable Goods, and Services DO update
-        # monthly (mom_yoy(), same cadence as the rest of the tab), unlike the 16 quarterly-only
-        # children above. Shown as header rows with their matching children nested underneath,
-        # so the chart gets a fresh top-level number every month even though the granular detail
-        # only refreshes once a quarter.
-        PCE_PARENTS = [
-            ("Durable Goods",    "DDURRG3M086SBEA", "PCEDG"),
-            ("Nondurable Goods", "DNDGRG3M086SBEA", "PCEND"),
-            ("Services",         "DSERRG3M086SBEA", "PCES"),
-        ]
-        PCE_PARENT_CHILDREN = {
-            "Durable Goods": ["Motor Vehicles & Parts", "Furnishings & Durable HH Equipment",
-                              "Recreational Goods & Vehicles", "Other Durable Goods"],
-            "Nondurable Goods": ["Food & Beverages (Off-Premises)", "Clothing & Footwear",
-                                 "Gasoline & Other Energy Goods", "Other Nondurable Goods"],
-            "Services": ["Housing & Utilities", "Health Care", "Transportation Services",
-                         "Recreation Services", "Food Services & Accommodations",
-                         "Financial Services & Insurance", "Other Services",
-                         "Nonprofit Institutions (NPISH)"],
-        }
-        pce_parent_data = {label: mom_yoy(fetch(pid, label, START, END), label) for label, pid, _ in PCE_PARENTS}
-        pce_total_monthly_df = fetch("PCE", "PCE Total (Monthly)", START, END)
-        pce_parent_weights = {}
-        if not pce_total_monthly_df.empty:
-            pce_total_monthly = pce_total_monthly_df["PCE Total (Monthly)"].dropna().iloc[-1]
-            for label, _, wid in PCE_PARENTS:
-                df_pw = fetch(wid, f"{label} $ (Monthly)", START, END)
-                if not df_pw.empty:
-                    pce_parent_weights[label] = df_pw[f"{label} $ (Monthly)"].dropna().iloc[-1] / pce_total_monthly * 100
-
-    # CPI vs Core CPI
-    fig_cpi = go.Figure()
-    for col, color in [("CPI YoY %","#ef5350"),("Core CPI YoY %","#ff9800"),
-                       ("CPI MoM %","#ef535055"),("Core CPI MoM %","#ff980055")]:
-        src = pd.concat([cpi, core_cpi], axis=1)
-        if col not in src.columns: continue
-        ax = "y2" if "MoM" in col else "y"
-        fig_cpi.add_trace(go.Scatter(x=src.index, y=src[col], name=col, mode="lines",
-                                     yaxis=ax, line=dict(width=1.5 if "YoY" in col else 1, dash="solid" if "YoY" in col else "dot")))
-        if col == "CPI YoY %":
-            add_rolling_mean_trace(fig_cpi, src[col], 6, "CPI YoY 6M MA", "#8a94a6")
-        elif col == "Core CPI YoY %":
-            add_rolling_mean_trace(fig_cpi, src[col], 6, "Core CPI YoY 6M MA", "#4fc3f7")
-    fig_cpi.update_layout(**dual_axis_layout("CPI vs Core CPI", "YoY %", "MoM %"))
-    add_recessions(fig_cpi, recessions)
-
-    # PCE vs Core PCE
-    fig_pce = go.Figure()
-    for col, color in [("PCE YoY %","#26a69a"),("Core PCE YoY %","#80cbc4"),
-                       ("PCE MoM %","#26a69a55"),("Core PCE MoM %","#80cbc455")]:
-        src = pd.concat([pce, core_pce], axis=1)
-        if col not in src.columns: continue
-        ax = "y2" if "MoM" in col else "y"
-        fig_pce.add_trace(go.Scatter(x=src.index, y=src[col], name=col, mode="lines",
-                                     yaxis=ax, line=dict(width=1.5 if "YoY" in col else 1, dash="solid" if "YoY" in col else "dot")))
-        if col == "PCE YoY %":
-            add_rolling_mean_trace(fig_pce, src[col], 6, "PCE YoY 6M MA", "#8a94a6")
-        elif col == "Core PCE YoY %":
-            add_rolling_mean_trace(fig_pce, src[col], 6, "Core PCE YoY 6M MA", "#4fc3f7")
-    fig_pce.update_layout(**dual_axis_layout("PCE vs Core PCE (Fed's Preferred)", "YoY %", "MoM %"))
-    add_recessions(fig_pce, recessions)
-
-    # PPI
-    fig_ppi = go.Figure()
-    for col in ppi.columns:
-        ax = "y2" if "MoM" in col else "y"
-        fig_ppi.add_trace(go.Scatter(x=ppi.index, y=ppi[col], name=col, mode="lines", yaxis=ax))
-    fig_ppi.update_layout(**dual_axis_layout("PPI (MoM & YoY)", "YoY %", "MoM %"))
-    add_recessions(fig_ppi, recessions)
-
-    # Retail Sales
-    fig_rsa = go.Figure()
-    for col in rsa.columns:
-        ax = "y2" if "MoM" in col else "y"
-        fig_rsa.add_trace(go.Scatter(x=rsa.index, y=rsa[col], name=col, mode="lines", yaxis=ax))
-    fig_rsa.update_layout(**dual_axis_layout("Retail Sales (MoM & YoY)", "YoY %", "MoM %"))
-    add_recessions(fig_rsa, recessions)
-
-    # Breakeven inflation
-    fig_be = go.Figure()
-    if not be_5y.empty:
-        fig_be.add_trace(go.Scatter(x=be_5y.index, y=be_5y["5Y Breakeven"], name="5Y Breakeven", line=dict(color="#26a69a")))
-    if not be_10y.empty:
-        fig_be.add_trace(go.Scatter(x=be_10y.index, y=be_10y["10Y Breakeven"], name="10Y Breakeven", line=dict(color="#ff9800")))
-    fig_be.update_layout(**base_layout("Inflation Expectations (TIPS Breakevens)"))
-    add_recessions(fig_be, recessions)
-
-    # UMich Sentiment + Inflation Expectations
-    fig_umich = make_subplots(rows=2, cols=1, shared_xaxes=True,
-                              subplot_titles=("Consumer Sentiment", "Inflation Expectations"),
-                              vertical_spacing=0.1)
-    if not umich.empty:
-        fig_umich.add_trace(go.Scatter(x=umich.index, y=umich["UMich Sentiment"],
-                                       name="UMich Sentiment", line=dict(color="#90a4d4")), row=1, col=1)
-    if not inf_exp1.empty:
-        fig_umich.add_trace(go.Scatter(x=inf_exp1.index, y=inf_exp1["1Y Inf Expectation"],
-                                       name="1Y Inf Exp", line=dict(color="#ef5350")), row=2, col=1)
-    if not inf_exp5.empty:
-        fig_umich.add_trace(go.Scatter(x=inf_exp5.index, y=inf_exp5["5Y Inf Expectation"],
-                                       name="5Y Inf Exp", line=dict(color="#ff9800")), row=2, col=1)
-    fig_umich.update_layout(template=TEMPLATE, paper_bgcolor=PAPER_BG, plot_bgcolor=PLOT_BG,
-                            height=500, margin=dict(l=10,r=10,t=45,b=30),
-                            legend=dict(orientation="h", y=-0.15, x=0.5, xanchor="center"))
-    fig_umich.update_xaxes(gridcolor=GRID_COLOR)
-    fig_umich.update_yaxes(gridcolor=GRID_COLOR)
-    add_recessions(fig_umich, recessions, rows=[1,1,2,2], cols=[1,1,1,1])
-
-    # Export/Import Prices
-    fig_pi = go.Figure()
-    for col in pd.concat([exp_pi, imp_pi], axis=1).columns:
-        src = pd.concat([exp_pi, imp_pi], axis=1)
-        ax  = "y2" if "MoM" in col else "y"
-        fig_pi.add_trace(go.Scatter(x=src.index, y=src[col], name=col, mode="lines", yaxis=ax))
-    fig_pi.update_layout(**dual_axis_layout("Export & Import Price Indices", "YoY %", "MoM %"))
-    add_recessions(fig_pi, recessions)
-
-    # CPI components - YoY % history (all 9 groups) + latest MoM/YoY snapshot
-    fig_cpi_comp_hist = go.Figure()
-    for label, _ in CPI_COMPONENTS:
-        df_c = cpi_components[label]
-        col = f"{label} YoY %"
-        if not df_c.empty and col in df_c.columns:
-            fig_cpi_comp_hist.add_trace(go.Scatter(x=df_c.index, y=df_c[col], name=label, mode="lines"))
-    fig_cpi_comp_hist.update_layout(**base_layout("CPI Components — YoY %"))
-    fig_cpi_comp_hist.update_yaxes(ticksuffix="%")
-    add_recessions(fig_cpi_comp_hist, recessions)
-
-    comp_rows = []
-    for label, _ in CPI_COMPONENTS:
-        df_c = cpi_components[label]
-        mom_col, yoy_col = f"{label} MoM %", f"{label} YoY %"
-        if df_c.empty or mom_col not in df_c.columns:
-            continue
-        mom_s, yoy_s = df_c[mom_col].dropna(), df_c[yoy_col].dropna()
-        if mom_s.empty or yoy_s.empty:
-            continue
-        comp_rows.append({"Component": label, "MoM %": mom_s.iloc[-1], "YoY %": yoy_s.iloc[-1], "As Of": df_c.index[-1]})
-    comp_df = pd.DataFrame(comp_rows).sort_values("YoY %", ascending=True)
-    comp_latest_date = comp_df["As Of"].max().strftime("%b %Y") if not comp_df.empty else ""
-    comp_df = comp_df.drop(columns="As Of")
-
-    fig_cpi_comp_snap = go.Figure()
-    fig_cpi_comp_snap.add_trace(go.Bar(y=comp_df["Component"], x=comp_df["YoY %"], name="YoY %",
-                                        orientation="h", marker_color="#ef5350"))
-    fig_cpi_comp_snap.add_trace(go.Bar(y=comp_df["Component"], x=comp_df["MoM %"], name="MoM %",
-                                        orientation="h", marker_color="#ff9800"))
-    fig_cpi_comp_snap.update_layout(**base_layout(f"CPI Components — Latest MoM & YoY % ({comp_latest_date})", height=420))
-    fig_cpi_comp_snap.update_layout(barmode="group")
-    fig_cpi_comp_snap.update_xaxes(ticksuffix="%")
-
-    # PCE components - YoY % history (16 non-overlapping groups) + latest QoQ/YoY snapshot.
-    # Quarterly cadence (see PCE_COMPONENTS comment above), unlike CPI's monthly history.
-    fig_pce_comp_hist = go.Figure()
-    for label, _ in PCE_COMPONENTS:
-        df_c = pce_components[label]
-        col = f"{label} YoY %"
-        if not df_c.empty and col in df_c.columns:
-            fig_pce_comp_hist.add_trace(go.Scatter(x=df_c.index, y=df_c[col], name=label, mode="lines"))
-    fig_pce_comp_hist.update_layout(**base_layout("PCE Components — YoY % (Quarterly)"))
-    fig_pce_comp_hist.update_yaxes(ticksuffix="%")
-    add_recessions(fig_pce_comp_hist, recessions)
-
-    # Grouped snapshot: each monthly parent (Durable Goods / Nondurable Goods / Services) as a
-    # header row, its non-overlapping quarterly children nested underneath - gives a fresh
-    # top-level number every month even though the granular detail only refreshes quarterly.
-    # Parent rows use YoY/MoM, child rows use YoY/QoQ; row order is fixed (not sorted by value)
-    # so the grouping stays intact, and colors are darker for parents, lighter for children.
-    pce_comp_rows = []
-    for p_label, _, _ in PCE_PARENTS:
-        df_p = pce_parent_data[p_label]
-        mom_col, pyoy_col = f"{p_label} MoM %", f"{p_label} YoY %"
-        if not df_p.empty and mom_col in df_p.columns:
-            mom_s, pyoy_s = df_p[mom_col].dropna(), df_p[pyoy_col].dropna()
-            if not mom_s.empty and not pyoy_s.empty:
-                pweight = pce_parent_weights.get(p_label)
-                row_label = f"{p_label.upper()} ({pweight:.1f}%)" if pweight is not None else p_label.upper()
-                pce_comp_rows.append({"Component": row_label, "YoY %": pyoy_s.iloc[-1],
-                                       "Period %": mom_s.iloc[-1], "is_parent": True, "As Of": df_p.index[-1]})
-        for child in PCE_PARENT_CHILDREN[p_label]:
-            df_c = pce_components.get(child)
-            qoq_col, cyoy_col = f"{child} QoQ %", f"{child} YoY %"
-            if df_c is None or df_c.empty or qoq_col not in df_c.columns:
-                continue
-            qoq_s, cyoy_s = df_c[qoq_col].dropna(), df_c[cyoy_col].dropna()
-            if qoq_s.empty or cyoy_s.empty:
-                continue
-            cweight = pce_weights.get(child)
-            row_label = f"     {child} ({cweight:.1f}%)" if cweight is not None else f"     {child}"
-            pce_comp_rows.append({"Component": row_label, "YoY %": cyoy_s.iloc[-1],
-                                   "Period %": qoq_s.iloc[-1], "is_parent": False, "As Of": df_c.index[-1]})
-
-    pce_comp_df = pd.DataFrame(pce_comp_rows)
-    pce_comp_latest_date = pce_comp_df["As Of"].max().strftime("%b %Y") if not pce_comp_df.empty else ""
-    pce_comp_df = pce_comp_df.drop(columns="As Of").iloc[::-1]  # reverse so parents render top-to-bottom
-
-    yoy_colors = ["#1f8f6b" if p else "#26a69a" for p in pce_comp_df["is_parent"]]
-    period_colors = ["#3568c9" if p else "#80cbc4" for p in pce_comp_df["is_parent"]]
-
-    fig_pce_comp_snap = go.Figure()
-    fig_pce_comp_snap.add_trace(go.Bar(y=pce_comp_df["Component"], x=pce_comp_df["YoY %"], name="YoY %",
-                                        orientation="h", marker_color=yoy_colors))
-    fig_pce_comp_snap.add_trace(go.Bar(y=pce_comp_df["Component"], x=pce_comp_df["Period %"],
-                                        name="MoM % (parents) / QoQ % (children)",
-                                        orientation="h", marker_color=period_colors))
-    fig_pce_comp_snap.update_layout(**base_layout(f"PCE Components — Monthly Parents + Quarterly Detail ({pce_comp_latest_date})", height=680))
-    fig_pce_comp_snap.update_layout(barmode="group")
-    fig_pce_comp_snap.update_xaxes(ticksuffix="%")
-    fig_pce_comp_snap.update_yaxes(tickfont=dict(size=10))
-
-    inflation_charts = [
-        ("CPI vs Core CPI", fig_cpi, pd.concat([cpi, core_cpi], axis=1)),
-        ("PCE vs Core PCE", fig_pce, pd.concat([pce, core_pce], axis=1)),
-        ("PPI", fig_ppi, ppi),
-        ("Retail Sales", fig_rsa, rsa),
-        ("TIPS Breakevens", fig_be, pd.concat([be_5y, be_10y], axis=1)),
-        ("UMich & Inflation Expectations", fig_umich, pd.concat([umich, inf_exp1, inf_exp5], axis=1)),
-        ("Export & Import Prices", fig_pi, pd.concat([exp_pi, imp_pi], axis=1)),
-        ("CPI Components History", fig_cpi_comp_hist, pd.concat([cpi_components[l] for l, _ in CPI_COMPONENTS], axis=1)),
-        ("CPI Components Snapshot", fig_cpi_comp_snap, comp_df),
-        ("PCE Components History", fig_pce_comp_hist, pd.concat([pce_components[l] for l, _ in PCE_COMPONENTS], axis=1)),
-        ("PCE Components Snapshot", fig_pce_comp_snap, pce_comp_df),
-    ]
-    render_two_col(inflation_charts)
-
-# ════════════════════════════════════════════════════════════════════════════════
-# TAB 2 — Oil & Gas
-# ════════════════════════════════════════════════════════════════════════════════
-with tabs[1]:
-    st.header("Oil & Gas")
-    st.caption("Strategic Petroleum Reserve - EIA (api.eia.gov), not FRED. A different data domain "
-               "from the rest of this dashboard.")
-
-    with st.spinner("Loading SPR data…"):
-        spr = get_spr_level()
-
-    if spr.empty:
-        st.info("SPR data unavailable this run.")
-    else:
-        latest_level = spr["SPR (Million Barrels)"].iloc[-1]
-        ath = spr["SPR (Million Barrels)"].max()
-        ath_date = spr["SPR (Million Barrels)"].idxmax()
-        pct_of_ath = latest_level / ath * 100
-        proj = estimate_time_to_floor(spr["SPR (Million Barrels)"], SPR_SECDEF_FLOOR, freq="weekly")
-
-        m1, m2, m3, m4 = st.columns(4)
-        with m1:
-            st.metric("Latest SPR Level", f"{latest_level:,.1f}M bbls", help=f"As of {spr.index[-1].strftime('%b %d, %Y')}")
-        with m2:
-            st.metric("All-Time High", f"{ath:,.1f}M bbls", help=f"{ath_date.strftime('%b %Y')}")
-        with m3:
-            st.metric("% of All-Time High", f"{pct_of_ath:.1f}%")
-        with m4:
-            if proj["periods_to_floor"] is not None:
-                weeks = proj["periods_to_floor"]
-                st.metric("Est. Time to SecDef Floor", f"{weeks:,.0f} weeks",
-                         delta=f"~{proj['eta_date'].strftime('%b %Y')}", delta_color="off",
-                         help=f"Floor: {SPR_SECDEF_FLOOR:.1f}M bbls (42 USC 6241(h), the non-emergency "
-                              f"drawdown minimum requiring Secretary of Defense sign-off). Drawdown rate: "
-                              f"4-week moving average of the weekly change, currently {proj['rate_per_period']:+.2f}M bbls/week.")
-            else:
-                st.metric("Est. Time to SecDef Floor", "N/A",
-                         help="Not currently drawing down (4-week average weekly change is flat or positive), "
-                              "so time-to-floor is undefined.")
-
-        st.caption(f"**SecDef-authorized floor: {SPR_SECDEF_FLOOR:.1f}M bbls** — the statutory minimum for the "
-                   f"SPR's non-emergency drawdown authority (42 U.S.C. § 6241(h)); a drawdown under this "
-                   f"specific authority requires the Secretary of Defense to confirm it \"will not impair "
-                   f"national security.\" This does not apply to the President's separate emergency-drawdown "
-                   f"authority, which has no statutory minimum.")
-
-        fig_spr = go.Figure()
-        fig_spr.add_trace(go.Scatter(x=spr.index, y=spr["SPR (Million Barrels)"], name="SPR Level",
-                                     line=dict(color="#e08b4f"), fill="tozeroy", fillcolor="rgba(224,139,79,0.12)"))
-        fig_spr.add_hline(y=SPR_SECDEF_FLOOR, line_dash="dash", line_color="#ef5350",
-                          annotation_text=f"SecDef Floor ({SPR_SECDEF_FLOOR:.1f}M)", annotation_position="bottom right")
-        fig_spr.update_layout(**base_layout("SPR Level — Full History (Weekly)"))
-        fig_spr.update_yaxes(title="Million Barrels")
-        add_recessions(fig_spr, recessions)
-
-        spr_recent = spr[spr.index >= (spr.index[-1] - pd.DateOffset(years=2))].copy()
-        spr_recent["WoW Change"] = spr_recent["SPR (Million Barrels)"].diff()
-        spr_recent["4W MA"] = spr_recent["WoW Change"].rolling(4).mean()
-        fig_spr_chg = go.Figure()
-        fig_spr_chg.add_trace(go.Bar(x=spr_recent.index, y=spr_recent["WoW Change"],
-                                     marker_color=["#26a69a" if v >= 0 else "#ef5350" for v in spr_recent["WoW Change"].fillna(0)],
-                                     name="Weekly Change", opacity=0.6))
-        fig_spr_chg.add_trace(go.Scatter(x=spr_recent.index, y=spr_recent["4W MA"],
-                                         name="4W MA (Drawdown Rate)", line=dict(color="white", width=2)))
-        fig_spr_chg.add_hline(y=0, line_dash="dot", line_color="#555")
-        fig_spr_chg.update_layout(**base_layout("SPR Weekly Change + 4W Moving Average (Last 2Y)"))
-        fig_spr_chg.update_yaxes(title="Million Barrels")
-
-        render_two_col([
-            ("SPR Level", fig_spr, spr),
-            ("SPR Weekly Change", fig_spr_chg, spr_recent),
-        ])
-
-    st.markdown('<div class="section-header">Retail Prices & Refining Margins</div>', unsafe_allow_html=True)
-    with st.spinner("Loading retail fuel prices & crack spreads…"):
-        gas_retail = fetch("GASREGW", "Gasoline Retail", START, END)
-        diesel_retail = fetch("GASDESW", "Diesel Retail", START, END)
-        crack = get_crack_spreads(START, END)
-
-    fig_retail = go.Figure()
-    if not gas_retail.empty:
-        fig_retail.add_trace(go.Scatter(x=gas_retail.index, y=gas_retail["Gasoline Retail"],
-                                        name="Gasoline (Regular)", line=dict(color="#f5a24c")))
-    if not diesel_retail.empty:
-        fig_retail.add_trace(go.Scatter(x=diesel_retail.index, y=diesel_retail["Diesel Retail"],
-                                        name="Diesel", line=dict(color="#4c8bf5")))
-    fig_retail.update_layout(**base_layout("US Retail Gasoline & Diesel Prices ($/gal)"))
-    fig_retail.update_yaxes(title="$/gallon", tickprefix="$")
-    add_recessions(fig_retail, recessions)
-
-    fig_crack = go.Figure()
-    if not crack.empty:
-        fig_crack.add_trace(go.Scatter(x=crack.index, y=crack["3:2:1 Crack ($/bbl)"],
-                                       name="3:2:1 Crack", line=dict(color="#26a69a", width=2.5)))
-        fig_crack.add_trace(go.Scatter(x=crack.index, y=crack["Gasoline Crack ($/bbl)"],
-                                       name="Gasoline Crack", line=dict(color="#f5a24c", width=1.3)))
-        fig_crack.add_trace(go.Scatter(x=crack.index, y=crack["Heating Oil Crack ($/bbl)"],
-                                       name="Heating Oil/Diesel Crack", line=dict(color="#c85fd6", width=1.3)))
-    fig_crack.update_layout(**base_layout("Refining Crack Spreads ($/bbl)"))
-    fig_crack.update_yaxes(title="$/bbl", tickprefix="$")
-    add_recessions(fig_crack, recessions)
-
-    st.markdown('<div class="section-header">Supply & Refinery Capacity</div>', unsafe_allow_html=True)
-    with st.spinner("Loading crude inventories & refinery utilization…"):
-        crude_inv = get_crude_inventories()
-        refinery_util = get_refinery_utilization()
-
-    fig_crude_inv = go.Figure()
-    if not crude_inv.empty:
-        fig_crude_inv.add_trace(go.Scatter(x=crude_inv.index, y=crude_inv["Crude Stocks ex-SPR (Million Barrels)"],
-                                           name="Crude Stocks ex-SPR", line=dict(color="#ef5350"),
-                                           fill="tozeroy", fillcolor="rgba(239,83,80,0.10)"))
-    fig_crude_inv.update_layout(**base_layout("US Commercial Crude Inventories, ex-SPR (Weekly)"))
-    fig_crude_inv.update_yaxes(title="Million Barrels")
-    add_recessions(fig_crude_inv, recessions)
-
-    fig_refinery = go.Figure()
-    if not refinery_util.empty:
-        fig_refinery.add_trace(go.Scatter(x=refinery_util.index, y=refinery_util["Refinery Utilization (%)"],
-                                          name="Refinery Utilization", line=dict(color="#6bbf8f"),
-                                          fill="tozeroy", fillcolor="rgba(107,191,143,0.10)"))
-    fig_refinery.update_layout(**base_layout("Refinery Utilization Rate (% of Operable Capacity)"))
-    fig_refinery.update_yaxes(title="%", ticksuffix="%")
-    add_recessions(fig_refinery, recessions)
-
-    render_two_col([
-        ("US Retail Gas & Diesel", fig_retail, pd.concat([gas_retail, diesel_retail], axis=1)),
-        ("Crack Spreads", fig_crack, crack),
-        ("Crude Inventories ex-SPR", fig_crude_inv, crude_inv),
-        ("Refinery Utilization", fig_refinery, refinery_util),
-    ])
-
-# ════════════════════════════════════════════════════════════════════════════════
-# TAB 3 — Labour Market
-# ════════════════════════════════════════════════════════════════════════════════
-with tabs[2]:
-    st.header("Labour Market")
-    with st.spinner("Loading labour data…"):
-        adp_ids = {
-            "Construction":       "ADPWINDCONNERSA",
-            "Information":        "ADPWINDINFONERSA",
-            "Prof & Business":    "ADPWINDPROBUSNERSA",
-            "Leisure & Hosp":     "ADPWINDLSHPNERSA",
-            "Education & Health": "ADPWINDEDHLTNERSA",
-            "Trade & Transport":  "ADPWINDTTUNERSA",
-            "Financial":          "ADPWINDFINNERSA",
-        }
-        # 29 independent FRED series fetched concurrently instead of one at a time - this tab
-        # had the same "sequential dict-comprehension fetch" pattern as the Prices tab's CPI/PCE
-        # components, just spread across wages/NFP/LFPR/unemployment/demographics/claims/JOLTS/ADP.
-        _labor_jobs = (
-            [("CES0500000003", "Avg Hourly Earnings"), ("PAYEMS", "NFP"),
-             ("CIVPART", "Labour Force Participation Rate"), ("LNS11300060", "Prime-Age LFPR (25-54)"),
-             ("ICSA", "Initial Claims"),
-             ("JTSJOL", "Job Openings (k)"), ("JTSQUR", "Quits Rate"),
-             ("JTSLDR", "Layoffs Rate"), ("JTSHIR", "Hire Rate")]
-            + [("U1RATE","U1"), ("U2RATE","U2"), ("UNRATE","U3"),
-               ("U4RATE","U4"), ("U5RATE","U5"), ("U6RATE","U6"), ("CGBD25O","U7 BA+")]
-            + [("LNS14000003","Men 20+"), ("LNS14000002","Women 20+"),
-               ("LNS14000006","Teenagers"), ("LNS14000009","Black/AA"),
-               ("LNS14000012","Hispanic"), ("LNS14027662","White")]
-            + [(sid, name) for name, sid in adp_ids.items()]
-        )
-        _labor_raw = fetch_many([(sid, label, START, END) for sid, label in _labor_jobs])
-
-        wages   = mom_yoy(_labor_raw["Avg Hourly Earnings"], "Avg Hourly Earnings")
-        nfp     = nfp_change(_labor_raw["NFP"], "NFP")
-        lfpr    = _labor_raw["Labour Force Participation Rate"]
-        prime_lfpr = _labor_raw["Prime-Age LFPR (25-54)"]
-
-        unemp_data = pd.concat([_labor_raw[lbl] for lbl in ["U1","U2","U3","U4","U5","U6","U7 BA+"]], axis=1)
-
-        demo = pd.concat([_labor_raw[lbl] for lbl in
-                           ["Men 20+","Women 20+","Teenagers","Black/AA","Hispanic","White"]], axis=1)
-
-        claims = _labor_raw["Initial Claims"]
-        if not claims.empty and "Initial Claims" in claims.columns:
-            claims["4W MA"]  = claims["Initial Claims"].rolling(4).mean()
-            claims["12W MA"] = claims["Initial Claims"].rolling(12).mean()
-
-        # JOLTS
-        jolts_openings = _labor_raw["Job Openings (k)"]
-        jolts_quits    = _labor_raw["Quits Rate"]
-        jolts_layoffs  = _labor_raw["Layoffs Rate"]
-        jolts_hire     = _labor_raw["Hire Rate"]
-
-        # ADP sectors
-        adp_sectors = pd.concat([
-            nfp_change(_labor_raw[name], name)
-            for name in adp_ids.keys()
-        ], axis=1)
-
-
-    # Wages
-    fig_wages = go.Figure()
-    for col in wages.columns:
-        ax = "y2" if "MoM" in col else "y"
-        fig_wages.add_trace(go.Scatter(x=wages.index, y=wages[col], name=col, mode="lines", yaxis=ax))
-    fig_wages.update_layout(**dual_axis_layout("Avg Hourly Earnings", "YoY %", "MoM %"))
-    add_recessions(fig_wages, recessions)
-
-    # NFP bar + 12-month moving average trendline
-    fig_nfp = go.Figure()
-    colors_nfp = ["#26a69a" if v >= 0 else "#ef5350" for v in nfp["NFP MoM Change (k)"].fillna(0)]
-    fig_nfp.add_trace(go.Bar(x=nfp.index, y=nfp["NFP MoM Change (k)"],
-                             marker_color=colors_nfp, name="NFP MoM"))
-    nfp_12m_ma = nfp["NFP MoM Change (k)"].rolling(12).mean().round(1)
-    fig_nfp.add_trace(go.Scatter(x=nfp.index, y=nfp_12m_ma, name="12M MA",
-                                  mode="lines", line=dict(color="#ffb74d", width=2)))
-    fig_nfp.update_layout(**base_layout("Nonfarm Payrolls MoM Change (k)"))
-    add_recessions(fig_nfp, recessions)
-
-    # LFPR
-    fig_lfpr = go.Figure()
-    if not lfpr.empty:
-        fig_lfpr.add_trace(go.Scatter(x=lfpr.index, y=lfpr["Labour Force Participation Rate"],
-                                      name="Overall LFPR", line=dict(color="#90a4d4")))
-    if not prime_lfpr.empty:
-        fig_lfpr.add_trace(go.Scatter(x=prime_lfpr.index, y=prime_lfpr["Prime-Age LFPR (25-54)"],
-                                      name="Prime-Age (25-54)", line=dict(color="#26a69a")))
-    fig_lfpr.update_layout(**base_layout("Labour Force Participation Rate"))
-    add_recessions(fig_lfpr, recessions)
-
-    # Unemployment U1-U7
-    fig_unemp = go.Figure()
-    colors_u = ["#ef5350","#ff7043","#ff9800","#ffc107","#26a69a","#42a5f5","#ab47bc"]
-    for col, color in zip(unemp_data.columns, colors_u):
-        fig_unemp.add_trace(go.Scatter(x=unemp_data.index, y=unemp_data[col], name=col,
-                                        mode="lines", line=dict(color=color)))
-    fig_unemp.update_layout(**base_layout("Unemployment Rates U1–U7"))
-    add_recessions(fig_unemp, recessions)
-
-    # Demographics
-    fig_demo = go.Figure()
-    for col in demo.columns:
-        fig_demo.add_trace(go.Scatter(x=demo.index, y=demo[col], name=col, mode="lines"))
-    fig_demo.update_layout(**base_layout("Unemployment by Demographics"))
-    add_recessions(fig_demo, recessions)
-
-    # Jobless claims
-    fig_claims = go.Figure()
-    color_map = {"Initial Claims": "#90a4d4", "4W MA": "#26a69a", "12W MA": "#ff9800"}
-    for col in claims.columns:
-        if col in color_map:
-            fig_claims.add_trace(go.Scatter(
-                x=claims.index, y=claims[col], name=col, mode="lines",
-                line=dict(color=color_map[col], width=2 if "MA" in col else 1)))
-    fig_claims.update_layout(**base_layout("Initial Jobless Claims + Moving Averages"))
-    add_recessions(fig_claims, recessions)
-
-    # JOLTS
-    fig_jolts = make_subplots(rows=2, cols=2,
-                              subplot_titles=("Job Openings (k)", "Quits Rate", "Layoffs Rate", "Hire Rate"),
-                              shared_xaxes=False, vertical_spacing=0.12)
-    for (df_j, label, color), (row, col) in zip(
-        [(jolts_openings,"Job Openings (k)","#26a69a"),
-         (jolts_quits,   "Quits Rate",     "#ff9800"),
-         (jolts_layoffs, "Layoffs Rate",   "#ef5350"),
-         (jolts_hire,    "Hire Rate",      "#90a4d4")],
-        [(1,1),(1,2),(2,1),(2,2)]
-    ):
-        if not df_j.empty:
-            fig_jolts.add_trace(go.Scatter(x=df_j.index, y=df_j.iloc[:,0],
-                                           name=label, line=dict(color=color)), row=row, col=col)
-    fig_jolts.update_layout(template=TEMPLATE, paper_bgcolor=PAPER_BG, plot_bgcolor=PLOT_BG,
-                            height=520, margin=dict(l=10,r=10,t=50,b=30),
-                            showlegend=False)
-    fig_jolts.update_xaxes(gridcolor=GRID_COLOR)
-    fig_jolts.update_yaxes(gridcolor=GRID_COLOR)
-    add_recessions(fig_jolts, recessions, rows=[1,1,2,2], cols=[1,2,1,2])
-
-    # Beveridge curve
-    if not jolts_openings.empty and "U3" in unemp_data.columns:
-        merged_bev = pd.concat([
-            jolts_openings["Job Openings (k)"] / 1000,
-            unemp_data["U3"]
-        ], axis=1).dropna()
-        merged_bev.columns = ["openings_m", "unemployment"]
-        fig_bev = go.Figure()
-        fig_bev.add_trace(go.Scatter(
-            x=merged_bev["unemployment"], y=merged_bev["openings_m"],
-            mode="markers+lines",
-            marker=dict(
-                color=list(range(len(merged_bev))),
-                colorscale="Viridis", size=5, opacity=0.7,
-                colorbar=dict(title="Time →", len=0.5, thickness=10),
-            ),
-            line=dict(width=0.5, color="rgba(255,255,255,0.2)"),
-            text=merged_bev.index.strftime("%Y-%m"),
-            hovertemplate="Date: %{text}<br>Unemployment: %{x:.1f}%<br>Openings: %{y:.2f}M<extra></extra>",
-            name="Beveridge Curve",
-        ))
-        fig_bev.update_layout(**base_layout("Beveridge Curve (Openings vs Unemployment)"))
-        fig_bev.update_xaxes(title="Unemployment Rate (%)", gridcolor=GRID_COLOR)
-        fig_bev.update_yaxes(title="Job Openings (M)", gridcolor=GRID_COLOR)
-    else:
-        fig_bev = go.Figure()
-
-    # ADP sectors - stacked bar (no trendline)
-    fig_adp = go.Figure()
-    for col in adp_sectors.columns:
-        fig_adp.add_trace(go.Bar(x=adp_sectors.index, y=adp_sectors[col], name=col))
-    fig_adp.update_layout(**base_layout("ADP Employment by Sector (MoM, k)"))
-    fig_adp.update_layout(barmode="relative")
-    add_recessions(fig_adp, recessions)
-
-
-    labor_charts = [
-        ("Wages", fig_wages, wages),
-        ("NFP", fig_nfp, nfp),
-        ("LFPR", fig_lfpr, pd.concat([lfpr, prime_lfpr], axis=1)),
-        ("Unemployment U1-U7", fig_unemp, unemp_data),
-        ("Demographics", fig_demo, demo),
-        ("Initial Claims", fig_claims, claims),
-        ("JOLTS", fig_jolts, pd.concat([jolts_openings, jolts_quits, jolts_layoffs, jolts_hire], axis=1)),
-        ("Beveridge Curve", fig_bev, merged_bev if not jolts_openings.empty else None),
-        ("ADP Sectors", fig_adp, adp_sectors),
-    ]
-    render_two_col(labor_charts)
-
-# ════════════════════════════════════════════════════════════════════════════════
-# TAB 4 — Economic Activity
-# ════════════════════════════════════════════════════════════════════════════════
-with tabs[3]:
-    st.header("Economic Activity")
-    st.caption("GDP and the Atlanta Fed's real-time GDPNow estimate, each paired against the 30Y "
-               "Treasury yield as a full daily line (not snapped to the lower-frequency series' own "
-               "print dates, the way an earlier version of the GDP chart did) - plus the real ISM "
-               "Manufacturing/Services PMI (0-100 scale, scraped from ISM's own PR Newswire release "
-               "- see caption below) and the Chicago Fed's regional survey (a different, zero-centered "
-               "scale, not literally PMI).")
-    with st.spinner("Loading economic activity data…"):
-        real_gdp   = fetch("GDPC1", "Real GDP", START, END)
-        nom_gdp    = fetch("GDP", "Nominal GDP", START, END)
-        gdp_now    = fetch("GDPNOW", "GDPNow", START, END)
-        dgs30      = fetch("DGS30", "30Y Treasury", START, END)
-        ism_pmi    = fetch_ism_pmi()
-        chi_mfg    = fetch("CFSBCACTIVITYMFG", "Chicago Fed Mfg Activity", START, END)
-        chi_nonmfg = fetch("CFSBCACTIVITYNMFG", "Chicago Fed Services Activity", START, END)
-
-        real_gdp_yoy = (real_gdp["Real GDP"].pct_change(4) * 100).round(3).dropna() if not real_gdp.empty else pd.Series(dtype=float)
-        nom_gdp_yoy  = (nom_gdp["Nominal GDP"].pct_change(4) * 100).round(3).dropna() if not nom_gdp.empty else pd.Series(dtype=float)
-        dgs30_clip   = dgs30["30Y Treasury"].dropna() if not dgs30.empty else pd.Series(dtype=float)
-
-    # Real & Nominal GDP (YoY %) vs 30Y Treasury yield - GDP as grouped quarterly bars, yield as
-    # its own full daily line (previously snapped to GDP's own quarterly dates via merge_asof;
-    # now plotted at its native daily frequency) - both series share one % axis.
-    fig_gdp_30y = go.Figure()
-    fig_gdp_30y.add_trace(go.Bar(x=real_gdp_yoy.index, y=real_gdp_yoy.values, name="Real GDP YoY %", marker_color="#4c8bf5"))
-    fig_gdp_30y.add_trace(go.Bar(x=nom_gdp_yoy.index, y=nom_gdp_yoy.values, name="Nominal GDP YoY %", marker_color="#f5a24c"))
-    if not dgs30_clip.empty:
-        fig_gdp_30y.add_trace(go.Scatter(x=dgs30_clip.index, y=dgs30_clip.values, name="30Y Treasury Yield (Daily)",
-                                          mode="lines", line=dict(color="#c85fd6", width=1.5)))
-    fig_gdp_30y.update_layout(**base_layout("Real & Nominal GDP (YoY %) vs. 30Y Treasury Yield (Daily)"))
-    fig_gdp_30y.update_layout(barmode="group")
-    fig_gdp_30y.update_yaxes(ticksuffix="%")
-    add_recessions(fig_gdp_30y, recessions)
-
-    # Atlanta Fed GDPNow (current-quarter real-time nowcast) vs 30Y Treasury yield, daily. FRED's
-    # GDPNOW series only carries one snapshot per quarter (the live/most-recent nowcast for that
-    # quarter), not GDPNow's own full within-quarter daily revision path - so this bars-by-quarter
-    # treatment matches what's actually available, same caveat as GDP itself being quarterly.
-    fig_gdpnow_30y = go.Figure()
-    if not gdp_now.empty:
-        gdpnow_s = gdp_now["GDPNow"].dropna()
-        gdpnow_colors = ["#26a69a" if v >= 0 else "#ef5350" for v in gdpnow_s.values]
-        fig_gdpnow_30y.add_trace(go.Bar(x=gdpnow_s.index, y=gdpnow_s.values, name="GDPNow (SAAR %)", marker_color=gdpnow_colors))
-    if not dgs30_clip.empty:
-        fig_gdpnow_30y.add_trace(go.Scatter(x=dgs30_clip.index, y=dgs30_clip.values, name="30Y Treasury Yield (Daily)",
-                                             mode="lines", line=dict(color="#c85fd6", width=1.5)))
-    fig_gdpnow_30y.add_hline(y=0, line_dash="dot", line_color="#555")
-    fig_gdpnow_30y.update_layout(**base_layout("Atlanta Fed GDPNow (Current-Quarter Nowcast) vs. 30Y Treasury Yield (Daily)"))
-    fig_gdpnow_30y.update_yaxes(ticksuffix="%")
-    add_recessions(fig_gdpnow_30y, recessions)
-
-    # ISM Manufacturing & Services PMI - the real thing, 0-100 scale, 50 = breakeven. FRED no
-    # longer carries this (see fetch_ism_pmi's own comment for what was checked live), so this
-    # is scraped from ISM's own PR Newswire release listing - real ISM data, just limited to
-    # however many recent months that listing page still covers (~13 as of 2026-09-28).
-    fig_ism = go.Figure()
-    if not ism_pmi.empty:
-        if "ISM Manufacturing PMI" in ism_pmi.columns:
-            mfg_s = ism_pmi["ISM Manufacturing PMI"].dropna()
-            fig_ism.add_trace(go.Scatter(x=mfg_s.index, y=mfg_s.values, name="ISM Manufacturing PMI",
-                                          mode="lines+markers", line=dict(color="#42a5f5")))
-        if "ISM Services PMI" in ism_pmi.columns:
-            svc_s = ism_pmi["ISM Services PMI"].dropna()
-            fig_ism.add_trace(go.Scatter(x=svc_s.index, y=svc_s.values, name="ISM Services PMI",
-                                          mode="lines+markers", line=dict(color="#ff9800")))
-    fig_ism.add_hline(y=50, line_dash="dot", line_color="#555", annotation_text="50 = breakeven")
-    fig_ism.update_layout(**base_layout("ISM Manufacturing & Services PMI"))
-    fig_ism.update_yaxes(range=[35, 65])
-
-    # Chicago Fed Survey of Economic Conditions - manufacturing vs. nonmanufacturing (services)
-    # activity index for Federal Reserve District 7 (Chicago). Diffusion-index-style, zero-centered,
-    # same convention as CFNAI on the Indicators tab.
-    fig_chicago = go.Figure()
-    for df_c, chi_label, chi_color in [(chi_mfg, "Manufacturing", "#42a5f5"),
-                                        (chi_nonmfg, "Services (Nonmanufacturing)", "#ff9800")]:
-        if not df_c.empty:
-            fig_chicago.add_trace(go.Scatter(x=df_c.index, y=df_c.iloc[:, 0], name=chi_label, line=dict(color=chi_color)))
-    fig_chicago.add_hline(y=0, line_dash="dot", line_color="#555")
-    fig_chicago.update_layout(**base_layout("Chicago Fed Survey — Manufacturing vs. Services Activity Index"))
-    add_recessions(fig_chicago, recessions)
-
-    render_two_col([
-        ("GDP vs 30Y Treasury Yield", fig_gdp_30y, pd.DataFrame({
-            "Real GDP YoY %": real_gdp_yoy, "Nominal GDP YoY %": nom_gdp_yoy, "30Y Treasury Yield": dgs30_clip,
-        })),
-        ("GDPNow vs 30Y Treasury Yield", fig_gdpnow_30y, pd.concat([gdp_now, dgs30], axis=1)),
-        ("ISM Manufacturing & Services PMI", fig_ism, ism_pmi),
-        ("Chicago Fed Mfg vs Services", fig_chicago, pd.concat([chi_mfg, chi_nonmfg], axis=1)),
-    ])
-    st.caption("ISM PMI history above is limited to what's still parseable from ISM's own PR "
-               "Newswire release listing (prnewswire.com/news/institute-for-supply-management) - "
-               "real ISM data, not a substitute, but not a full multi-year back-history the way "
-               "FRED used to provide before ISM stopped feeding it for free.")
-
-# ════════════════════════════════════════════════════════════════════════════════
-# TAB 5 — Housing
-# ════════════════════════════════════════════════════════════════════════════════
-with tabs[4]:
-    st.header("Housing")
-    with st.spinner("Loading housing data…"):
-        home_sales  = fetch("EXHOSLUSM495S", "Existing Home Sales", START, END)
-        new_sales   = fetch("HSN1F",         "New Home Sales", START, END)
-        starts      = fetch("HOUST",         "Housing Starts", START, END)
-        permits     = fetch("PERMIT",        "Building Permits", START, END)
-        completions = fetch("COMPUTSA",      "Completions", START, END)
-        case_shiller = fetch("CSUSHPINSA",   "Case-Shiller HPI", START, END)
-
-        mort30      = fetch("MORTGAGE30US", "30Y Fixed Mortgage", START, END)
-        mort15      = fetch("MORTGAGE15US", "15Y Fixed Mortgage", START, END)
-        dgs30_h     = fetch("DGS30",        "30Y Treasury", START, END)
-        new_supply  = fetch("MSACSR",       "New Home Months Supply", START, END)
-        existing_supply = fetch("HOSSUPUSM673N", "Existing Home Months Supply", START, END)
-        median_price = fetch("MSPUS",       "Median New-Home Price", START, END)
-        homeownership = fetch("RHORUSQ156N", "Homeownership Rate", START, END)
-        affordability = fetch("FIXHAI",     "Housing Affordability Index", START, END)
-
-    # Existing vs New Home Sales
-    fig_sales = go.Figure()
-    if not home_sales.empty:
-        fig_sales.add_trace(go.Scatter(x=home_sales.index, y=home_sales["Existing Home Sales"],
-                                       name="Existing", line=dict(color="#26a69a")))
-    if not new_sales.empty:
-        fig_sales.add_trace(go.Scatter(x=new_sales.index, y=new_sales["New Home Sales"],
-                                       name="New", line=dict(color="#ff9800"), yaxis="y2"))
-    fig_sales.update_layout(**dual_axis_layout("Existing vs New Home Sales", "Existing (k)", "New (k)"))
-    add_recessions(fig_sales, recessions)
-
-    # Starts vs Permits vs Completions - full construction pipeline; a widening
-    # permits-to-completions gap signals a building backlog before it shows up elsewhere.
-    fig_starts = go.Figure()
-    if not starts.empty:
-        fig_starts.add_trace(go.Scatter(x=starts.index, y=starts["Housing Starts"],
-                                        name="Starts", line=dict(color="#42a5f5")))
-    if not permits.empty:
-        fig_starts.add_trace(go.Scatter(x=permits.index, y=permits["Building Permits"],
-                                        name="Permits", line=dict(color="#ab47bc")))
-    if not completions.empty:
-        fig_starts.add_trace(go.Scatter(x=completions.index, y=completions["Completions"],
-                                        name="Completions", line=dict(color="#26a69a")))
-    fig_starts.update_layout(**base_layout("Housing Starts, Permits & Completions"))
-    add_recessions(fig_starts, recessions)
-
-    # Case-Shiller
-    cs_mom = mom_yoy(case_shiller, "Case-Shiller HPI") if not case_shiller.empty else pd.DataFrame()
-    fig_cs = go.Figure()
-    if not cs_mom.empty:
-        for col in cs_mom.columns:
-            ax = "y2" if "MoM" in col else "y"
-            fig_cs.add_trace(go.Scatter(x=cs_mom.index, y=cs_mom[col], name=col, mode="lines", yaxis=ax))
-    fig_cs.update_layout(**dual_axis_layout("Case-Shiller Home Price Index", "YoY %", "MoM %"))
-    add_recessions(fig_cs, recessions)
-
-    # 30Y vs 15Y fixed mortgage rate
-    fig_mortgage = go.Figure()
-    if not mort30.empty:
-        fig_mortgage.add_trace(go.Scatter(x=mort30.index, y=mort30["30Y Fixed Mortgage"],
-                                          name="30Y Fixed", line=dict(color="#42a5f5")))
-    if not mort15.empty:
-        fig_mortgage.add_trace(go.Scatter(x=mort15.index, y=mort15["15Y Fixed Mortgage"],
-                                          name="15Y Fixed", line=dict(color="#8a94a6")))
-    fig_mortgage.update_layout(**base_layout("30Y vs 15Y Fixed Mortgage Rate"))
-    fig_mortgage.update_yaxes(ticksuffix="%")
-    add_recessions(fig_mortgage, recessions)
-
-    # Mortgage-Treasury spread - the standard MBS-market-stress read (30Y mortgage over
-    # 30Y Treasury, matching maturities). Peaked well above its historical norm during the
-    # 2022-23 stress episode and has been normalizing since.
-    mort_spread = pd.DataFrame()
-    if not mort30.empty and not dgs30_h.empty:
-        spread_df = pd.concat([mort30, dgs30_h], axis=1).ffill().dropna()
-        mort_spread = pd.DataFrame(index=spread_df.index)
-        mort_spread["Mortgage-Treasury Spread (bps)"] = (
-            spread_df["30Y Fixed Mortgage"] - spread_df["30Y Treasury"]) * 100
-    fig_mort_spread = go.Figure()
-    if not mort_spread.empty:
-        fig_mort_spread.add_trace(go.Scatter(x=mort_spread.index, y=mort_spread["Mortgage-Treasury Spread (bps)"],
-                                             name="Spread", line=dict(color="#e08b4f"), fill="tozeroy",
-                                             fillcolor="rgba(224,139,79,0.15)"))
-    fig_mort_spread.update_layout(**base_layout("Mortgage — 30Y Treasury Spread"))
-    fig_mort_spread.update_yaxes(ticksuffix=" bps")
-    add_recessions(fig_mort_spread, recessions)
-
-    # New home months' supply
-    fig_new_supply = go.Figure()
-    if not new_supply.empty:
-        fig_new_supply.add_trace(go.Scatter(x=new_supply.index, y=new_supply["New Home Months Supply"],
-                                            name="Months Supply", line=dict(color="#e08b4f"), fill="tozeroy",
-                                            fillcolor="rgba(224,139,79,0.15)"))
-    fig_new_supply.update_layout(**base_layout("New Home Months' Supply"))
-    add_recessions(fig_new_supply, recessions)
-
-    # Existing home months' supply - NAR restricted data redistribution in 2023-24, so FRED
-    # restarted this series from scratch; only a short window of history is available.
-    fig_existing_supply = go.Figure()
-    if not existing_supply.empty:
-        fig_existing_supply.add_trace(go.Scatter(x=existing_supply.index, y=existing_supply["Existing Home Months Supply"],
-                                                  name="Months Supply", line=dict(color="#26a69a"), fill="tozeroy",
-                                                  fillcolor="rgba(38,166,154,0.15)"))
-    fig_existing_supply.update_layout(**base_layout("Existing Home Months' Supply"))
-
-    # Median new-home price vs Case-Shiller - two panels, not one dual-axis chart: different
-    # units and scales. Case-Shiller says how much prices moved (%); this says what a home
-    # actually costs ($).
-    fig_price = make_subplots(rows=2, cols=1, shared_xaxes=True,
-                              subplot_titles=("Median New-Home Price ($)", "Case-Shiller Index"),
-                              vertical_spacing=0.12)
-    if not median_price.empty:
-        fig_price.add_trace(go.Scatter(x=median_price.index, y=median_price["Median New-Home Price"],
-                                       name="Median Price", line=dict(color="#e08b4f")), row=1, col=1)
-    if not case_shiller.empty:
-        fig_price.add_trace(go.Scatter(x=case_shiller.index, y=case_shiller["Case-Shiller HPI"],
-                                       name="Case-Shiller", line=dict(color="#8a94a6")), row=2, col=1)
-    fig_price.update_layout(template=TEMPLATE, paper_bgcolor=PAPER_BG, plot_bgcolor=PLOT_BG,
-                            height=500, margin=dict(l=10,r=10,t=45,b=30), showlegend=False)
-    fig_price.update_xaxes(gridcolor=GRID_COLOR)
-    fig_price.update_yaxes(gridcolor=GRID_COLOR)
-    add_recessions(fig_price, recessions, rows=[1,2], cols=[1,1])
-
-    # Homeownership rate - slow-moving structural context, not a series people watch move
-    # month to month.
-    fig_homeownership = go.Figure()
-    if not homeownership.empty:
-        fig_homeownership.add_trace(go.Scatter(x=homeownership.index, y=homeownership["Homeownership Rate"],
-                                                name="Homeownership Rate", line=dict(color="#90a4d4")))
-    fig_homeownership.update_layout(**base_layout("Homeownership Rate"))
-    fig_homeownership.update_yaxes(ticksuffix="%")
-    add_recessions(fig_homeownership, recessions)
-
-    # Housing affordability index - same NAR restart issue as existing-home supply; short
-    # history, useful as a current reading (100 = median family exactly qualifies for the
-    # median-priced home) more than a trend.
-    fig_afford = go.Figure()
-    if not affordability.empty:
-        fig_afford.add_trace(go.Scatter(x=affordability.index, y=affordability["Housing Affordability Index"],
-                                        name="Affordability Index", line=dict(color="#ab47bc")))
-    fig_afford.add_hline(y=100, line_dash="dot", line_color="#555",
-                          annotation_text="100 = median family qualifies")
-    fig_afford.update_layout(**base_layout("Housing Affordability Index"))
-
-    housing_charts = [
-        ("Home Sales", fig_sales, pd.concat([home_sales, new_sales], axis=1)),
-        ("Starts, Permits & Completions", fig_starts, pd.concat([starts, permits, completions], axis=1)),
-        ("Case-Shiller HPI", fig_cs, cs_mom),
-        ("30Y vs 15Y Mortgage Rate", fig_mortgage, pd.concat([mort30, mort15], axis=1)),
-        ("Mortgage-Treasury Spread", fig_mort_spread, mort_spread),
-        ("New Home Months Supply", fig_new_supply, new_supply),
-        ("Existing Home Months Supply", fig_existing_supply, existing_supply),
-        ("Median Price vs Case-Shiller", fig_price, pd.concat([median_price, case_shiller], axis=1)),
-        ("Homeownership Rate", fig_homeownership, homeownership),
-        ("Housing Affordability Index", fig_afford, affordability),
-    ]
-    render_two_col(housing_charts)
-    st.caption("Existing Home Months' Supply and the Housing Affordability Index both restart in "
-               "2025 - NAR restricted redistribution of this data in 2023-24, and FRED rebuilt these "
-               "series from scratch once a new agreement was reached. The same gap affects the "
-               "Existing Home Sales series above, which also only carries recent history.")
-
-# ════════════════════════════════════════════════════════════════════════════════
-# TAB 6 — Monetary & Rates
-# ════════════════════════════════════════════════════════════════════════════════
-with tabs[5]:
     st.header("Monetary Policy & Rates")
     with st.spinner("Loading monetary data…"):
         maturities = {
@@ -2804,6 +1909,901 @@ with tabs[5]:
     ]
     render_two_col(treasury_charts)
 
+
+# ════════════════════════════════════════════════════════════════════════════════
+# TAB 2 — Inflation & Consumer
+# ════════════════════════════════════════════════════════════════════════════════
+with tabs[1]:
+    st.header("Inflation & Consumer")
+    with st.spinner("Loading inflation data…"):
+        cpi      = mom_yoy(fetch("CPIAUCSL", "CPI", START, END), "CPI")
+        core_cpi = mom_yoy(fetch("CPILFESL", "Core CPI", START, END), "Core CPI")
+        pce      = mom_yoy(fetch("PCEPI", "PCE", START, END), "PCE")
+        core_pce = mom_yoy(fetch("PCEPILFE", "Core PCE", START, END), "Core PCE")
+        ppi      = mom_yoy(fetch("PPIACO", "PPI", START, END), "PPI")
+        rsa      = mom_yoy(fetch("RSAFS", "Retail Sales", START, END), "Retail Sales")
+        exp_pi   = mom_yoy(fetch("IQ", "Export Price Index", START, END), "Export Price Index")
+        imp_pi   = mom_yoy(fetch("IR", "Import Price Index", START, END), "Import Price Index")
+        be_5y    = fetch("T5YIE",  "5Y Breakeven", START, END)
+        be_10y   = fetch("T10YIE", "10Y Breakeven", START, END)
+        umich    = fetch("UMCSENT", "UMich Sentiment", START, END)
+        inf_exp1 = fetch("MICH", "1Y Inf Expectation", START, END)
+        inf_exp5 = fetch("EXPINF5YR", "5Y Inf Expectation", START, END)
+
+        # CPI components - the standard BLS major expenditure groups (SA), each verified
+        # live against FRED. Not exhaustive (BLS publishes finer subcomponents too), but this
+        # is the standard "CPI component breakdown" level of granularity.
+        CPI_COMPONENTS = [
+            ("Food",                       "CPIUFDSL"),
+            ("Energy",                     "CPIENGSL"),
+            ("Shelter",                    "CUSR0000SAH1"),
+            ("Apparel",                    "CPIAPPSL"),
+            ("Transportation",             "CPITRNSL"),
+            ("Medical Care",               "CPIMEDSL"),
+            ("Recreation",                 "CPIRECSL"),
+            ("Education & Communication",  "CPIEDUSL"),
+            ("Other Goods & Services",     "CPIOGSSL"),
+        ]
+        cpi_raw = fetch_many([(sid, label, START, END) for label, sid in CPI_COMPONENTS])
+        cpi_components = {label: mom_yoy(cpi_raw[label], label) for label, sid in CPI_COMPONENTS}
+
+        # PCE components - a genuinely non-overlapping partition of PCE (BEA NIPA Table 2.4.5,
+        # "Personal Consumption Expenditures by Type of Product" - verified live via FRED's
+        # release/tables API, not guessed). The previous 7-category set mixed a clean
+        # Goods/Durable/Nondurable/Services split with cross-cutting memo categories (Food,
+        # Energy, Services-Excl-Energy&Housing) that overlapped both the clean split and each
+        # other, so weights never summed to 100% and nothing here was meant to be added up -
+        # confusing without a caption explaining it. This 16-category set IS BEA's actual leaf
+        # level of the Goods/Services tree, so every dollar of PCE falls into exactly one row.
+        # Only available quarterly at BEA/FRED (confirmed - no monthly series at this
+        # granularity exists), so this section runs at quarterly cadence unlike the rest of
+        # the Prices tab.
+        PCE_COMPONENTS = [
+            ("Motor Vehicles & Parts",             "DMOT"),
+            ("Furnishings & Durable HH Equipment",  "DFDH"),
+            ("Recreational Goods & Vehicles",       "DREQ"),
+            ("Other Durable Goods",                 "DODG"),
+            ("Food & Beverages (Off-Premises)",     "DFXA"),
+            ("Clothing & Footwear",                 "DCLO"),
+            ("Gasoline & Other Energy Goods",       "DGOE"),
+            ("Other Nondurable Goods",              "DONG"),
+            ("Housing & Utilities",                 "DHUT"),
+            ("Health Care",                         "DHLC"),
+            ("Transportation Services",             "DTRS"),
+            ("Recreation Services",                 "DRCA"),
+            ("Food Services & Accommodations",      "DFSA"),
+            ("Financial Services & Insurance",       "DIFS"),
+            ("Other Services",                      "DOTS"),
+            ("Nonprofit Institutions (NPISH)",      "DNPI"),
+        ]
+
+        def qoq_yoy(df: pd.DataFrame, col: str) -> pd.DataFrame:
+            if df.empty or col not in df.columns:
+                return pd.DataFrame(columns=[f"{col} QoQ %", f"{col} YoY %"])
+            out = pd.DataFrame(index=df.index)
+            out[f"{col} QoQ %"] = (df[col].pct_change() * 100).round(3)
+            out[f"{col} YoY %"] = (df[col].pct_change(4) * 100).round(3)
+            return out
+
+        pce_raw_qoq = fetch_many([(f"{root}RG3Q086SBEA", label, START, END) for label, root in PCE_COMPONENTS])
+        pce_components = {label: qoq_yoy(pce_raw_qoq[label], label) for label, root in PCE_COMPONENTS}
+
+        # Weights - nominal-dollar expenditure shares. Since these 16 categories are a complete
+        # partition by construction, the total is just their own sum - no separate "PCE Total"
+        # series needed, and weights always sum to exactly 100%.
+        pce_raw_wt = fetch_many([(f"{root}RC1Q027SBEA", f"{label} $", START, END) for label, root in PCE_COMPONENTS])
+        pce_levels = {}
+        for label, root in PCE_COMPONENTS:
+            df_w = pce_raw_wt[f"{label} $"]
+            if not df_w.empty:
+                pce_levels[label] = df_w[f"{label} $"].dropna().iloc[-1]
+        pce_total = sum(pce_levels.values())
+        pce_weights = {label: val / pce_total * 100 for label, val in pce_levels.items()} if pce_total else {}
+
+        # Monthly "parent" categories - Durable Goods, Nondurable Goods, and Services DO update
+        # monthly (mom_yoy(), same cadence as the rest of the tab), unlike the 16 quarterly-only
+        # children above. Shown as header rows with their matching children nested underneath,
+        # so the chart gets a fresh top-level number every month even though the granular detail
+        # only refreshes once a quarter.
+        PCE_PARENTS = [
+            ("Durable Goods",    "DDURRG3M086SBEA", "PCEDG"),
+            ("Nondurable Goods", "DNDGRG3M086SBEA", "PCEND"),
+            ("Services",         "DSERRG3M086SBEA", "PCES"),
+        ]
+        PCE_PARENT_CHILDREN = {
+            "Durable Goods": ["Motor Vehicles & Parts", "Furnishings & Durable HH Equipment",
+                              "Recreational Goods & Vehicles", "Other Durable Goods"],
+            "Nondurable Goods": ["Food & Beverages (Off-Premises)", "Clothing & Footwear",
+                                 "Gasoline & Other Energy Goods", "Other Nondurable Goods"],
+            "Services": ["Housing & Utilities", "Health Care", "Transportation Services",
+                         "Recreation Services", "Food Services & Accommodations",
+                         "Financial Services & Insurance", "Other Services",
+                         "Nonprofit Institutions (NPISH)"],
+        }
+        pce_parent_data = {label: mom_yoy(fetch(pid, label, START, END), label) for label, pid, _ in PCE_PARENTS}
+        pce_total_monthly_df = fetch("PCE", "PCE Total (Monthly)", START, END)
+        pce_parent_weights = {}
+        if not pce_total_monthly_df.empty:
+            pce_total_monthly = pce_total_monthly_df["PCE Total (Monthly)"].dropna().iloc[-1]
+            for label, _, wid in PCE_PARENTS:
+                df_pw = fetch(wid, f"{label} $ (Monthly)", START, END)
+                if not df_pw.empty:
+                    pce_parent_weights[label] = df_pw[f"{label} $ (Monthly)"].dropna().iloc[-1] / pce_total_monthly * 100
+
+    # CPI vs Core CPI
+    fig_cpi = go.Figure()
+    for col, color in [("CPI YoY %","#ef5350"),("Core CPI YoY %","#ff9800"),
+                       ("CPI MoM %","#ef535055"),("Core CPI MoM %","#ff980055")]:
+        src = pd.concat([cpi, core_cpi], axis=1)
+        if col not in src.columns: continue
+        ax = "y2" if "MoM" in col else "y"
+        fig_cpi.add_trace(go.Scatter(x=src.index, y=src[col], name=col, mode="lines",
+                                     yaxis=ax, line=dict(width=1.5 if "YoY" in col else 1, dash="solid" if "YoY" in col else "dot")))
+        if col == "CPI YoY %":
+            add_rolling_mean_trace(fig_cpi, src[col], 6, "CPI YoY 6M MA", "#8a94a6")
+        elif col == "Core CPI YoY %":
+            add_rolling_mean_trace(fig_cpi, src[col], 6, "Core CPI YoY 6M MA", "#4fc3f7")
+    fig_cpi.update_layout(**dual_axis_layout("CPI vs Core CPI", "YoY %", "MoM %"))
+    add_recessions(fig_cpi, recessions)
+
+    # PCE vs Core PCE
+    fig_pce = go.Figure()
+    for col, color in [("PCE YoY %","#26a69a"),("Core PCE YoY %","#80cbc4"),
+                       ("PCE MoM %","#26a69a55"),("Core PCE MoM %","#80cbc455")]:
+        src = pd.concat([pce, core_pce], axis=1)
+        if col not in src.columns: continue
+        ax = "y2" if "MoM" in col else "y"
+        fig_pce.add_trace(go.Scatter(x=src.index, y=src[col], name=col, mode="lines",
+                                     yaxis=ax, line=dict(width=1.5 if "YoY" in col else 1, dash="solid" if "YoY" in col else "dot")))
+        if col == "PCE YoY %":
+            add_rolling_mean_trace(fig_pce, src[col], 6, "PCE YoY 6M MA", "#8a94a6")
+        elif col == "Core PCE YoY %":
+            add_rolling_mean_trace(fig_pce, src[col], 6, "Core PCE YoY 6M MA", "#4fc3f7")
+    fig_pce.update_layout(**dual_axis_layout("PCE vs Core PCE (Fed's Preferred)", "YoY %", "MoM %"))
+    add_recessions(fig_pce, recessions)
+
+    # PPI
+    fig_ppi = go.Figure()
+    for col in ppi.columns:
+        ax = "y2" if "MoM" in col else "y"
+        fig_ppi.add_trace(go.Scatter(x=ppi.index, y=ppi[col], name=col, mode="lines", yaxis=ax))
+    fig_ppi.update_layout(**dual_axis_layout("PPI (MoM & YoY)", "YoY %", "MoM %"))
+    add_recessions(fig_ppi, recessions)
+
+    # Retail Sales
+    fig_rsa = go.Figure()
+    for col in rsa.columns:
+        ax = "y2" if "MoM" in col else "y"
+        fig_rsa.add_trace(go.Scatter(x=rsa.index, y=rsa[col], name=col, mode="lines", yaxis=ax))
+    fig_rsa.update_layout(**dual_axis_layout("Retail Sales (MoM & YoY)", "YoY %", "MoM %"))
+    add_recessions(fig_rsa, recessions)
+
+    # Breakeven inflation
+    fig_be = go.Figure()
+    if not be_5y.empty:
+        fig_be.add_trace(go.Scatter(x=be_5y.index, y=be_5y["5Y Breakeven"], name="5Y Breakeven", line=dict(color="#26a69a")))
+    if not be_10y.empty:
+        fig_be.add_trace(go.Scatter(x=be_10y.index, y=be_10y["10Y Breakeven"], name="10Y Breakeven", line=dict(color="#ff9800")))
+    fig_be.update_layout(**base_layout("Inflation Expectations (TIPS Breakevens)"))
+    add_recessions(fig_be, recessions)
+
+    # UMich Sentiment + Inflation Expectations
+    fig_umich = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                              subplot_titles=("Consumer Sentiment", "Inflation Expectations"),
+                              vertical_spacing=0.1)
+    if not umich.empty:
+        fig_umich.add_trace(go.Scatter(x=umich.index, y=umich["UMich Sentiment"],
+                                       name="UMich Sentiment", line=dict(color="#90a4d4")), row=1, col=1)
+    if not inf_exp1.empty:
+        fig_umich.add_trace(go.Scatter(x=inf_exp1.index, y=inf_exp1["1Y Inf Expectation"],
+                                       name="1Y Inf Exp", line=dict(color="#ef5350")), row=2, col=1)
+    if not inf_exp5.empty:
+        fig_umich.add_trace(go.Scatter(x=inf_exp5.index, y=inf_exp5["5Y Inf Expectation"],
+                                       name="5Y Inf Exp", line=dict(color="#ff9800")), row=2, col=1)
+    fig_umich.update_layout(template=TEMPLATE, paper_bgcolor=PAPER_BG, plot_bgcolor=PLOT_BG,
+                            height=500, margin=dict(l=10,r=10,t=45,b=30),
+                            legend=dict(orientation="h", y=-0.15, x=0.5, xanchor="center"))
+    fig_umich.update_xaxes(gridcolor=GRID_COLOR)
+    fig_umich.update_yaxes(gridcolor=GRID_COLOR)
+    add_recessions(fig_umich, recessions, rows=[1,1,2,2], cols=[1,1,1,1])
+
+    # Export/Import Prices
+    fig_pi = go.Figure()
+    for col in pd.concat([exp_pi, imp_pi], axis=1).columns:
+        src = pd.concat([exp_pi, imp_pi], axis=1)
+        ax  = "y2" if "MoM" in col else "y"
+        fig_pi.add_trace(go.Scatter(x=src.index, y=src[col], name=col, mode="lines", yaxis=ax))
+    fig_pi.update_layout(**dual_axis_layout("Export & Import Price Indices", "YoY %", "MoM %"))
+    add_recessions(fig_pi, recessions)
+
+    # CPI components - YoY % history (all 9 groups) + latest MoM/YoY snapshot
+    fig_cpi_comp_hist = go.Figure()
+    for label, _ in CPI_COMPONENTS:
+        df_c = cpi_components[label]
+        col = f"{label} YoY %"
+        if not df_c.empty and col in df_c.columns:
+            fig_cpi_comp_hist.add_trace(go.Scatter(x=df_c.index, y=df_c[col], name=label, mode="lines"))
+    fig_cpi_comp_hist.update_layout(**base_layout("CPI Components — YoY %"))
+    fig_cpi_comp_hist.update_yaxes(ticksuffix="%")
+    add_recessions(fig_cpi_comp_hist, recessions)
+
+    comp_rows = []
+    for label, _ in CPI_COMPONENTS:
+        df_c = cpi_components[label]
+        mom_col, yoy_col = f"{label} MoM %", f"{label} YoY %"
+        if df_c.empty or mom_col not in df_c.columns:
+            continue
+        mom_s, yoy_s = df_c[mom_col].dropna(), df_c[yoy_col].dropna()
+        if mom_s.empty or yoy_s.empty:
+            continue
+        comp_rows.append({"Component": label, "MoM %": mom_s.iloc[-1], "YoY %": yoy_s.iloc[-1], "As Of": df_c.index[-1]})
+    comp_df = pd.DataFrame(comp_rows).sort_values("YoY %", ascending=True)
+    comp_latest_date = comp_df["As Of"].max().strftime("%b %Y") if not comp_df.empty else ""
+    comp_df = comp_df.drop(columns="As Of")
+
+    fig_cpi_comp_snap = go.Figure()
+    fig_cpi_comp_snap.add_trace(go.Bar(y=comp_df["Component"], x=comp_df["YoY %"], name="YoY %",
+                                        orientation="h", marker_color="#ef5350"))
+    fig_cpi_comp_snap.add_trace(go.Bar(y=comp_df["Component"], x=comp_df["MoM %"], name="MoM %",
+                                        orientation="h", marker_color="#ff9800"))
+    fig_cpi_comp_snap.update_layout(**base_layout(f"CPI Components — Latest MoM & YoY % ({comp_latest_date})", height=420))
+    fig_cpi_comp_snap.update_layout(barmode="group")
+    fig_cpi_comp_snap.update_xaxes(ticksuffix="%")
+
+    # PCE components - YoY % history (16 non-overlapping groups) + latest QoQ/YoY snapshot.
+    # Quarterly cadence (see PCE_COMPONENTS comment above), unlike CPI's monthly history.
+    fig_pce_comp_hist = go.Figure()
+    for label, _ in PCE_COMPONENTS:
+        df_c = pce_components[label]
+        col = f"{label} YoY %"
+        if not df_c.empty and col in df_c.columns:
+            fig_pce_comp_hist.add_trace(go.Scatter(x=df_c.index, y=df_c[col], name=label, mode="lines"))
+    fig_pce_comp_hist.update_layout(**base_layout("PCE Components — YoY % (Quarterly)"))
+    fig_pce_comp_hist.update_yaxes(ticksuffix="%")
+    add_recessions(fig_pce_comp_hist, recessions)
+
+    # Grouped snapshot: each monthly parent (Durable Goods / Nondurable Goods / Services) as a
+    # header row, its non-overlapping quarterly children nested underneath - gives a fresh
+    # top-level number every month even though the granular detail only refreshes quarterly.
+    # Parent rows use YoY/MoM, child rows use YoY/QoQ; row order is fixed (not sorted by value)
+    # so the grouping stays intact, and colors are darker for parents, lighter for children.
+    pce_comp_rows = []
+    for p_label, _, _ in PCE_PARENTS:
+        df_p = pce_parent_data[p_label]
+        mom_col, pyoy_col = f"{p_label} MoM %", f"{p_label} YoY %"
+        if not df_p.empty and mom_col in df_p.columns:
+            mom_s, pyoy_s = df_p[mom_col].dropna(), df_p[pyoy_col].dropna()
+            if not mom_s.empty and not pyoy_s.empty:
+                pweight = pce_parent_weights.get(p_label)
+                row_label = f"{p_label.upper()} ({pweight:.1f}%)" if pweight is not None else p_label.upper()
+                pce_comp_rows.append({"Component": row_label, "YoY %": pyoy_s.iloc[-1],
+                                       "Period %": mom_s.iloc[-1], "is_parent": True, "As Of": df_p.index[-1]})
+        for child in PCE_PARENT_CHILDREN[p_label]:
+            df_c = pce_components.get(child)
+            qoq_col, cyoy_col = f"{child} QoQ %", f"{child} YoY %"
+            if df_c is None or df_c.empty or qoq_col not in df_c.columns:
+                continue
+            qoq_s, cyoy_s = df_c[qoq_col].dropna(), df_c[cyoy_col].dropna()
+            if qoq_s.empty or cyoy_s.empty:
+                continue
+            cweight = pce_weights.get(child)
+            row_label = f"     {child} ({cweight:.1f}%)" if cweight is not None else f"     {child}"
+            pce_comp_rows.append({"Component": row_label, "YoY %": cyoy_s.iloc[-1],
+                                   "Period %": qoq_s.iloc[-1], "is_parent": False, "As Of": df_c.index[-1]})
+
+    pce_comp_df = pd.DataFrame(pce_comp_rows)
+    pce_comp_latest_date = pce_comp_df["As Of"].max().strftime("%b %Y") if not pce_comp_df.empty else ""
+    pce_comp_df = pce_comp_df.drop(columns="As Of").iloc[::-1]  # reverse so parents render top-to-bottom
+
+    yoy_colors = ["#1f8f6b" if p else "#26a69a" for p in pce_comp_df["is_parent"]]
+    period_colors = ["#3568c9" if p else "#80cbc4" for p in pce_comp_df["is_parent"]]
+
+    fig_pce_comp_snap = go.Figure()
+    fig_pce_comp_snap.add_trace(go.Bar(y=pce_comp_df["Component"], x=pce_comp_df["YoY %"], name="YoY %",
+                                        orientation="h", marker_color=yoy_colors))
+    fig_pce_comp_snap.add_trace(go.Bar(y=pce_comp_df["Component"], x=pce_comp_df["Period %"],
+                                        name="MoM % (parents) / QoQ % (children)",
+                                        orientation="h", marker_color=period_colors))
+    fig_pce_comp_snap.update_layout(**base_layout(f"PCE Components — Monthly Parents + Quarterly Detail ({pce_comp_latest_date})", height=680))
+    fig_pce_comp_snap.update_layout(barmode="group")
+    fig_pce_comp_snap.update_xaxes(ticksuffix="%")
+    fig_pce_comp_snap.update_yaxes(tickfont=dict(size=10))
+
+    inflation_charts = [
+        ("CPI vs Core CPI", fig_cpi, pd.concat([cpi, core_cpi], axis=1)),
+        ("PCE vs Core PCE", fig_pce, pd.concat([pce, core_pce], axis=1)),
+        ("PPI", fig_ppi, ppi),
+        ("Retail Sales", fig_rsa, rsa),
+        ("TIPS Breakevens", fig_be, pd.concat([be_5y, be_10y], axis=1)),
+        ("UMich & Inflation Expectations", fig_umich, pd.concat([umich, inf_exp1, inf_exp5], axis=1)),
+        ("Export & Import Prices", fig_pi, pd.concat([exp_pi, imp_pi], axis=1)),
+        ("CPI Components History", fig_cpi_comp_hist, pd.concat([cpi_components[l] for l, _ in CPI_COMPONENTS], axis=1)),
+        ("CPI Components Snapshot", fig_cpi_comp_snap, comp_df),
+        ("PCE Components History", fig_pce_comp_hist, pd.concat([pce_components[l] for l, _ in PCE_COMPONENTS], axis=1)),
+        ("PCE Components Snapshot", fig_pce_comp_snap, pce_comp_df),
+    ]
+    render_two_col(inflation_charts)
+
+# ════════════════════════════════════════════════════════════════════════════════
+# TAB 3 — Oil & Gas
+# ════════════════════════════════════════════════════════════════════════════════
+with tabs[2]:
+    st.header("Oil & Gas")
+    st.caption("Strategic Petroleum Reserve - EIA (api.eia.gov), not FRED. A different data domain "
+               "from the rest of this dashboard.")
+
+    with st.spinner("Loading SPR data…"):
+        spr = get_spr_level()
+
+    if spr.empty:
+        st.info("SPR data unavailable this run.")
+    else:
+        latest_level = spr["SPR (Million Barrels)"].iloc[-1]
+        ath = spr["SPR (Million Barrels)"].max()
+        ath_date = spr["SPR (Million Barrels)"].idxmax()
+        pct_of_ath = latest_level / ath * 100
+        proj = estimate_time_to_floor(spr["SPR (Million Barrels)"], SPR_SECDEF_FLOOR, freq="weekly")
+
+        m1, m2, m3, m4 = st.columns(4)
+        with m1:
+            st.metric("Latest SPR Level", f"{latest_level:,.1f}M bbls", help=f"As of {spr.index[-1].strftime('%b %d, %Y')}")
+        with m2:
+            st.metric("All-Time High", f"{ath:,.1f}M bbls", help=f"{ath_date.strftime('%b %Y')}")
+        with m3:
+            st.metric("% of All-Time High", f"{pct_of_ath:.1f}%")
+        with m4:
+            if proj["periods_to_floor"] is not None:
+                weeks = proj["periods_to_floor"]
+                st.metric("Est. Time to SecDef Floor", f"{weeks:,.0f} weeks",
+                         delta=f"~{proj['eta_date'].strftime('%b %Y')}", delta_color="off",
+                         help=f"Floor: {SPR_SECDEF_FLOOR:.1f}M bbls (42 USC 6241(h), the non-emergency "
+                              f"drawdown minimum requiring Secretary of Defense sign-off). Drawdown rate: "
+                              f"4-week moving average of the weekly change, currently {proj['rate_per_period']:+.2f}M bbls/week.")
+            else:
+                st.metric("Est. Time to SecDef Floor", "N/A",
+                         help="Not currently drawing down (4-week average weekly change is flat or positive), "
+                              "so time-to-floor is undefined.")
+
+        st.caption(f"**SecDef-authorized floor: {SPR_SECDEF_FLOOR:.1f}M bbls** — the statutory minimum for the "
+                   f"SPR's non-emergency drawdown authority (42 U.S.C. § 6241(h)); a drawdown under this "
+                   f"specific authority requires the Secretary of Defense to confirm it \"will not impair "
+                   f"national security.\" This does not apply to the President's separate emergency-drawdown "
+                   f"authority, which has no statutory minimum.")
+
+        fig_spr = go.Figure()
+        fig_spr.add_trace(go.Scatter(x=spr.index, y=spr["SPR (Million Barrels)"], name="SPR Level",
+                                     line=dict(color="#e08b4f"), fill="tozeroy", fillcolor="rgba(224,139,79,0.12)"))
+        fig_spr.add_hline(y=SPR_SECDEF_FLOOR, line_dash="dash", line_color="#ef5350",
+                          annotation_text=f"SecDef Floor ({SPR_SECDEF_FLOOR:.1f}M)", annotation_position="bottom right")
+        fig_spr.update_layout(**base_layout("SPR Level — Full History (Weekly)"))
+        fig_spr.update_yaxes(title="Million Barrels")
+        add_recessions(fig_spr, recessions)
+
+        spr_recent = spr[spr.index >= (spr.index[-1] - pd.DateOffset(years=2))].copy()
+        spr_recent["WoW Change"] = spr_recent["SPR (Million Barrels)"].diff()
+        spr_recent["4W MA"] = spr_recent["WoW Change"].rolling(4).mean()
+        fig_spr_chg = go.Figure()
+        fig_spr_chg.add_trace(go.Bar(x=spr_recent.index, y=spr_recent["WoW Change"],
+                                     marker_color=["#26a69a" if v >= 0 else "#ef5350" for v in spr_recent["WoW Change"].fillna(0)],
+                                     name="Weekly Change", opacity=0.6))
+        fig_spr_chg.add_trace(go.Scatter(x=spr_recent.index, y=spr_recent["4W MA"],
+                                         name="4W MA (Drawdown Rate)", line=dict(color="white", width=2)))
+        fig_spr_chg.add_hline(y=0, line_dash="dot", line_color="#555")
+        fig_spr_chg.update_layout(**base_layout("SPR Weekly Change + 4W Moving Average (Last 2Y)"))
+        fig_spr_chg.update_yaxes(title="Million Barrels")
+
+        render_two_col([
+            ("SPR Level", fig_spr, spr),
+            ("SPR Weekly Change", fig_spr_chg, spr_recent),
+        ])
+
+    st.markdown('<div class="section-header">Retail Prices & Refining Margins</div>', unsafe_allow_html=True)
+    with st.spinner("Loading retail fuel prices & crack spreads…"):
+        gas_retail = fetch("GASREGW", "Gasoline Retail", START, END)
+        diesel_retail = fetch("GASDESW", "Diesel Retail", START, END)
+        crack = get_crack_spreads(START, END)
+
+    fig_retail = go.Figure()
+    if not gas_retail.empty:
+        fig_retail.add_trace(go.Scatter(x=gas_retail.index, y=gas_retail["Gasoline Retail"],
+                                        name="Gasoline (Regular)", line=dict(color="#f5a24c")))
+    if not diesel_retail.empty:
+        fig_retail.add_trace(go.Scatter(x=diesel_retail.index, y=diesel_retail["Diesel Retail"],
+                                        name="Diesel", line=dict(color="#4c8bf5")))
+    fig_retail.update_layout(**base_layout("US Retail Gasoline & Diesel Prices ($/gal)"))
+    fig_retail.update_yaxes(title="$/gallon", tickprefix="$")
+    add_recessions(fig_retail, recessions)
+
+    fig_crack = go.Figure()
+    if not crack.empty:
+        fig_crack.add_trace(go.Scatter(x=crack.index, y=crack["3:2:1 Crack ($/bbl)"],
+                                       name="3:2:1 Crack", line=dict(color="#26a69a", width=2.5)))
+        fig_crack.add_trace(go.Scatter(x=crack.index, y=crack["Gasoline Crack ($/bbl)"],
+                                       name="Gasoline Crack", line=dict(color="#f5a24c", width=1.3)))
+        fig_crack.add_trace(go.Scatter(x=crack.index, y=crack["Heating Oil Crack ($/bbl)"],
+                                       name="Heating Oil/Diesel Crack", line=dict(color="#c85fd6", width=1.3)))
+    fig_crack.update_layout(**base_layout("Refining Crack Spreads ($/bbl)"))
+    fig_crack.update_yaxes(title="$/bbl", tickprefix="$")
+    add_recessions(fig_crack, recessions)
+
+    st.markdown('<div class="section-header">Supply & Refinery Capacity</div>', unsafe_allow_html=True)
+    with st.spinner("Loading crude inventories & refinery utilization…"):
+        crude_inv = get_crude_inventories()
+        refinery_util = get_refinery_utilization()
+
+    fig_crude_inv = go.Figure()
+    if not crude_inv.empty:
+        fig_crude_inv.add_trace(go.Scatter(x=crude_inv.index, y=crude_inv["Crude Stocks ex-SPR (Million Barrels)"],
+                                           name="Crude Stocks ex-SPR", line=dict(color="#ef5350"),
+                                           fill="tozeroy", fillcolor="rgba(239,83,80,0.10)"))
+    fig_crude_inv.update_layout(**base_layout("US Commercial Crude Inventories, ex-SPR (Weekly)"))
+    fig_crude_inv.update_yaxes(title="Million Barrels")
+    add_recessions(fig_crude_inv, recessions)
+
+    fig_refinery = go.Figure()
+    if not refinery_util.empty:
+        fig_refinery.add_trace(go.Scatter(x=refinery_util.index, y=refinery_util["Refinery Utilization (%)"],
+                                          name="Refinery Utilization", line=dict(color="#6bbf8f"),
+                                          fill="tozeroy", fillcolor="rgba(107,191,143,0.10)"))
+    fig_refinery.update_layout(**base_layout("Refinery Utilization Rate (% of Operable Capacity)"))
+    fig_refinery.update_yaxes(title="%", ticksuffix="%")
+    add_recessions(fig_refinery, recessions)
+
+    render_two_col([
+        ("US Retail Gas & Diesel", fig_retail, pd.concat([gas_retail, diesel_retail], axis=1)),
+        ("Crack Spreads", fig_crack, crack),
+        ("Crude Inventories ex-SPR", fig_crude_inv, crude_inv),
+        ("Refinery Utilization", fig_refinery, refinery_util),
+    ])
+
+# ════════════════════════════════════════════════════════════════════════════════
+# TAB 4 — Labour Market
+# ════════════════════════════════════════════════════════════════════════════════
+with tabs[3]:
+    st.header("Labour Market")
+    with st.spinner("Loading labour data…"):
+        adp_ids = {
+            "Construction":       "ADPWINDCONNERSA",
+            "Information":        "ADPWINDINFONERSA",
+            "Prof & Business":    "ADPWINDPROBUSNERSA",
+            "Leisure & Hosp":     "ADPWINDLSHPNERSA",
+            "Education & Health": "ADPWINDEDHLTNERSA",
+            "Trade & Transport":  "ADPWINDTTUNERSA",
+            "Financial":          "ADPWINDFINNERSA",
+        }
+        # 29 independent FRED series fetched concurrently instead of one at a time - this tab
+        # had the same "sequential dict-comprehension fetch" pattern as the Prices tab's CPI/PCE
+        # components, just spread across wages/NFP/LFPR/unemployment/demographics/claims/JOLTS/ADP.
+        _labor_jobs = (
+            [("CES0500000003", "Avg Hourly Earnings"), ("PAYEMS", "NFP"),
+             ("CIVPART", "Labour Force Participation Rate"), ("LNS11300060", "Prime-Age LFPR (25-54)"),
+             ("ICSA", "Initial Claims"),
+             ("JTSJOL", "Job Openings (k)"), ("JTSQUR", "Quits Rate"),
+             ("JTSLDR", "Layoffs Rate"), ("JTSHIR", "Hire Rate")]
+            + [("U1RATE","U1"), ("U2RATE","U2"), ("UNRATE","U3"),
+               ("U4RATE","U4"), ("U5RATE","U5"), ("U6RATE","U6"), ("CGBD25O","U7 BA+")]
+            + [("LNS14000003","Men 20+"), ("LNS14000002","Women 20+"),
+               ("LNS14000006","Teenagers"), ("LNS14000009","Black/AA"),
+               ("LNS14000012","Hispanic"), ("LNS14027662","White")]
+            + [(sid, name) for name, sid in adp_ids.items()]
+        )
+        _labor_raw = fetch_many([(sid, label, START, END) for sid, label in _labor_jobs])
+
+        wages   = mom_yoy(_labor_raw["Avg Hourly Earnings"], "Avg Hourly Earnings")
+        nfp     = nfp_change(_labor_raw["NFP"], "NFP")
+        lfpr    = _labor_raw["Labour Force Participation Rate"]
+        prime_lfpr = _labor_raw["Prime-Age LFPR (25-54)"]
+
+        unemp_data = pd.concat([_labor_raw[lbl] for lbl in ["U1","U2","U3","U4","U5","U6","U7 BA+"]], axis=1)
+
+        demo = pd.concat([_labor_raw[lbl] for lbl in
+                           ["Men 20+","Women 20+","Teenagers","Black/AA","Hispanic","White"]], axis=1)
+
+        claims = _labor_raw["Initial Claims"]
+        if not claims.empty and "Initial Claims" in claims.columns:
+            claims["4W MA"]  = claims["Initial Claims"].rolling(4).mean()
+            claims["12W MA"] = claims["Initial Claims"].rolling(12).mean()
+
+        # JOLTS
+        jolts_openings = _labor_raw["Job Openings (k)"]
+        jolts_quits    = _labor_raw["Quits Rate"]
+        jolts_layoffs  = _labor_raw["Layoffs Rate"]
+        jolts_hire     = _labor_raw["Hire Rate"]
+
+        # ADP sectors
+        adp_sectors = pd.concat([
+            nfp_change(_labor_raw[name], name)
+            for name in adp_ids.keys()
+        ], axis=1)
+
+
+    # Wages
+    fig_wages = go.Figure()
+    for col in wages.columns:
+        ax = "y2" if "MoM" in col else "y"
+        fig_wages.add_trace(go.Scatter(x=wages.index, y=wages[col], name=col, mode="lines", yaxis=ax))
+    fig_wages.update_layout(**dual_axis_layout("Avg Hourly Earnings", "YoY %", "MoM %"))
+    add_recessions(fig_wages, recessions)
+
+    # NFP bar + 12-month moving average trendline
+    fig_nfp = go.Figure()
+    colors_nfp = ["#26a69a" if v >= 0 else "#ef5350" for v in nfp["NFP MoM Change (k)"].fillna(0)]
+    fig_nfp.add_trace(go.Bar(x=nfp.index, y=nfp["NFP MoM Change (k)"],
+                             marker_color=colors_nfp, name="NFP MoM"))
+    nfp_12m_ma = nfp["NFP MoM Change (k)"].rolling(12).mean().round(1)
+    fig_nfp.add_trace(go.Scatter(x=nfp.index, y=nfp_12m_ma, name="12M MA",
+                                  mode="lines", line=dict(color="#ffb74d", width=2)))
+    fig_nfp.update_layout(**base_layout("Nonfarm Payrolls MoM Change (k)"))
+    add_recessions(fig_nfp, recessions)
+
+    # LFPR
+    fig_lfpr = go.Figure()
+    if not lfpr.empty:
+        fig_lfpr.add_trace(go.Scatter(x=lfpr.index, y=lfpr["Labour Force Participation Rate"],
+                                      name="Overall LFPR", line=dict(color="#90a4d4")))
+    if not prime_lfpr.empty:
+        fig_lfpr.add_trace(go.Scatter(x=prime_lfpr.index, y=prime_lfpr["Prime-Age LFPR (25-54)"],
+                                      name="Prime-Age (25-54)", line=dict(color="#26a69a")))
+    fig_lfpr.update_layout(**base_layout("Labour Force Participation Rate"))
+    add_recessions(fig_lfpr, recessions)
+
+    # Unemployment U1-U7
+    fig_unemp = go.Figure()
+    colors_u = ["#ef5350","#ff7043","#ff9800","#ffc107","#26a69a","#42a5f5","#ab47bc"]
+    for col, color in zip(unemp_data.columns, colors_u):
+        fig_unemp.add_trace(go.Scatter(x=unemp_data.index, y=unemp_data[col], name=col,
+                                        mode="lines", line=dict(color=color)))
+    fig_unemp.update_layout(**base_layout("Unemployment Rates U1–U7"))
+    add_recessions(fig_unemp, recessions)
+
+    # Demographics
+    fig_demo = go.Figure()
+    for col in demo.columns:
+        fig_demo.add_trace(go.Scatter(x=demo.index, y=demo[col], name=col, mode="lines"))
+    fig_demo.update_layout(**base_layout("Unemployment by Demographics"))
+    add_recessions(fig_demo, recessions)
+
+    # Jobless claims
+    fig_claims = go.Figure()
+    color_map = {"Initial Claims": "#90a4d4", "4W MA": "#26a69a", "12W MA": "#ff9800"}
+    for col in claims.columns:
+        if col in color_map:
+            fig_claims.add_trace(go.Scatter(
+                x=claims.index, y=claims[col], name=col, mode="lines",
+                line=dict(color=color_map[col], width=2 if "MA" in col else 1)))
+    fig_claims.update_layout(**base_layout("Initial Jobless Claims + Moving Averages"))
+    add_recessions(fig_claims, recessions)
+
+    # JOLTS
+    fig_jolts = make_subplots(rows=2, cols=2,
+                              subplot_titles=("Job Openings (k)", "Quits Rate", "Layoffs Rate", "Hire Rate"),
+                              shared_xaxes=False, vertical_spacing=0.12)
+    for (df_j, label, color), (row, col) in zip(
+        [(jolts_openings,"Job Openings (k)","#26a69a"),
+         (jolts_quits,   "Quits Rate",     "#ff9800"),
+         (jolts_layoffs, "Layoffs Rate",   "#ef5350"),
+         (jolts_hire,    "Hire Rate",      "#90a4d4")],
+        [(1,1),(1,2),(2,1),(2,2)]
+    ):
+        if not df_j.empty:
+            fig_jolts.add_trace(go.Scatter(x=df_j.index, y=df_j.iloc[:,0],
+                                           name=label, line=dict(color=color)), row=row, col=col)
+    fig_jolts.update_layout(template=TEMPLATE, paper_bgcolor=PAPER_BG, plot_bgcolor=PLOT_BG,
+                            height=520, margin=dict(l=10,r=10,t=50,b=30),
+                            showlegend=False)
+    fig_jolts.update_xaxes(gridcolor=GRID_COLOR)
+    fig_jolts.update_yaxes(gridcolor=GRID_COLOR)
+    add_recessions(fig_jolts, recessions, rows=[1,1,2,2], cols=[1,2,1,2])
+
+    # Beveridge curve
+    if not jolts_openings.empty and "U3" in unemp_data.columns:
+        merged_bev = pd.concat([
+            jolts_openings["Job Openings (k)"] / 1000,
+            unemp_data["U3"]
+        ], axis=1).dropna()
+        merged_bev.columns = ["openings_m", "unemployment"]
+        fig_bev = go.Figure()
+        fig_bev.add_trace(go.Scatter(
+            x=merged_bev["unemployment"], y=merged_bev["openings_m"],
+            mode="markers+lines",
+            marker=dict(
+                color=list(range(len(merged_bev))),
+                colorscale="Viridis", size=5, opacity=0.7,
+                colorbar=dict(title="Time →", len=0.5, thickness=10),
+            ),
+            line=dict(width=0.5, color="rgba(255,255,255,0.2)"),
+            text=merged_bev.index.strftime("%Y-%m"),
+            hovertemplate="Date: %{text}<br>Unemployment: %{x:.1f}%<br>Openings: %{y:.2f}M<extra></extra>",
+            name="Beveridge Curve",
+        ))
+        fig_bev.update_layout(**base_layout("Beveridge Curve (Openings vs Unemployment)"))
+        fig_bev.update_xaxes(title="Unemployment Rate (%)", gridcolor=GRID_COLOR)
+        fig_bev.update_yaxes(title="Job Openings (M)", gridcolor=GRID_COLOR)
+    else:
+        fig_bev = go.Figure()
+
+    # ADP sectors - stacked bar (no trendline)
+    fig_adp = go.Figure()
+    for col in adp_sectors.columns:
+        fig_adp.add_trace(go.Bar(x=adp_sectors.index, y=adp_sectors[col], name=col))
+    fig_adp.update_layout(**base_layout("ADP Employment by Sector (MoM, k)"))
+    fig_adp.update_layout(barmode="relative")
+    add_recessions(fig_adp, recessions)
+
+
+    labor_charts = [
+        ("Wages", fig_wages, wages),
+        ("NFP", fig_nfp, nfp),
+        ("LFPR", fig_lfpr, pd.concat([lfpr, prime_lfpr], axis=1)),
+        ("Unemployment U1-U7", fig_unemp, unemp_data),
+        ("Demographics", fig_demo, demo),
+        ("Initial Claims", fig_claims, claims),
+        ("JOLTS", fig_jolts, pd.concat([jolts_openings, jolts_quits, jolts_layoffs, jolts_hire], axis=1)),
+        ("Beveridge Curve", fig_bev, merged_bev if not jolts_openings.empty else None),
+        ("ADP Sectors", fig_adp, adp_sectors),
+    ]
+    render_two_col(labor_charts)
+
+# ════════════════════════════════════════════════════════════════════════════════
+# TAB 5 — Economic Activity
+# ════════════════════════════════════════════════════════════════════════════════
+with tabs[4]:
+    st.header("Economic Activity")
+    st.caption("GDP and the Atlanta Fed's real-time GDPNow estimate, each paired against the 30Y "
+               "Treasury yield as a full daily line (not snapped to the lower-frequency series' own "
+               "print dates, the way an earlier version of the GDP chart did) - plus the real ISM "
+               "Manufacturing/Services PMI (0-100 scale, scraped from ISM's own PR Newswire release "
+               "- see caption below) and the Chicago Fed's regional survey (a different, zero-centered "
+               "scale, not literally PMI).")
+    with st.spinner("Loading economic activity data…"):
+        real_gdp   = fetch("GDPC1", "Real GDP", START, END)
+        nom_gdp    = fetch("GDP", "Nominal GDP", START, END)
+        gdp_now    = fetch("GDPNOW", "GDPNow", START, END)
+        dgs30      = fetch("DGS30", "30Y Treasury", START, END)
+        ism_pmi    = fetch_ism_pmi()
+        chi_mfg    = fetch("CFSBCACTIVITYMFG", "Chicago Fed Mfg Activity", START, END)
+        chi_nonmfg = fetch("CFSBCACTIVITYNMFG", "Chicago Fed Services Activity", START, END)
+
+        real_gdp_yoy = (real_gdp["Real GDP"].pct_change(4) * 100).round(3).dropna() if not real_gdp.empty else pd.Series(dtype=float)
+        nom_gdp_yoy  = (nom_gdp["Nominal GDP"].pct_change(4) * 100).round(3).dropna() if not nom_gdp.empty else pd.Series(dtype=float)
+        dgs30_clip   = dgs30["30Y Treasury"].dropna() if not dgs30.empty else pd.Series(dtype=float)
+
+    # Real & Nominal GDP (YoY %) vs 30Y Treasury yield - GDP as grouped quarterly bars, yield as
+    # its own full daily line (previously snapped to GDP's own quarterly dates via merge_asof;
+    # now plotted at its native daily frequency) - both series share one % axis.
+    fig_gdp_30y = go.Figure()
+    fig_gdp_30y.add_trace(go.Bar(x=real_gdp_yoy.index, y=real_gdp_yoy.values, name="Real GDP YoY %", marker_color="#4c8bf5"))
+    fig_gdp_30y.add_trace(go.Bar(x=nom_gdp_yoy.index, y=nom_gdp_yoy.values, name="Nominal GDP YoY %", marker_color="#f5a24c"))
+    if not dgs30_clip.empty:
+        fig_gdp_30y.add_trace(go.Scatter(x=dgs30_clip.index, y=dgs30_clip.values, name="30Y Treasury Yield (Daily)",
+                                          mode="lines", line=dict(color="#c85fd6", width=1.5)))
+    fig_gdp_30y.update_layout(**base_layout("Real & Nominal GDP (YoY %) vs. 30Y Treasury Yield (Daily)"))
+    fig_gdp_30y.update_layout(barmode="group")
+    fig_gdp_30y.update_yaxes(ticksuffix="%")
+    add_recessions(fig_gdp_30y, recessions)
+
+    # Atlanta Fed GDPNow (current-quarter real-time nowcast) vs 30Y Treasury yield, daily. FRED's
+    # GDPNOW series only carries one snapshot per quarter (the live/most-recent nowcast for that
+    # quarter), not GDPNow's own full within-quarter daily revision path - so this bars-by-quarter
+    # treatment matches what's actually available, same caveat as GDP itself being quarterly.
+    fig_gdpnow_30y = go.Figure()
+    if not gdp_now.empty:
+        gdpnow_s = gdp_now["GDPNow"].dropna()
+        gdpnow_colors = ["#26a69a" if v >= 0 else "#ef5350" for v in gdpnow_s.values]
+        fig_gdpnow_30y.add_trace(go.Bar(x=gdpnow_s.index, y=gdpnow_s.values, name="GDPNow (SAAR %)", marker_color=gdpnow_colors))
+    if not dgs30_clip.empty:
+        fig_gdpnow_30y.add_trace(go.Scatter(x=dgs30_clip.index, y=dgs30_clip.values, name="30Y Treasury Yield (Daily)",
+                                             mode="lines", line=dict(color="#c85fd6", width=1.5)))
+    fig_gdpnow_30y.add_hline(y=0, line_dash="dot", line_color="#555")
+    fig_gdpnow_30y.update_layout(**base_layout("Atlanta Fed GDPNow (Current-Quarter Nowcast) vs. 30Y Treasury Yield (Daily)"))
+    fig_gdpnow_30y.update_yaxes(ticksuffix="%")
+    add_recessions(fig_gdpnow_30y, recessions)
+
+    # ISM Manufacturing & Services PMI - the real thing, 0-100 scale, 50 = breakeven. FRED no
+    # longer carries this (see fetch_ism_pmi's own comment for what was checked live), so this
+    # is scraped from ISM's own PR Newswire release listing - real ISM data, just limited to
+    # however many recent months that listing page still covers (~13 as of 2026-09-28).
+    fig_ism = go.Figure()
+    if not ism_pmi.empty:
+        if "ISM Manufacturing PMI" in ism_pmi.columns:
+            mfg_s = ism_pmi["ISM Manufacturing PMI"].dropna()
+            fig_ism.add_trace(go.Scatter(x=mfg_s.index, y=mfg_s.values, name="ISM Manufacturing PMI",
+                                          mode="lines+markers", line=dict(color="#42a5f5")))
+        if "ISM Services PMI" in ism_pmi.columns:
+            svc_s = ism_pmi["ISM Services PMI"].dropna()
+            fig_ism.add_trace(go.Scatter(x=svc_s.index, y=svc_s.values, name="ISM Services PMI",
+                                          mode="lines+markers", line=dict(color="#ff9800")))
+    fig_ism.add_hline(y=50, line_dash="dot", line_color="#555", annotation_text="50 = breakeven")
+    fig_ism.update_layout(**base_layout("ISM Manufacturing & Services PMI"))
+    fig_ism.update_yaxes(range=[35, 65])
+
+    # Chicago Fed Survey of Economic Conditions - manufacturing vs. nonmanufacturing (services)
+    # activity index for Federal Reserve District 7 (Chicago). Diffusion-index-style, zero-centered,
+    # same convention as CFNAI on the Indicators tab.
+    fig_chicago = go.Figure()
+    for df_c, chi_label, chi_color in [(chi_mfg, "Manufacturing", "#42a5f5"),
+                                        (chi_nonmfg, "Services (Nonmanufacturing)", "#ff9800")]:
+        if not df_c.empty:
+            fig_chicago.add_trace(go.Scatter(x=df_c.index, y=df_c.iloc[:, 0], name=chi_label, line=dict(color=chi_color)))
+    fig_chicago.add_hline(y=0, line_dash="dot", line_color="#555")
+    fig_chicago.update_layout(**base_layout("Chicago Fed Survey — Manufacturing vs. Services Activity Index"))
+    add_recessions(fig_chicago, recessions)
+
+    render_two_col([
+        ("GDP vs 30Y Treasury Yield", fig_gdp_30y, pd.DataFrame({
+            "Real GDP YoY %": real_gdp_yoy, "Nominal GDP YoY %": nom_gdp_yoy, "30Y Treasury Yield": dgs30_clip,
+        })),
+        ("GDPNow vs 30Y Treasury Yield", fig_gdpnow_30y, pd.concat([gdp_now, dgs30], axis=1)),
+        ("ISM Manufacturing & Services PMI", fig_ism, ism_pmi),
+        ("Chicago Fed Mfg vs Services", fig_chicago, pd.concat([chi_mfg, chi_nonmfg], axis=1)),
+    ])
+    st.caption("ISM PMI history above is limited to what's still parseable from ISM's own PR "
+               "Newswire release listing (prnewswire.com/news/institute-for-supply-management) - "
+               "real ISM data, not a substitute, but not a full multi-year back-history the way "
+               "FRED used to provide before ISM stopped feeding it for free.")
+
+# ════════════════════════════════════════════════════════════════════════════════
+# TAB 6 — Housing
+# ════════════════════════════════════════════════════════════════════════════════
+with tabs[5]:
+    st.header("Housing")
+    with st.spinner("Loading housing data…"):
+        home_sales  = fetch("EXHOSLUSM495S", "Existing Home Sales", START, END)
+        new_sales   = fetch("HSN1F",         "New Home Sales", START, END)
+        starts      = fetch("HOUST",         "Housing Starts", START, END)
+        permits     = fetch("PERMIT",        "Building Permits", START, END)
+        completions = fetch("COMPUTSA",      "Completions", START, END)
+        case_shiller = fetch("CSUSHPINSA",   "Case-Shiller HPI", START, END)
+
+        mort30      = fetch("MORTGAGE30US", "30Y Fixed Mortgage", START, END)
+        mort15      = fetch("MORTGAGE15US", "15Y Fixed Mortgage", START, END)
+        dgs30_h     = fetch("DGS30",        "30Y Treasury", START, END)
+        new_supply  = fetch("MSACSR",       "New Home Months Supply", START, END)
+        existing_supply = fetch("HOSSUPUSM673N", "Existing Home Months Supply", START, END)
+        median_price = fetch("MSPUS",       "Median New-Home Price", START, END)
+        homeownership = fetch("RHORUSQ156N", "Homeownership Rate", START, END)
+        affordability = fetch("FIXHAI",     "Housing Affordability Index", START, END)
+
+    # Existing vs New Home Sales
+    fig_sales = go.Figure()
+    if not home_sales.empty:
+        fig_sales.add_trace(go.Scatter(x=home_sales.index, y=home_sales["Existing Home Sales"],
+                                       name="Existing", line=dict(color="#26a69a")))
+    if not new_sales.empty:
+        fig_sales.add_trace(go.Scatter(x=new_sales.index, y=new_sales["New Home Sales"],
+                                       name="New", line=dict(color="#ff9800"), yaxis="y2"))
+    fig_sales.update_layout(**dual_axis_layout("Existing vs New Home Sales", "Existing (k)", "New (k)"))
+    add_recessions(fig_sales, recessions)
+
+    # Starts vs Permits vs Completions - full construction pipeline; a widening
+    # permits-to-completions gap signals a building backlog before it shows up elsewhere.
+    fig_starts = go.Figure()
+    if not starts.empty:
+        fig_starts.add_trace(go.Scatter(x=starts.index, y=starts["Housing Starts"],
+                                        name="Starts", line=dict(color="#42a5f5")))
+    if not permits.empty:
+        fig_starts.add_trace(go.Scatter(x=permits.index, y=permits["Building Permits"],
+                                        name="Permits", line=dict(color="#ab47bc")))
+    if not completions.empty:
+        fig_starts.add_trace(go.Scatter(x=completions.index, y=completions["Completions"],
+                                        name="Completions", line=dict(color="#26a69a")))
+    fig_starts.update_layout(**base_layout("Housing Starts, Permits & Completions"))
+    add_recessions(fig_starts, recessions)
+
+    # Case-Shiller
+    cs_mom = mom_yoy(case_shiller, "Case-Shiller HPI") if not case_shiller.empty else pd.DataFrame()
+    fig_cs = go.Figure()
+    if not cs_mom.empty:
+        for col in cs_mom.columns:
+            ax = "y2" if "MoM" in col else "y"
+            fig_cs.add_trace(go.Scatter(x=cs_mom.index, y=cs_mom[col], name=col, mode="lines", yaxis=ax))
+    fig_cs.update_layout(**dual_axis_layout("Case-Shiller Home Price Index", "YoY %", "MoM %"))
+    add_recessions(fig_cs, recessions)
+
+    # 30Y vs 15Y fixed mortgage rate
+    fig_mortgage = go.Figure()
+    if not mort30.empty:
+        fig_mortgage.add_trace(go.Scatter(x=mort30.index, y=mort30["30Y Fixed Mortgage"],
+                                          name="30Y Fixed", line=dict(color="#42a5f5")))
+    if not mort15.empty:
+        fig_mortgage.add_trace(go.Scatter(x=mort15.index, y=mort15["15Y Fixed Mortgage"],
+                                          name="15Y Fixed", line=dict(color="#8a94a6")))
+    fig_mortgage.update_layout(**base_layout("30Y vs 15Y Fixed Mortgage Rate"))
+    fig_mortgage.update_yaxes(ticksuffix="%")
+    add_recessions(fig_mortgage, recessions)
+
+    # Mortgage-Treasury spread - the standard MBS-market-stress read (30Y mortgage over
+    # 30Y Treasury, matching maturities). Peaked well above its historical norm during the
+    # 2022-23 stress episode and has been normalizing since.
+    mort_spread = pd.DataFrame()
+    if not mort30.empty and not dgs30_h.empty:
+        spread_df = pd.concat([mort30, dgs30_h], axis=1).ffill().dropna()
+        mort_spread = pd.DataFrame(index=spread_df.index)
+        mort_spread["Mortgage-Treasury Spread (bps)"] = (
+            spread_df["30Y Fixed Mortgage"] - spread_df["30Y Treasury"]) * 100
+    fig_mort_spread = go.Figure()
+    if not mort_spread.empty:
+        fig_mort_spread.add_trace(go.Scatter(x=mort_spread.index, y=mort_spread["Mortgage-Treasury Spread (bps)"],
+                                             name="Spread", line=dict(color="#e08b4f"), fill="tozeroy",
+                                             fillcolor="rgba(224,139,79,0.15)"))
+    fig_mort_spread.update_layout(**base_layout("Mortgage — 30Y Treasury Spread"))
+    fig_mort_spread.update_yaxes(ticksuffix=" bps")
+    add_recessions(fig_mort_spread, recessions)
+
+    # New home months' supply
+    fig_new_supply = go.Figure()
+    if not new_supply.empty:
+        fig_new_supply.add_trace(go.Scatter(x=new_supply.index, y=new_supply["New Home Months Supply"],
+                                            name="Months Supply", line=dict(color="#e08b4f"), fill="tozeroy",
+                                            fillcolor="rgba(224,139,79,0.15)"))
+    fig_new_supply.update_layout(**base_layout("New Home Months' Supply"))
+    add_recessions(fig_new_supply, recessions)
+
+    # Existing home months' supply - NAR restricted data redistribution in 2023-24, so FRED
+    # restarted this series from scratch; only a short window of history is available.
+    fig_existing_supply = go.Figure()
+    if not existing_supply.empty:
+        fig_existing_supply.add_trace(go.Scatter(x=existing_supply.index, y=existing_supply["Existing Home Months Supply"],
+                                                  name="Months Supply", line=dict(color="#26a69a"), fill="tozeroy",
+                                                  fillcolor="rgba(38,166,154,0.15)"))
+    fig_existing_supply.update_layout(**base_layout("Existing Home Months' Supply"))
+
+    # Median new-home price vs Case-Shiller - two panels, not one dual-axis chart: different
+    # units and scales. Case-Shiller says how much prices moved (%); this says what a home
+    # actually costs ($).
+    fig_price = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                              subplot_titles=("Median New-Home Price ($)", "Case-Shiller Index"),
+                              vertical_spacing=0.12)
+    if not median_price.empty:
+        fig_price.add_trace(go.Scatter(x=median_price.index, y=median_price["Median New-Home Price"],
+                                       name="Median Price", line=dict(color="#e08b4f")), row=1, col=1)
+    if not case_shiller.empty:
+        fig_price.add_trace(go.Scatter(x=case_shiller.index, y=case_shiller["Case-Shiller HPI"],
+                                       name="Case-Shiller", line=dict(color="#8a94a6")), row=2, col=1)
+    fig_price.update_layout(template=TEMPLATE, paper_bgcolor=PAPER_BG, plot_bgcolor=PLOT_BG,
+                            height=500, margin=dict(l=10,r=10,t=45,b=30), showlegend=False)
+    fig_price.update_xaxes(gridcolor=GRID_COLOR)
+    fig_price.update_yaxes(gridcolor=GRID_COLOR)
+    add_recessions(fig_price, recessions, rows=[1,2], cols=[1,1])
+
+    # Homeownership rate - slow-moving structural context, not a series people watch move
+    # month to month.
+    fig_homeownership = go.Figure()
+    if not homeownership.empty:
+        fig_homeownership.add_trace(go.Scatter(x=homeownership.index, y=homeownership["Homeownership Rate"],
+                                                name="Homeownership Rate", line=dict(color="#90a4d4")))
+    fig_homeownership.update_layout(**base_layout("Homeownership Rate"))
+    fig_homeownership.update_yaxes(ticksuffix="%")
+    add_recessions(fig_homeownership, recessions)
+
+    # Housing affordability index - same NAR restart issue as existing-home supply; short
+    # history, useful as a current reading (100 = median family exactly qualifies for the
+    # median-priced home) more than a trend.
+    fig_afford = go.Figure()
+    if not affordability.empty:
+        fig_afford.add_trace(go.Scatter(x=affordability.index, y=affordability["Housing Affordability Index"],
+                                        name="Affordability Index", line=dict(color="#ab47bc")))
+    fig_afford.add_hline(y=100, line_dash="dot", line_color="#555",
+                          annotation_text="100 = median family qualifies")
+    fig_afford.update_layout(**base_layout("Housing Affordability Index"))
+
+    housing_charts = [
+        ("Home Sales", fig_sales, pd.concat([home_sales, new_sales], axis=1)),
+        ("Starts, Permits & Completions", fig_starts, pd.concat([starts, permits, completions], axis=1)),
+        ("Case-Shiller HPI", fig_cs, cs_mom),
+        ("30Y vs 15Y Mortgage Rate", fig_mortgage, pd.concat([mort30, mort15], axis=1)),
+        ("Mortgage-Treasury Spread", fig_mort_spread, mort_spread),
+        ("New Home Months Supply", fig_new_supply, new_supply),
+        ("Existing Home Months Supply", fig_existing_supply, existing_supply),
+        ("Median Price vs Case-Shiller", fig_price, pd.concat([median_price, case_shiller], axis=1)),
+        ("Homeownership Rate", fig_homeownership, homeownership),
+        ("Housing Affordability Index", fig_afford, affordability),
+    ]
+    render_two_col(housing_charts)
+    st.caption("Existing Home Months' Supply and the Housing Affordability Index both restart in "
+               "2025 - NAR restricted redistribution of this data in 2023-24, and FRED rebuilt these "
+               "series from scratch once a new agreement was reached. The same gap affects the "
+               "Existing Home Sales series above, which also only carries recent history.")
 
 # ════════════════════════════════════════════════════════════════════════════════
 # TAB 7 — US Markets
