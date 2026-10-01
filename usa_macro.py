@@ -146,6 +146,7 @@ st.markdown("""
                   text-transform: uppercase; margin-bottom: 3px; }
   .metric-value { font-size: 1.25rem; font-weight: 700; }
   .metric-delta { font-size: 0.72rem; margin-top: 2px; }
+  .metric-asof { font-size: 0.6rem; color: #5f6b7e; margin-top: 3px; }
   .metric-z { font-size: 0.62rem; margin-top: 4px; padding-top: 4px;
               border-top: 1px solid #2a2f3e; display: flex; justify-content: center; gap: 8px; }
   .positive { color: #26a69a; }
@@ -1493,7 +1494,7 @@ def get_summary_metrics(end):
     for name, (sid, calc, unit, freq) in metrics.items():
         s = raw[sid]
         if len(s) < 2:
-            results[name] = (None, None, "", "", {})
+            results[name] = (None, None, "", "", {}, "")
             continue
         try:
             latest = float(s.iloc[-1])
@@ -1524,15 +1525,17 @@ def get_summary_metrics(end):
                 delta, delta_unit = delta * 100, "bps"
             else:
                 delta_unit = unit
-            results[name] = (val, delta, unit, delta_unit, z)
+            # "as of" = date of the latest observation (monthly series are dated the 1st of their month)
+            asof = s.index[-1].strftime("%b %Y") if freq == "M" else s.index[-1].strftime("%d %b %Y")
+            results[name] = (val, delta, unit, delta_unit, z, asof)
         except Exception as e:
             st.warning(f"Could not compute {name}: {e}")
-            results[name] = (None, None, "", "", {})
+            results[name] = (None, None, "", "", {}, "")
 
     d2, d5, d10, d30 = raw["DGS2"], raw["DGS5"], raw["DGS10"], raw["DGS30"]
     if min(len(d2), len(d5), len(d10), len(d30)) < 2:
-        results["2s5s10s Fly"] = (None, None, "", "", {})
-        results["5s30s"] = (None, None, "", "", {})
+        results["2s5s10s Fly"] = (None, None, "", "", {}, "")
+        results["5s30s"] = (None, None, "", "", {}, "")
     else:
         try:
             curve = pd.concat([d2, d5, d10, d30], axis=1, keys=["2Y", "5Y", "10Y", "30Y"]).ffill().dropna()
@@ -1540,16 +1543,16 @@ def get_summary_metrics(end):
             fly_prev = _value_one_month_ago(fly)
             results["2s5s10s Fly"] = (float(fly.iloc[-1]),
                                        float(fly.iloc[-1] - fly_prev) if fly_prev is not None else None,
-                                       "bps", "bps", _zscores(fly, Z_WINDOWS_DAILY))
+                                       "bps", "bps", _zscores(fly, Z_WINDOWS_DAILY), curve.index[-1].strftime("%d %b %Y"))
             curve_5s30s = (curve["30Y"] - curve["5Y"]) * 100  # bps
             c5s30s_prev = _value_one_month_ago(curve_5s30s)
             results["5s30s"] = (float(curve_5s30s.iloc[-1]),
                                  float(curve_5s30s.iloc[-1] - c5s30s_prev) if c5s30s_prev is not None else None,
-                                 "bps", "bps", _zscores(curve_5s30s, Z_WINDOWS_DAILY))
+                                 "bps", "bps", _zscores(curve_5s30s, Z_WINDOWS_DAILY), curve.index[-1].strftime("%d %b %Y"))
         except Exception as e:
             st.warning(f"Could not compute 2s5s10s Fly / 5s30s: {e}")
-            results["2s5s10s Fly"] = (None, None, "", "", {})
-            results["5s30s"] = (None, None, "", "", {})
+            results["2s5s10s Fly"] = (None, None, "", "", {}, "")
+            results["5s30s"] = (None, None, "", "", {}, "")
 
     return results
 
@@ -1675,7 +1678,7 @@ ROW_SIZE = 6
 for row_start in range(0, len(summary_items), ROW_SIZE):
     row_items = summary_items[row_start:row_start + ROW_SIZE]
     cols = st.columns(ROW_SIZE)
-    for col, (name, (val, delta, unit, delta_unit, z)) in zip(cols, row_items):
+    for col, (name, (val, delta, unit, delta_unit, z, asof)) in zip(cols, row_items):
         with col:
             if val is None:
                 st.markdown(f'<div class="metric-card"><div class="metric-label">{name}</div><div class="metric-value neutral">N/A</div></div>', unsafe_allow_html=True)
@@ -1702,10 +1705,135 @@ for row_start in range(0, len(summary_items), ROW_SIZE):
               <div class="metric-value neutral">{val_str}</div>
               <div class="metric-delta {delta_cls}">{delta_str} MoM</div>
               <div class="metric-z">{z_line}</div>
+              <div class="metric-asof">as of {asof}</div>
             </div>""", unsafe_allow_html=True)
     st.markdown("<div style='margin-top:8px'></div>", unsafe_allow_html=True)
 
 st.markdown("<br>", unsafe_allow_html=True)
+
+# ── Rates Monitor (outrights / spreads / flies) ─────────────────────────────────
+# Uses each series' FULL history via _fred_full (not the date-slider slice), so z-scores and
+# 5Y percentiles don't change when the user narrows the date range.
+RM_TENORS = {"1M": ("DGS1MO", 1 / 12), "3M": ("DGS3MO", 0.25), "6M": ("DGS6MO", 0.5), "1Y": ("DGS1", 1),
+             "2Y": ("DGS2", 2), "3Y": ("DGS3", 3), "5Y": ("DGS5", 5), "7Y": ("DGS7", 7), "10Y": ("DGS10", 10),
+             "20Y": ("DGS20", 20), "30Y": ("DGS30", 30)}
+# spread/fly = Σ weight × yield (bp). "Long" the spread = steepener / long fly = pay the positive-weight legs.
+RM_SPREADS = {"2s5s": {"5Y": 1, "2Y": -1}, "2s10s": {"10Y": 1, "2Y": -1}, "5s10s": {"10Y": 1, "5Y": -1},
+              "5s30s": {"30Y": 1, "5Y": -1}, "10s30s": {"30Y": 1, "10Y": -1}, "3M10Y": {"10Y": 1, "3M": -1}}
+RM_FLIES = {"2s5s10s": {"5Y": 2, "2Y": -1, "10Y": -1}, "5s10s30s": {"10Y": 2, "5Y": -1, "30Y": -1},
+            "10s20s30s": {"20Y": 2, "10Y": -1, "30Y": -1}, "1s10s20s": {"10Y": 2, "1Y": -1, "20Y": -1}}
+
+def _rm_series():
+    ids = [sid for sid, _ in RM_TENORS.values()] + ["EFFR", "SOFR"]
+    out = {}
+    with ThreadPoolExecutor(max_workers=8, thread_name_prefix="usa_bg_rm") as pool:
+        for sid, (s, err) in zip(ids, pool.map(lambda i: _fred_series_retry_core(i), ids)):
+            out[sid] = s
+    return out
+
+def _rm_pctile(s, years):
+    w = s[s.index >= s.index[-1] - pd.DateOffset(years=years)]
+    return float((w <= w.iloc[-1]).mean() * 100) if len(w) > 20 else np.nan
+
+def _rm_chg(s, offset):
+    prev = s.asof(s.index[-1] - offset)
+    return float(s.iloc[-1] - prev) if pd.notna(prev) else np.nan
+
+def build_rates_monitor():
+    """Returns (outrights_df, spreads_df, flies_df, sofr_level, sofr_date)."""
+    raw = _rm_series()
+    curve = pd.concat({t: raw[sid] for t, (sid, _) in RM_TENORS.items()}, axis=1).dropna(how="all")
+    sofr = raw["SOFR"].dropna()
+    fund, fund_dt = float(sofr.iloc[-1]), sofr.index[-1]
+    last = curve.ffill().iloc[-1].dropna()
+    xs = np.array([RM_TENORS[t][1] for t in last.index]); o = np.argsort(xs)
+    xs, ys = xs[o], last.values[o]
+
+    legs = {}
+    for t, (_, T) in RM_TENORS.items():
+        if t not in last:
+            continue
+        y = float(last[t])
+        dur = (1 - (1 + y / 200) ** (-2 * T)) / (y / 100)       # modified duration, par bond, semi-annual
+        running = (y - fund) * 100                               # bp/yr, receiving the tenor funded at SOFR
+        # ≤1Y matures inside the 1Y horizon: no yield risk to break even against, and "rolling to 0Y" would
+        # just land on the 1M yield (a fake ~50bp of roll), so breakeven carry & roll are left blank
+        be = running / dur if T > 1 else np.nan                  # bp of yield one year of carry offsets
+        roll = (np.interp(T, xs, ys) - np.interp(T - 1, xs, ys)) * 100 if T > 1 else np.nan
+        legs[t] = (running, be, roll)
+
+    def row(name, s, unit, running=np.nan, be=np.nan, roll=np.nan):
+        s = s.dropna()
+        m = 100 if unit == "%" else 1
+        z = _zscores(s, Z_WINDOWS_DAILY)
+        vol = s.diff().iloc[-252:].std() * m * np.sqrt(252)
+        cr = be + roll
+        return {"Instrument": name, "Level": float(s.iloc[-1]), "_unit": unit,
+                "Δ1D (bp)": (s.iloc[-1] - s.iloc[-2]) * m, "Δ1W (bp)": _rm_chg(s, pd.Timedelta(days=7)) * m,
+                "Δ1M (bp)": _rm_chg(s, pd.DateOffset(months=1)) * m, "Δ3M (bp)": _rm_chg(s, pd.DateOffset(months=3)) * m,
+                "Z 1M": z["1M"], "Z 3M": z["3M"], "Z 12M": z["12M"], "1Y %ile": _rm_pctile(s, 1), "5Y %ile": _rm_pctile(s, 5),
+                "Carry (bp/yr)": running, "Breakeven carry (bp yld/yr)": be, "Roll 1Y (bp)": roll,
+                "Carry+Roll (bp yld/yr)": cr, "1Y vol (bp)": vol,
+                "C+R / Vol": cr / vol if pd.notna(cr) and vol else np.nan, "As of": s.index[-1]}
+
+    outr = [row("SOFR", sofr, "%"), row("EFFR", raw["EFFR"], "%")]
+    outr += [row(f"{t} UST", curve[t], "%", *legs[t]) for t in RM_TENORS if t in legs]
+
+    def combo(defs):
+        rows = []
+        for n, w in defs.items():
+            s = sum(curve[k] * v for k, v in w.items()).dropna() * 100
+            be = -sum(v * legs[k][1] for k, v in w.items())       # DV01-neutral legs add in bp of yield
+            roll = -sum(v * legs[k][2] for k, v in w.items())
+            rows.append(row(n, s, "bp", np.nan, be, roll))
+        return rows
+    spr = combo(RM_SPREADS) + [row("EFFR − SOFR", ((raw["EFFR"] - sofr) * 100).dropna(), "bp")]
+    fly = combo(RM_FLIES)
+    return pd.DataFrame(outr), pd.DataFrame(spr), pd.DataFrame(fly), fund, fund_dt
+
+def _rm_zcolor(v):
+    if pd.isna(v):
+        return "color: #5f6b7e"
+    a = min(abs(v) / 2.5, 1.0)
+    return f"background-color: rgba({'38,166,154' if v > 0 else '239,83,80'},{0.10 + 0.5 * a:.2f}); color: #e0e0e0"
+
+def _rm_signcolor(v):
+    return "color: #8a94a6" if pd.isna(v) or v == 0 else ("color: #26a69a" if v > 0 else "color: #ef5350")
+
+def _rm_pctcolor(v):
+    return "color: #5f6b7e" if pd.isna(v) else _rm_zcolor((v - 50) / 20)
+
+def render_rates_monitor_table(df, key, show_running):
+    """One monitor table with its own multi-column sort controls (priority order + per-column direction)."""
+    if not show_running:
+        df = df.drop(columns="Carry (bp/yr)")
+    sortable = [c for c in df.columns if not c.startswith("_")]
+    s1, s2 = st.columns([3, 2])
+    sort_cols = s1.multiselect("Sort by (priority order — first pick sorts first)", sortable, default=[],
+                               key=f"rm_sort_{key}", placeholder="Default order")
+    asc = []
+    if sort_cols:
+        for dc, col in zip(s2.columns(len(sort_cols)), sort_cols):
+            asc.append(dc.radio(col, ["↓ Desc", "↑ Asc"], key=f"rm_dir_{key}_{col}") == "↑ Asc")
+    else:
+        s2.caption("Pick one or more columns to sort by, or click a column header for a quick single-column sort.")
+    if sort_cols:
+        df = df.sort_values(sort_cols, ascending=asc, na_position="last", kind="mergesort")
+    view = df.copy()
+    view["Level"] = [f"{v:.3f}%" if u == "%" else f"{v:+.1f}bp" for v, u in zip(view["Level"], view["_unit"])]
+    view["As of"] = view["As of"].dt.strftime("%d %b")
+    view = view.drop(columns="_unit")
+    chg = ["Δ1D (bp)", "Δ1W (bp)", "Δ1M (bp)", "Δ3M (bp)"]
+    carry = [c for c in ["Carry (bp/yr)", "Breakeven carry (bp yld/yr)", "Roll 1Y (bp)", "Carry+Roll (bp yld/yr)"] if c in view]
+    # callables rather than format strings + na_rep: st.dataframe renders a Styler's NaNs as "None" otherwise
+    fmt = lambda f: (lambda v: "—" if v is None or pd.isna(v) else format(v, f))
+    st.dataframe(view.style.format({**{c: fmt("+.1f") for c in chg + carry}, "Z 1M": fmt("+.2f"), "Z 3M": fmt("+.2f"),
+                                    "Z 12M": fmt("+.2f"), "1Y %ile": fmt(".0f"), "5Y %ile": fmt(".0f"), "1Y vol (bp)": fmt(".0f"),
+                                    "C+R / Vol": fmt("+.2f")})
+                 .map(_rm_signcolor, subset=chg + carry).map(_rm_zcolor, subset=["Z 1M", "Z 3M", "Z 12M", "C+R / Vol"])
+                 .map(_rm_pctcolor, subset=["1Y %ile", "5Y %ile"]),
+                 hide_index=True, use_container_width=True, height=36 * (len(view) + 1))
+    csv_download(df.drop(columns="_unit"), f"rates_monitor_{key}")
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 tabs = st.tabs([
@@ -1726,6 +1854,28 @@ tabs = st.tabs([
 # ════════════════════════════════════════════════════════════════════════════════
 with tabs[0]:
     st.header("Monetary Policy & Rates")
+
+    with st.expander("Rates Monitor — outrights, spreads & flies", expanded=True):
+        with st.spinner("Building rates monitor…"):
+            try:
+                rm_out, rm_spr, rm_fly, rm_fund, rm_fund_dt = build_rates_monitor()
+            except Exception as e:
+                st.warning(f"Could not build the rates monitor: {e}")
+                rm_out = None
+        if rm_out is not None:
+            st.caption(f"Carry is for receiving each tenor funded at SOFR ({rm_fund:.2f}%, {rm_fund_dt:%d %b}). "
+                       "Carry (bp/yr) = (yield − SOFR) × 100, annualised running carry. Breakeven carry = that ÷ modified "
+                       "duration (the yield rise one year of carry offsets). Roll 1Y = rolldown on today's curve. "
+                       "C+R / Vol = (breakeven carry + roll) ÷ 1Y realised vol. Tenors of 1Y and under (and flies using them) are "
+                       "blank there, since they mature inside the 1Y horizon. Spreads & flies are DV01-neutral and shown for being LONG the spread (steepener / "
+                       "long fly, i.e. paying the positive-weight legs). Z-scores and percentiles use full history, "
+                       "independent of the date slider.")
+            with st.expander("Outright Rates", expanded=True):
+                render_rates_monitor_table(rm_out, "outright", show_running=True)
+            with st.expander("Spreads", expanded=True):
+                render_rates_monitor_table(rm_spr, "spreads", show_running=False)
+            with st.expander("Flies", expanded=True):
+                render_rates_monitor_table(rm_fly, "flies", show_running=False)
     with st.spinner("Loading monetary data…"):
         maturities = {
             "1M":"DGS1MO","3M":"DGS3MO","6M":"DGS6MO","1Y":"DGS1",
@@ -2152,7 +2302,6 @@ with tabs[0]:
     upcoming, issuance_summary = get_upcoming_issuances(auctions, days_ahead)
     maturing, maturity_summary = get_maturing_treasuries(auctions, days_ahead)
     outstanding_mat, outstanding_maturity_summary = get_outstanding_by_remaining_maturity(auctions)
-    issuance_maturity_summary = get_upcoming_issuance_by_maturity_bucket(auctions, days_ahead)
 
     combined = pd.merge(issuance_summary, maturity_summary, on="security_term_week_year", how="outer").fillna(0)
     combined = _sort_by_tenor(combined, "security_term_week_year")
@@ -2251,27 +2400,6 @@ with tabs[0]:
     fig_btc.update_layout(**base_layout(f"Bid-to-Cover Ratio — {bc_type}s"))
     add_recessions(fig_btc, recessions)
 
-    # Outstanding + new issuance - current outstanding balance plus whatever's being newly
-    # issued in the selected forward window, both bucketed on the same remaining-maturity
-    # ladder (a 17-Week bill lands in 3M, a 26-Week bill in 6M, etc. - see
-    # get_upcoming_issuance_by_maturity_bucket). Does not net out maturities - that's what the
-    # "Issuance vs Maturity" chart above already covers.
-    outstanding_plus_new = pd.merge(
-        outstanding_maturity_summary, issuance_maturity_summary, on="maturity_bucket", how="left"
-    ).fillna(0)
-    outstanding_plus_new = outstanding_plus_new.iloc[outstanding_plus_new["maturity_bucket"].map(_MATURITY_LADDER_ORDER).argsort()]
-    outstanding_plus_new["Outstanding + New Issuance (Billion $)"] = (
-        outstanding_plus_new["Outstanding (Billion $)"] + outstanding_plus_new["Total Issuance (Billion $)"])
-    fig_outstanding_plus_new = go.Figure()
-    fig_outstanding_plus_new.add_trace(go.Bar(x=outstanding_plus_new["maturity_bucket"], y=outstanding_plus_new["Outstanding (Billion $)"],
-                                               name="Current Outstanding", marker_color="#ab47bc"))
-    fig_outstanding_plus_new.add_trace(go.Bar(x=outstanding_plus_new["maturity_bucket"], y=outstanding_plus_new["Total Issuance (Billion $)"],
-                                               name=f"New Issuance (Next {days_ahead}d)", marker_color="#26a69a"))
-    fig_outstanding_plus_new.update_layout(**base_layout(
-        f"Outstanding + New Issuance ({days_ahead}d, "
-        f"${outstanding_plus_new['Outstanding + New Issuance (Billion $)'].sum():,.0f}B)"))
-    fig_outstanding_plus_new.update_layout(barmode="stack")
-
     # Issuance by tenor over time - quarterly stacked area, selected date range. Answers "how
     # has the magnitude (and mix) of issuance across tenors changed over time" directly: total
     # stack height is total quarterly issuance, band thickness is that tenor's share.
@@ -2286,7 +2414,7 @@ with tabs[0]:
                 x=issuance_over_time.index, y=issuance_over_time[tenor], name=tenor,
                 mode="lines", stackgroup="one", line=dict(width=0.5, color=TENOR_PALETTE[i % len(TENOR_PALETTE)]),
             ))
-    fig_issuance_time.update_layout(**base_layout("Issuance by Tenor Over Time (Quarterly, Billion $)", height=520))
+    fig_issuance_time.update_layout(**base_layout("Issuance by Tenor Over Time (Quarterly, Billion $)"))
     fig_issuance_time.update_yaxes(title="Issuance (Billion $)")
     add_recessions(fig_issuance_time, recessions)
 
@@ -2296,10 +2424,62 @@ with tabs[0]:
         ("Issuance vs Maturity", fig_supply_bar, combined),
         ("Outstanding by Remaining Maturity", fig_outstanding_maturity, outstanding_maturity_summary),
         ("Bid-to-Cover Trend", fig_btc, bc_hist[["auction_date", "security_term_week_year", "bid_to_cover_ratio"]]),
-        ("Outstanding + New Issuance", fig_outstanding_plus_new, outstanding_plus_new),
         ("Issuance by Tenor Over Time", fig_issuance_time, issuance_over_time.reset_index()),
     ]
     render_two_col(treasury_charts)
+
+    # Net issuance vs EFFR − SOFR. Net = accepted amounts settling that day (issue_date) minus accepted
+    # amounts maturing that day (maturity_date), every marketable security in the auctions data (bills,
+    # notes, bonds, TIPS, FRNs; since 1990, so every still-outstanding maturity is captured). Capped at
+    # today - already-auctioned settlements a few days out would otherwise show with no maturities.
+    st.markdown("**Net Issuance vs EFFR − SOFR**")
+    ni_gran = st.radio("Granularity", ["Daily", "Weekly", "Monthly"], index=1, horizontal=True, key="ni_gran")
+    _ni_gross = auctions.groupby("issue_date")["total_accepted"].sum() / 1e9
+    _ni_mat = auctions.groupby("maturity_date")["total_accepted"].sum() / 1e9
+    ni_df = pd.DataFrame({"Gross": _ni_gross, "Maturing": _ni_mat}).fillna(0)
+    ni_df["Net"] = ni_df["Gross"] - ni_df["Maturing"]
+    ni_end = min(pd.Timestamp(END), pd.Timestamp.today().normalize())
+    ni_df = ni_df[(ni_df.index >= pd.Timestamp(START)) & (ni_df.index <= ni_end)].sort_index()
+    try:
+        _effr, _sofr = _fred_full("EFFR").dropna(), _fred_full("SOFR").dropna()
+        effr_sofr = ((_effr - _sofr) * 100).dropna()
+    except Exception as e:
+        st.warning(f"Could not load EFFR / SOFR: {e}")
+        effr_sofr = pd.Series(dtype=float)
+    effr_sofr = effr_sofr[(effr_sofr.index >= pd.Timestamp(START)) & (effr_sofr.index <= ni_end)]
+    _rule = {"Daily": None, "Weekly": "W-FRI", "Monthly": "MS"}[ni_gran]
+    ni_bars = ni_df.resample(_rule).sum() if _rule else ni_df
+    ni_line = effr_sofr.resample(_rule).mean() if _rule else effr_sofr
+    ni_bars, ni_line = ni_bars.round(1), ni_line.round(2)
+    _xfmt = "%b %Y" if ni_gran == "Monthly" else ("w/e %d %b %Y" if ni_gran == "Weekly" else "%d %b %Y")
+    fig_ni = go.Figure()
+    fig_ni.add_trace(go.Bar(
+        x=ni_bars.index, y=ni_bars["Net"], name="Net issuance ($bn)",
+        marker_color=["#26a69a" if v >= 0 else "#ef5350" for v in ni_bars["Net"]],
+        customdata=np.column_stack([ni_bars["Gross"], ni_bars["Maturing"]]),
+        hovertemplate=f"%{{x|{_xfmt}}}<br>Net: $%{{y:,.1~f}}bn<br>Gross: $%{{customdata[0]:,.1~f}}bn · "
+                      f"Maturing: $%{{customdata[1]:,.1~f}}bn<extra></extra>"))
+    fig_ni.add_trace(go.Scatter(
+        x=ni_line.index, y=ni_line.values, yaxis="y2", mode="lines" if ni_gran == "Daily" else "lines+markers",
+        name="EFFR − SOFR (bp)" if ni_gran == "Daily" else f"EFFR − SOFR (bp, {ni_gran.lower()} avg)",
+        line=dict(color="#ffd54f", width=1.6),
+        # "~" drops trailing zeros: -3 not -3.00, -2.67 stays -2.67
+        hovertemplate=f"%{{x|{_xfmt}}}<br>EFFR − SOFR: %{{y:+.2~f}} bp<extra></extra>"))
+    fig_ni.add_hline(y=0, line_color="#555")
+    fig_ni.update_layout(**dual_axis_layout(f"Net Treasury Issuance ({ni_gran.lower()}, $bn) vs EFFR − SOFR (bp)",
+                                            "Net issuance ($bn)", "EFFR − SOFR (bp)"))
+    fig_ni.update_layout(bargap=0 if ni_gran == "Daily" else 0.15,
+                         yaxis=dict(tickformat=",~f"), yaxis2=dict(tickformat="~f"))
+    add_recessions(fig_ni, recessions)
+    st.plotly_chart(fig_ni, use_container_width=True, key="chart_net_issuance")
+    if not ni_df.empty and not effr_sofr.empty:
+        _big = ni_df["Net"] >= ni_df["Net"].quantile(0.9)
+        _e_big = effr_sofr.reindex(ni_df.index[_big]).mean()
+        _e_rest = effr_sofr.reindex(ni_df.index[~_big]).mean()
+        st.caption(f"In the selected range: net issuance ${ni_df['Net'].sum():,.0f}bn. Avg EFFR − SOFR on the heaviest 10% "
+                   f"of settlement days {_e_big:+.1f}bp vs {_e_rest:+.1f}bp on all other days. Weekly/monthly bars sum net "
+                   "issuance; the line is the period-average EFFR − SOFR. Excludes buybacks and TIPS inflation accretion.")
+    csv_download(pd.concat([ni_bars, ni_line.rename("EFFR-SOFR (bp)")], axis=1), "net_issuance_vs_effr_sofr")
 
 
 # ════════════════════════════════════════════════════════════════════════════════
