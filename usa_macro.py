@@ -2409,11 +2409,22 @@ with tabs[0]:
                       "#d4e157", "#ffee58", "#ffca28", "#ffa726", "#ff7043", "#ef5350",
                       "#ec407a", "#ab47bc", "#7e57c2", "#5c6bc0"]
     if not issuance_over_time.empty:
+        # The latest quarter is usually still in progress, so its stack is a quarter-to-date total that
+        # can look like a collapse (e.g. one day into Q4) - label it QTD in the hover and shade it.
+        _cur_q = pd.Timestamp.today().to_period("Q").start_time
+        _qtd = issuance_over_time.index[-1] == _cur_q
+        _qlabels = [f"{d.year} Q{(d.month - 1) // 3 + 1}" + (" (QTD)" if _qtd and d == _cur_q else "")
+                    for d in issuance_over_time.index]
         for i, tenor in enumerate(issuance_over_time.columns):
             fig_issuance_time.add_trace(go.Scatter(
                 x=issuance_over_time.index, y=issuance_over_time[tenor], name=tenor,
                 mode="lines", stackgroup="one", line=dict(width=0.5, color=TENOR_PALETTE[i % len(TENOR_PALETTE)]),
+                customdata=_qlabels, hovertemplate=f"%{{customdata}}<br>{tenor}: $%{{y:,.1f}}B<extra></extra>",
             ))
+        if _qtd and len(issuance_over_time) > 1:
+            fig_issuance_time.add_vrect(x0=issuance_over_time.index[-2], x1=_cur_q, fillcolor="rgba(255,255,255,0.06)",
+                                        line_width=0, annotation_text="QTD", annotation_position="top right",
+                                        annotation_font=dict(size=11, color="#ffd54f"))
     fig_issuance_time.update_layout(**base_layout("Issuance by Tenor Over Time (Quarterly, Billion $)"))
     fig_issuance_time.update_yaxes(title="Issuance (Billion $)")
     add_recessions(fig_issuance_time, recessions)
