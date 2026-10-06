@@ -3543,7 +3543,7 @@ with tabs[1]:
     corr_win_label = f"{corr_win}D"
     level_cols = {}
     for df_c, src_col, name in [(spy_full, "SPY", "SPY"), (y2_full, "2Y Yield", "2Y Yield"),
-                                (y10_full, "10Y Yield", "10Y Yield"),
+                                (y10_full, "10Y Yield", "10Y Yield"), (y30_full, "30Y Yield", "30Y Yield"),
                                 (corr_extra_full["BZ=F"], "Brent", "Brent"), (gold_full, "Gold", "Gold"),
                                 (dxy_full, "DXY", "DXY"), (corr_extra_full["BTC-USD"], "BTC", "BTC"),
                                 (vix_full, "VIX", "VIX"), (corr_extra_full["^MOVE"], "MOVE", "MOVE")]:
@@ -3558,7 +3558,7 @@ with tabs[1]:
         levels = levels[levels.index <= pd.Timestamp(END)]
         changes = pd.DataFrame(index=levels.index)
         for name in levels.columns:
-            if name in ("2Y Yield", "10Y Yield"):
+            if name in ("2Y Yield", "10Y Yield", "30Y Yield"):
                 changes[name] = levels[name].diff() * 100            # bps
             elif name in ("VIX", "MOVE"):
                 changes[name] = levels[name].diff()                  # vol points
@@ -3584,7 +3584,7 @@ with tabs[1]:
     st.plotly_chart(fig_cm, use_container_width=True, key="chart_cross_asset_corr_matrix")
     csv_download(corr_matrix, f"cross_asset_correlation_{corr_win_label}")
     st.caption("Correlations of daily changes over the selected window: % returns for SPY, Brent, Gold, DXY "
-               "and BTC; bps changes for the 2Y/10Y Treasury yields; point changes for VIX and MOVE (the ICE "
+               "and BTC; bps changes for the 2Y/10Y/30Y Treasury yields; point changes for VIX and MOVE (the ICE "
                "BofA MOVE index - implied volatility of Treasuries, i.e. the bond market's VIX). Yield signs are "
                "the reverse of bond-price signs: SPY vs 10Y yield < 0 means stocks fall when yields rise, i.e. "
                "stocks and bond PRICES move together - the same thing as a positive SPY/TLT correlation above. "
