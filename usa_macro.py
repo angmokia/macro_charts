@@ -1213,6 +1213,10 @@ SECTOR_ETFS = {
     "XLB": "Materials", "XLU": "Utilities", "XLRE": "Real Estate", "XLC": "Comm. Services",
 }
 MARKET_INDICES = {"^GSPC": "S&P 500", "^IXIC": "Nasdaq", "^RUT": "Russell 2000", "^DJI": "Dow Jones"}
+# Extra series for the cross-asset correlation matrix (one batched download). ^MOVE is the ICE
+# BofA MOVE index - Yahoo's metadata name for it is wrong, but its history matches MOVE (verified:
+# 163.7 on 2020-03-09, 160.7 on 2022-10-12, 182.6 on 2023-03-20).
+CORR_EXTRA_TICKERS = {"BZ=F": "Brent", "BTC-USD": "BTC", "^MOVE": "MOVE"}
 MARKETS_HIST_START = "2015-01-01"  # independent of the global slider - z-scores need a
                                     # trailing window regardless of the selected display range
 
@@ -1666,6 +1670,7 @@ for _tkr in ("SPY", "TLT", "^VIX", "DX-Y.NYB", "GC=F"):
     prefetch(_yf_close_raw, _tkr, MARKETS_HIST_START, None)
 prefetch(_yf_batch_raw, tuple(MARKET_INDICES), MARKETS_HIST_START)
 prefetch(_yf_batch_raw, tuple(SECTOR_ETFS), MARKETS_HIST_START)
+prefetch(_yf_batch_raw, tuple(CORR_EXTRA_TICKERS), MARKETS_HIST_START)
 prefetch(_yf_last_close, "^VIX9D", every=600)
 prefetch(_yf_last_close, "^VIX3M", every=600)
 prefetch(_yf_trailing_pe, "SPY", every=600)
@@ -3415,6 +3420,7 @@ with tabs[1]:
         y30_full = fetch("DGS30", "30Y Yield", MARKETS_HIST_START, END)
         idx_full = fetch_yf_close_batch(MARKET_INDICES, MARKETS_HIST_START)
         sector_full = fetch_yf_close_batch(SECTOR_ETFS, MARKETS_HIST_START)
+        corr_extra_full = fetch_yf_close_batch(CORR_EXTRA_TICKERS, MARKETS_HIST_START)
 
         # VIX term structure - ^VIX9D/^VIX3M only ever return their single current value via
         # yfinance (confirmed live: requesting 2 years of history still returns exactly 1 row),
@@ -3524,6 +3530,65 @@ with tabs[1]:
                "SPY share buys. Rising = stocks beating gold; falling = gold beating stocks, even when SPY "
                "is up in dollars. SPY is dividend-adjusted (yfinance auto_adjust), so this is total-return "
                "SPY vs gold.")
+
+    # Cross-asset correlation matrix - correlations of daily CHANGES (not levels: levels of
+    # trending series correlate spuriously). Prices -> % returns; yields -> bps changes; vol
+    # indices -> point changes. Everything is aligned to SPY's trading calendar first (BTC trades
+    # weekends, FRED yields skip bond-market holidays), forward-filling each series' last value.
+    st.markdown('<div class="section-header">Cross-Asset Correlation Matrix</div>', unsafe_allow_html=True)
+    corr_win = int(st.number_input("Correlation matrix window (trading days, ending at the date range's end)",
+                                   min_value=10, max_value=2500, value=63, step=5, key="corr_matrix_window",
+                                   help="21 ≈ 1M, 63 ≈ 3M, 126 ≈ 6M, 252 ≈ 1Y, 756 ≈ 3Y. History starts 2015, "
+                                        "so ~2,900 days is the most available."))
+    corr_win_label = f"{corr_win}D"
+    level_cols = {}
+    for df_c, src_col, name in [(spy_full, "SPY", "SPY"), (y2_full, "2Y Yield", "2Y Yield"),
+                                (y10_full, "10Y Yield", "10Y Yield"),
+                                (corr_extra_full["BZ=F"], "Brent", "Brent"), (gold_full, "Gold", "Gold"),
+                                (dxy_full, "DXY", "DXY"), (corr_extra_full["BTC-USD"], "BTC", "BTC"),
+                                (vix_full, "VIX", "VIX"), (corr_extra_full["^MOVE"], "MOVE", "MOVE")]:
+        if not df_c.empty and src_col in df_c:
+            level_cols[name] = df_c[src_col]
+    fig_cm = go.Figure()
+    corr_matrix = pd.DataFrame()
+    if "SPY" in level_cols and len(level_cols) > 1:
+        levels = pd.DataFrame(level_cols)
+        levels.index = pd.to_datetime(levels.index)
+        levels = levels.sort_index().ffill().reindex(level_cols["SPY"].dropna().index)
+        levels = levels[levels.index <= pd.Timestamp(END)]
+        changes = pd.DataFrame(index=levels.index)
+        for name in levels.columns:
+            if name in ("2Y Yield", "10Y Yield"):
+                changes[name] = levels[name].diff() * 100            # bps
+            elif name in ("VIX", "MOVE"):
+                changes[name] = levels[name].diff()                  # vol points
+            else:
+                changes[name] = levels[name].pct_change(fill_method=None) * 100  # % return
+        window = changes.dropna(how="all").tail(corr_win)
+        corr_matrix = window.corr(min_periods=max(10, corr_win // 2)).round(2)
+        n_obs = window.notna().astype(int).T.dot(window.notna().astype(int))
+        names = list(corr_matrix.columns)
+        fig_cm.add_trace(go.Heatmap(
+            z=corr_matrix.values, x=names, y=names, zmin=-1, zmax=1,
+            colorscale=[[0, "#ef5350"], [0.5, "#161b26"], [1, "#26a69a"]],
+            text=corr_matrix.map(lambda v: "" if pd.isna(v) else f"{v:+.2f}").values,
+            texttemplate="%{text}", textfont=dict(size=12),
+            customdata=n_obs.reindex(index=names, columns=names).values,
+            hovertemplate="%{y} vs %{x}<br>Correlation: %{z:.2f}<br>Obs: %{customdata}<extra></extra>",
+            colorbar=dict(title="ρ", tickvals=[-1, -0.5, 0, 0.5, 1])))
+        win_start = window.index.min().strftime("%Y-%m-%d") if not window.empty else "?"
+        win_end = window.index.max().strftime("%Y-%m-%d") if not window.empty else "?"
+        fig_cm.update_layout(**base_layout(f"Correlation of Daily Changes — {corr_win} Trading Days ({win_start} to {win_end})", height=600))
+        fig_cm.update_yaxes(autorange="reversed", showgrid=False)
+        fig_cm.update_xaxes(side="bottom", showgrid=False)
+    st.plotly_chart(fig_cm, use_container_width=True, key="chart_cross_asset_corr_matrix")
+    csv_download(corr_matrix, f"cross_asset_correlation_{corr_win_label}")
+    st.caption("Correlations of daily changes over the selected window: % returns for SPY, Brent, Gold, DXY "
+               "and BTC; bps changes for the 2Y/10Y Treasury yields; point changes for VIX and MOVE (the ICE "
+               "BofA MOVE index - implied volatility of Treasuries, i.e. the bond market's VIX). Yield signs are "
+               "the reverse of bond-price signs: SPY vs 10Y yield < 0 means stocks fall when yields rise, i.e. "
+               "stocks and bond PRICES move together - the same thing as a positive SPY/TLT correlation above. "
+               "BTC's weekend moves are folded into the next trading day.")
 
     # Index levels, 1M/3M/1Y returns, and z-scores - returns use the same fixed trailing
     # windows as the z-scores (not the global date-range slider), so the two charts stay
