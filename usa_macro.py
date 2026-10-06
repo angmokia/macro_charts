@@ -1838,12 +1838,12 @@ def render_rates_monitor_table(df, key, show_running):
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 tabs = st.tabs([
     "Treasury & Rates",
+    "US Markets",
     "Prices",
     "Oil & Gas",
     "Labour Market",
     "Economic Activity",
     "Housing",
-    "US Markets",
     "Fiscal",
     "Indicators",
     "Economic Calendar",
@@ -2494,9 +2494,9 @@ with tabs[0]:
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-# TAB 2 — Inflation & Consumer
+# TAB 3 — Inflation & Consumer
 # ════════════════════════════════════════════════════════════════════════════════
-with tabs[1]:
+with tabs[2]:
     st.header("Inflation & Consumer")
     with st.spinner("Loading inflation data…"):
         cpi      = mom_yoy(fetch("CPIAUCSL", "CPI", START, END), "CPI")
@@ -2808,9 +2808,9 @@ with tabs[1]:
     render_two_col(inflation_charts)
 
 # ════════════════════════════════════════════════════════════════════════════════
-# TAB 3 — Oil & Gas
+# TAB 4 — Oil & Gas
 # ════════════════════════════════════════════════════════════════════════════════
-with tabs[2]:
+with tabs[3]:
     st.header("Oil & Gas")
     st.caption("Strategic Petroleum Reserve - EIA (api.eia.gov), not FRED. A different data domain "
                "from the rest of this dashboard.")
@@ -2940,9 +2940,9 @@ with tabs[2]:
     ])
 
 # ════════════════════════════════════════════════════════════════════════════════
-# TAB 4 — Labour Market
+# TAB 5 — Labour Market
 # ════════════════════════════════════════════════════════════════════════════════
-with tabs[3]:
+with tabs[4]:
     st.header("Labour Market")
     with st.spinner("Loading labour data…"):
         adp_ids = {
@@ -3128,9 +3128,9 @@ with tabs[3]:
     render_two_col(labor_charts)
 
 # ════════════════════════════════════════════════════════════════════════════════
-# TAB 5 — Economic Activity
+# TAB 6 — Economic Activity
 # ════════════════════════════════════════════════════════════════════════════════
-with tabs[4]:
+with tabs[5]:
     st.header("Economic Activity")
     st.caption("GDP and the Atlanta Fed's real-time GDPNow estimate, each paired against the 30Y "
                "Treasury yield as a full daily line (not snapped to the lower-frequency series' own "
@@ -3226,9 +3226,9 @@ with tabs[4]:
                "FRED used to provide before ISM stopped feeding it for free.")
 
 # ════════════════════════════════════════════════════════════════════════════════
-# TAB 6 — Housing
+# TAB 7 — Housing
 # ════════════════════════════════════════════════════════════════════════════════
-with tabs[5]:
+with tabs[6]:
     st.header("Housing")
     with st.spinner("Loading housing data…"):
         home_sales  = fetch("EXHOSLUSM495S", "Existing Home Sales", START, END)
@@ -3389,9 +3389,9 @@ with tabs[5]:
                "Existing Home Sales series above, which also only carries recent history.")
 
 # ════════════════════════════════════════════════════════════════════════════════
-# TAB 7 — US Markets
+# TAB 2 — US Markets
 # ════════════════════════════════════════════════════════════════════════════════
-with tabs[6]:
+with tabs[1]:
     st.header("US Markets")
     st.caption("Equities and cross-asset - a different data domain from the rest of this dashboard "
                "(yfinance, not FRED, for most of this tab). Charts respect the global date range above; "
@@ -3489,8 +3489,35 @@ with tabs[6]:
     else:
         st.info(f"Equity risk premium unavailable this run - failed to load: {', '.join(missing)}.")
 
-    st.plotly_chart(fig_corr, use_container_width=True, key="chart_stock_bond_corr")
-    csv_download(corr_df if not spy_full.empty and not tlt_full.empty else pd.DataFrame(), "stock_bond_correlation")
+    # SPY priced in gold - SPY's dollar price divided by gold's $/oz = ounces of gold one SPY
+    # share buys. Strips out dollar debasement: a rising line means equities are outperforming
+    # gold (real-asset terms), a falling line means gold is winning even if SPY rises in dollars.
+    # Built from the same cached SPY / GC=F downloads already used on this tab (no extra fetch);
+    # ratio, z-score and 200D/200W MAs all computed on the full 2015+ history, then clipped.
+    fig_spy_gold = go.Figure()
+    spy_gold_df = pd.DataFrame()
+    if not spy_full.empty and not gold_full.empty:
+        sg = pd.concat([spy_full["SPY"], gold_full["Gold"]], axis=1).ffill().dropna()
+        spy_gold_full = (sg["SPY"] / sg["Gold"]).rename("SPY in Gold (oz)").to_frame()
+        spy_gold_df = _clip_mkt(spy_gold_full).round(4)
+        if not spy_gold_df.empty:
+            sg_z = pd.Series(_z1y(spy_gold_full["SPY in Gold (oz)"]), index=spy_gold_full.index).reindex(spy_gold_df.index)
+            fig_spy_gold.add_trace(go.Scatter(
+                x=spy_gold_df.index, y=spy_gold_df["SPY in Gold (oz)"], name="SPY / Gold", line=dict(color="#eda100"),
+                customdata=sg_z.values,
+                hovertemplate="%{x|%Y-%m-%d}<br>SPY in gold: %{y:.4f} oz<br>Z (1Y): %{customdata:.2f}<extra></extra>"))
+            add_ma_overlays(fig_spy_gold, spy_gold_full, "SPY in Gold (oz)", START, END)
+    fig_spy_gold.update_layout(**base_layout("SPY Priced in Gold (oz of Gold per SPY Share)"))
+    add_recessions(fig_spy_gold, recessions)
+
+    render_two_col([
+        ("Stock/Bond Correlation (SPY vs TLT)", fig_corr, corr_df if not spy_full.empty and not tlt_full.empty else pd.DataFrame()),
+        ("SPY Priced in Gold", fig_spy_gold, spy_gold_df),
+    ])
+    st.caption("SPY in gold = SPY's price ÷ gold's $/oz (front-month COMEX futures), i.e. ounces of gold one "
+               "SPY share buys. Rising = stocks beating gold; falling = gold beating stocks, even when SPY "
+               "is up in dollars. SPY is dividend-adjusted (yfinance auto_adjust), so this is total-return "
+               "SPY vs gold.")
 
     # Index levels, 1M/3M/1Y returns, and z-scores - returns use the same fixed trailing
     # windows as the z-scores (not the global date-range slider), so the two charts stay
