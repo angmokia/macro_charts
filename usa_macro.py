@@ -1622,7 +1622,7 @@ def fetch_ism_pmi() -> pd.DataFrame:
 PREFETCH_FRED_SERIES = [
     "USREC", "EFFR", "FEDTARMDLR", "CPIAUCSL", "CPILFESL", "PCEPILFE", "UNRATE", "PAYEMS",
     "DGS10", "DGS2", "T10Y2Y", "FEDFUNDS", "M2SL", "DGS5", "DGS30", "WALCL", "TREAST", "SOFR",
-    "IORB", "RRPONTSYAWARD", "DFII5", "DFII10", "T5YIE", "T10YIE", "BAMLC0A0CM", "BAMLH0A0HYM2",
+    "IORB", "RRPONTSYAWARD", "SRFTSYD", "DFII5", "DFII10", "T5YIE", "T10YIE", "BAMLC0A0CM", "BAMLH0A0HYM2",
     "DGS1MO", "DGS3MO", "DGS6MO", "DGS1", "DGS3", "DGS7", "DGS20", "PCEPI", "PPIACO", "RSAFS",
     "IQ", "IR", "UMCSENT", "MICH", "EXPINF5YR", "CPIUFDSL", "CPIENGSL", "CUSR0000SAH1",
     "CPIAPPSL", "CPITRNSL", "CPIMEDSL", "CPIRECSL", "CPIEDUSL", "CPIOGSSL", "DMOTRG3Q086SBEA",
@@ -1887,6 +1887,7 @@ with tabs[0]:
         _rates_jobs = [
             ("WALCL", "Fed Total Assets (M)"), ("TREAST", "Fed Treasuries (M)"), ("M2SL", "M2"),
             ("SOFR", "SOFR"), ("IORB", "IORB"), ("RRPONTSYAWARD", "ON RRP"), ("EFFR", "EFFR"),
+            ("SRFTSYD", "SRF"),
             ("DFII5", "5Y Real Yield"), ("DFII10", "10Y Real Yield"),
             ("T5YIE", "5Y Breakeven"), ("T10YIE", "10Y Breakeven"),
             ("BAMLC0A0CM", "IG OAS"), ("BAMLH0A0HYM2", "HY OAS"),
@@ -1899,6 +1900,7 @@ with tabs[0]:
         sofr       = _rates_raw["SOFR"]
         iorb       = _rates_raw["IORB"]
         rrp        = _rates_raw["ON RRP"]
+        srf        = _rates_raw["SRF"]
         effr       = _rates_raw["EFFR"]
         tips_5y    = _rates_raw["5Y Real Yield"]
         tips_10y   = _rates_raw["10Y Real Yield"]
@@ -1942,11 +1944,15 @@ with tabs[0]:
 
     # Policy rates
     fig_rates = go.Figure()
-    for df_r, col, color in [(effr,"EFFR","#ef5350"),(sofr,"SOFR","#26a69a"),
-                              (iorb,"IORB","#ff9800"),(rrp,"ON RRP","#ab47bc")]:
+    # SRF = Standing Repo Facility minimum bid rate (FRED SRFTSYD, from its July 2021 launch) -
+    # the ceiling of the corridor, set at the top of the fed funds target range, just as ON RRP
+    # is the floor - so SOFR printing at/above it flags repo-market stress.
+    for df_r, col, color, dash in [(effr,"EFFR","#ef5350",None),(sofr,"SOFR","#26a69a",None),
+                                   (iorb,"IORB","#ff9800",None),(rrp,"ON RRP","#ab47bc",None),
+                                   (srf,"SRF","#eda100","dash")]:
         if not df_r.empty:
             fig_rates.add_trace(go.Scatter(x=df_r.index, y=df_r.iloc[:,0],
-                                           name=col, line=dict(color=color)))
+                                           name=col, line=dict(color=color, dash=dash)))
     fig_rates.update_layout(**base_layout("Policy Rates"))
     add_recessions(fig_rates, recessions)
 
@@ -2098,7 +2104,7 @@ with tabs[0]:
     monetary_charts = [
         ("Fed Balance Sheet", fig_fed, pd.concat([fed_total, fed_tres], axis=1)),
         ("M2 Money Supply",   fig_m2,  m2_data),
-        ("Policy Rates",      fig_rates, pd.concat([effr, sofr, iorb, rrp], axis=1)),
+        ("Policy Rates",      fig_rates, pd.concat([effr, sofr, iorb, rrp, srf], axis=1)),
         ("Yield Curve",       fig_yc,  yc),
         ("Yield Curve Changes", fig_yc_chg, None),
         ("Treasury Spreads",  fig_spreads, spreads),
