@@ -829,8 +829,9 @@ def get_upcoming_issuances(df, days_ahead):
     today = pd.Timestamp.today().normalize()
     cutoff = today + pd.Timedelta(days=days_ahead)
     upcoming = df[(df["issue_date"] >= today) & (df["issue_date"] <= cutoff)].copy()
-    if upcoming.empty:
-        return upcoming, pd.DataFrame(columns=["security_term_week_year", "Total Issuance (Billion $)"])
+    # No early return on an empty window: the steps below work on an empty frame and keep the
+    # columns the tables need (returning the raw slice crashed the Offering ($B) column with a
+    # KeyError whenever Treasury hadn't posted any auctions inside the window yet).
     upcoming["offering_amt_bil"] = upcoming["offering_amt"] / 1e9
     upcoming = upcoming[["auction_date", "issue_date", "security_type", "security_term_week_year", "cusip", "offering_amt_bil"]].sort_values("issue_date")
     summary = upcoming.groupby("security_term_week_year")["offering_amt_bil"].sum().reset_index()
@@ -843,8 +844,6 @@ def get_maturing_treasuries(df, days_ahead):
     today = pd.Timestamp.today().normalize()
     cutoff = today + pd.Timedelta(days=days_ahead)
     maturing = df[(df["maturity_date"] >= today) & (df["maturity_date"] <= cutoff)].copy()
-    if maturing.empty:
-        return maturing, pd.DataFrame(columns=["security_term_week_year", "Total Maturing (Billion $)"])
     maturing["maturing_amt_bil"] = maturing["total_accepted"].fillna(maturing["offering_amt"]) / 1e9
     maturing_out = maturing[["maturity_date", "security_type", "security_term_week_year", "cusip", "maturing_amt_bil"]].sort_values("maturity_date")
     summary = maturing.groupby("security_term_week_year")["maturing_amt_bil"].sum().reset_index()
@@ -1623,6 +1622,68 @@ def fetch_ism_pmi() -> pd.DataFrame:
 # just doesn't get the head start.
 # In render order (header cards, then tab by tab) - ~142 series against FRED's 110/min budget
 # here, so the first tabs' series go first and the last ~30 fill in as the rate window rolls.
+# ── Truflation (daily alternative US CPI) via the TRUF.NETWORK public gateway ──────────
+# Truflation's own REST API needs a paid key, but the same index is published on-chain and the
+# gateway answers read-only SQL (JSON-RPC `user.query`) with no auth - verified 2026-10-26.
+# One print a day (~12:30-13:50 UTC), daily YoY %. History before ~Aug 2025 was bulk-loaded
+# on-chain, so it is not point-in-time.
+TRUF_GATEWAY = "https://gateway.mainnet.truf.network/rpc/v1"
+TRUF_STREAM, TRUF_PROVIDER = "st1e321de22ece39a258bc2588dd2871", "0x4710a8d8f0d845da110086812a32de6d90d7ff5c"
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def truflation_headline() -> pd.Series:
+    sql = ("SELECT p.event_time, p.value, p.created_at FROM primitive_events p JOIN streams s ON s.id = p.stream_ref "
+           f"WHERE s.stream_id = '{TRUF_STREAM}' AND s.data_provider = '{TRUF_PROVIDER}' AND p.event_time >= 1262304000")
+    r = requests.post(TRUF_GATEWAY, json={"jsonrpc": "2.0", "id": 1, "method": "user.query",
+                                          "params": {"query": sql, "params": {}}}, timeout=60)
+    r.raise_for_status()
+    body = r.json()
+    if "error" in body:
+        raise RuntimeError(f"TRUF gateway: {body['error']}")
+    df = pd.DataFrame(body["result"]["values"], columns=body["result"]["column_names"])
+    df = df.astype({"event_time": "int64", "value": "float64", "created_at": "int64"})
+    df = df.sort_values(["event_time", "created_at"]).drop_duplicates("event_time", keep="last")
+    df["date"] = pd.to_datetime(df["event_time"], unit="s").dt.normalize()
+    return df.groupby("date")["value"].last().rename("Truflation YoY %")
+
+def truflation_cpi_nowcast(truf: pd.Series, cpi_level: pd.Series):
+    """Where the next headline CPI print (CPIAUCSL, SA) is heading, from Truflation.
+    YoY: last CPI YoY + a + b x (change in Truflation's monthly average) - fitted on changes over the
+    last 36 prints. Scored out-of-sample on the last 24 prints it beat both "same as last print" and a
+    levels regression (RMSE ~0.29 vs 0.32 vs 0.59pp, checked 2026-10-26): Truflation tracks CPI's
+    direction far better than its level (housing ~23% of its basket vs ~35% of CPI's).
+    MoM: implied by the YoY nowcast and the index level 12 months earlier."""
+    lvl = cpi_level.copy()
+    yoy = ((lvl / lvl.reindex(lvl.index - pd.DateOffset(months=12)).values - 1) * 100)   # by date: Oct-2025 is missing
+    tm = truf.resample("MS").mean()
+    d = pd.concat([tm.rename("t"), yoy.rename("c")], axis=1).dropna()
+    if len(d) < 40:
+        return None
+    def bridge(h):
+        dd = h.diff().dropna().iloc[-36:]
+        b, a = np.polyfit(dd["t"], dd["c"], 1)
+        return a, b
+    errs = []
+    for i in range(len(d) - 24, len(d)):
+        a, b = bridge(d.iloc[:i])
+        errs.append(d["c"].iloc[i] - (d["c"].iloc[i - 1] + a + b * (d["t"].iloc[i] - d["t"].iloc[i - 1])))
+    rmse = float(np.sqrt(np.mean(np.square(errs))))
+    a, b = bridge(d)
+    last_m = lvl.dropna().index[-1]
+    nxt = last_m + pd.DateOffset(months=1)
+    if nxt not in tm.index:
+        return None
+    y = d["c"].iloc[-1] + a + b * (tm[nxt] - d["t"].iloc[-1])
+    base_m = nxt - pd.DateOffset(months=12)
+    base = lvl.get(base_m, np.nan)
+    interp = False
+    if pd.isna(base):   # missing month (Oct-2025, shutdown): geometric mean of its neighbours
+        lo, hi = lvl.get(base_m - pd.DateOffset(months=1), np.nan), lvl.get(base_m + pd.DateOffset(months=1), np.nan)
+        base, interp = np.sqrt(lo * hi), True
+    mom = (base * (1 + y / 100) / lvl[last_m] - 1) * 100
+    return {"month": nxt, "yoy": float(y), "mom": float(mom), "band": 1.28 * rmse, "rmse": rmse,
+            "days": int(truf[(truf.index >= nxt) & (truf.index < nxt + pd.DateOffset(months=1))].count()), "base_interpolated": interp, "beta": float(b)}
+
 PREFETCH_FRED_SERIES = [
     "USREC", "EFFR", "FEDTARMDLR", "CPIAUCSL", "CPILFESL", "PCEPILFE", "UNRATE", "PAYEMS",
     "DGS10", "DGS2", "T10Y2Y", "FEDFUNDS", "M2SL", "DGS5", "DGS30", "WALCL", "TREAST", "SOFR",
@@ -1663,6 +1724,7 @@ if EIA_API_KEY:
 for _tkr in ("CL=F", "RB=F", "HO=F"):  # crack spreads - follow the date slider
     prefetch(_yf_close_raw, _tkr, START, END)
 prefetch(get_tga_balance, START, END)
+prefetch(truflation_headline)
 prefetch(get_debt_subject_to_limit, START, END)
 prefetch(get_mts_monthly)
 prefetch(get_category_spend, tuple(FISCAL_SPEND_GROUPS[next(iter(FISCAL_SPEND_GROUPS))]), "2022-01-01")
@@ -2377,6 +2439,9 @@ with tabs[0]:
         auctions = load_auctions_data()
 
     upcoming, issuance_summary = get_upcoming_issuances(auctions, days_ahead)
+    if upcoming.empty:
+        st.caption(f"No auctions with an issue date in the next {days_ahead} days have been posted yet - Treasury's "
+                   f"auction dataset currently runs to {auctions['issue_date'].max():%d %b %Y}. Widen the window or check back later.")
     maturing, maturity_summary = get_maturing_treasuries(auctions, days_ahead)
     outstanding_mat, outstanding_maturity_summary = get_outstanding_by_remaining_maturity(auctions)
 
@@ -2703,7 +2768,33 @@ with tabs[2]:
             add_rolling_mean_trace(fig_cpi, src[col], 6, "CPI YoY 6M MA", "#8a94a6")
         elif col == "Core CPI YoY %":
             add_rolling_mean_trace(fig_cpi, src[col], 6, "Core CPI YoY 6M MA", "#4fc3f7")
-    fig_cpi.update_layout(**dual_axis_layout("CPI vs Core CPI", "YoY %", "MoM %"))
+    # Truflation (daily) on the YoY axis + where the next CPI print is heading
+    cpi_nowcast = None
+    try:
+        truf = truflation_headline()
+        tc = truf[(truf.index >= pd.Timestamp(START)) & (truf.index <= pd.Timestamp(END))]
+        fig_cpi.add_trace(go.Scatter(x=tc.index, y=tc.values, name="Truflation YoY % (daily)", mode="lines", yaxis="y",
+                                     line=dict(color="#42a5f5", width=1.2),
+                                     customdata=pd.Series(_z1y(truf), index=truf.index).reindex(tc.index).values,
+                                     hovertemplate="%{x|%Y-%m-%d}<br>Truflation: %{y:.2f}%<br>Z (1Y): %{customdata:.2f}<extra></extra>"))
+        cpi_nowcast = truflation_cpi_nowcast(truf, _fred_full("CPIAUCSL"))
+    except Exception as e:
+        st.caption(f"Truflation unavailable right now ({e}).")
+    if cpi_nowcast:
+        nc = cpi_nowcast
+        fig_cpi.add_trace(go.Scatter(
+            x=[nc["month"]], y=[nc["yoy"]], name=f"{nc['month']:%b} CPI nowcast", mode="markers", yaxis="y",
+            marker=dict(color="#ffd54f", size=12, symbol="diamond"),
+            error_y=dict(type="constant", value=nc["band"], color="#ffd54f"),
+            hovertemplate=(f"{nc['month']:%b %Y} CPI nowcast<br>YoY %{{y:.2f}}% ± {nc['band']:.2f}<br>"
+                           f"MoM {nc['mom']:+.2f}%<extra></extra>")))
+        fig_cpi.add_annotation(
+            xref="paper", yref="paper", x=0.01, y=0.99, xanchor="left", yanchor="top", showarrow=False, align="left",
+            bgcolor="rgba(22,27,38,0.85)", bordercolor="#ffd54f", borderwidth=1, font=dict(size=11, color="#e0e0e0"),
+            text=(f"<b>{nc['month']:%b} CPI nowcast (Truflation)</b><br>YoY {nc['yoy']:.2f}% ± {nc['band']:.2f}"
+                  f" · MoM {nc['mom']:+.2f}%<br><span style='font-size:10px'>{nc['days']} daily prints so far · "
+                  f"out-of-sample RMSE {nc['rmse']:.2f}pp</span>"))
+    fig_cpi.update_layout(**dual_axis_layout("CPI vs Core CPI (+ Truflation)", "YoY %", "MoM %"))
     add_recessions(fig_cpi, recessions)
 
     # PCE vs Core PCE
@@ -2883,6 +2974,14 @@ with tabs[2]:
         ("PCE Components Snapshot", fig_pce_comp_snap, pce_comp_df),
     ]
     render_two_col(inflation_charts)
+    if cpi_nowcast:
+        st.caption(
+            f"Truflation: daily alternative CPI read keyless from the TRUF.NETWORK gateway. It runs below CPI in level ("
+            f"housing is ~23% of its basket vs ~35% of CPI), so the {cpi_nowcast['month']:%b} nowcast uses its direction: "
+            f"last CPI YoY + {cpi_nowcast['beta']:.2f} × the change in Truflation's monthly average; the band is the 80% range "
+            f"from its out-of-sample error on the last 24 prints. MoM is implied from the YoY and the index a year earlier"
+            + (" (that month was never published - shutdown - so its level is interpolated from its neighbours)." if cpi_nowcast["base_interpolated"] else ".")
+            + " Truflation history before ~Aug 2025 was bulk-loaded on-chain, so the band is somewhat optimistic.")
 
 # ════════════════════════════════════════════════════════════════════════════════
 # TAB 4 — Oil & Gas
