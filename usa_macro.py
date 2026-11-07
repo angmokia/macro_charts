@@ -1150,6 +1150,16 @@ def fetch_yf_close(ticker: str, label: str, start: str, end: str = None) -> pd.D
         st.warning(f"Could not load {label} ({ticker}): {e}")
         return pd.DataFrame()
 
+# Full daily history for Cboe vol indices (VIX3M etc.) - unlike yfinance's Ticker.history, the
+# Cboe CDN serves the whole series (VIX3M since 2009-09; the 307 redirect must be followed).
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_cboe_index(symbol: str) -> pd.Series:
+    r = requests.get(f"https://cdn.cboe.com/api/global/us_indices/daily_prices/{symbol}_History.csv", timeout=20)
+    r.raise_for_status()
+    d = pd.read_csv(io.StringIO(r.text))
+    d.columns = [c.strip().upper() for c in d.columns]
+    return pd.Series(d["CLOSE"].astype(float).values, index=pd.to_datetime(d["DATE"], format="%m/%d/%Y"), name=symbol)
+
 @st.cache_data(ttl=3600)
 def fetch_yf_close_batch(tickers_map: dict, start: str) -> dict:
     """Fetch Close prices for several tickers in ONE yfinance request instead of one request per
@@ -3599,6 +3609,10 @@ with tabs[1]:
         except Exception:
             vix3m_now = None
         try:
+            vix3m_hist = fetch_cboe_index("VIX3M")
+        except Exception:
+            vix3m_hist = pd.Series(dtype=float)
+        try:
             spy_pe = _yf_trailing_pe("SPY")
         except Exception:
             spy_pe = None
@@ -3845,14 +3859,42 @@ with tabs[1]:
     # VIX level
     fig_vix = go.Figure()
     vix_clipped = _clip_mkt(vix_full)
+    vix_inversions = 0
     if not vix_clipped.empty:
         vix_z = pd.Series(_z1y(vix_full["VIX"]), index=vix_full.index).reindex(vix_clipped.index)
+        # VIX / VIX3M: > 1 = backwardation (near-term fear priced above 3-month), NaN before VIX3M history
+        term_ratio = (vix_clipped["VIX"] / vix3m_hist.reindex(vix_clipped.index, method="ffill", limit=3)
+                      if not vix3m_hist.empty else pd.Series(np.nan, index=vix_clipped.index))
         fig_vix.add_trace(go.Scatter(
             x=vix_clipped.index, y=vix_clipped["VIX"], name="VIX",
             line=dict(color="#ef5350"), fill="tozeroy", fillcolor="rgba(239,83,80,0.12)",
-            customdata=vix_z.values,
-            hovertemplate="%{x|%Y-%m-%d}<br>VIX: %{y:.1f}<br>Z (1Y): %{customdata:.2f}<extra></extra>"))
-    fig_vix.update_layout(**base_layout("VIX (Implied Volatility)"))
+            customdata=np.c_[vix_z.values, term_ratio.values],
+            hovertemplate="%{x|%Y-%m-%d}<br>VIX: %{y:.1f}<br>Z (1Y): %{customdata[0]:.2f}"
+                          "<br>VIX/VIX3M: %{customdata[1]:.2f}<extra></extra>"))
+        inv = term_ratio > 1
+        if inv.any():
+            # one band per run of consecutive inverted days, extended to the next trading day so 1-day runs show
+            run_id = (inv != inv.shift()).cumsum()[inv]
+            dates = vix_clipped.index
+            for _, run in run_id.groupby(run_id):
+                end_pos = min(dates.get_loc(run.index[-1]) + 1, len(dates) - 1)
+                fig_vix.add_vrect(x0=run.index[0], x1=dates[end_pos], fillcolor="rgba(255,152,0,0.28)",
+                                  layer="below", line_width=0)
+            vix_inversions = int(run_id.nunique())
+            fig_vix.add_trace(go.Scatter(
+                x=vix_clipped.index[inv], y=vix_clipped["VIX"][inv], name="VIX > VIX3M (backwardation)",
+                mode="markers", marker=dict(color="#ff9800", size=5), customdata=term_ratio[inv].values,
+                hovertemplate="%{x|%Y-%m-%d}<br>VIX: %{y:.1f}<br><b>VIX/VIX3M: %{customdata:.2f}</b>"
+                              " - backwardation<extra></extra>"))
+        if term_ratio.notna().any():
+            fig_vix.add_trace(go.Scatter(
+                x=vix_clipped.index, y=term_ratio, name="VIX / VIX3M (right axis)", yaxis="y2",
+                line=dict(color="#4fc3f7", width=1),
+                hovertemplate="%{x|%Y-%m-%d}<br>VIX/VIX3M: %{y:.2f}<extra></extra>"))
+            fig_vix.add_shape(type="line", xref="paper", x0=0, x1=1, yref="y2", y0=1, y1=1,
+                              line=dict(dash="dot", color="#4fc3f7", width=1), opacity=0.6)
+    fig_vix.update_layout(**dual_axis_layout("VIX (Implied Volatility) · orange = VIX > VIX3M", "VIX", "VIX / VIX3M"))
+    fig_vix.update_layout(yaxis2=dict(showgrid=False, tickformat=".2f"))
     add_recessions(fig_vix, recessions)
 
     # VIX term structure - snapshot only (see note above on why no history exists for these two)
@@ -3871,9 +3913,10 @@ with tabs[1]:
         ("VIX", fig_vix, vix_clipped),
         ("VIX Term Structure", fig_vix_term, pd.DataFrame({"Tenor": term_labels, "VIX": term_vals})),
     ])
-    st.caption("VIX Term Structure is a current snapshot, not a time series - confirmed live that "
-               "yfinance only ever returns the single latest value for ^VIX9D and ^VIX3M, regardless "
-               "of how much history is requested.")
+    st.caption("VIX chart: orange bands mark days VIX closed above VIX3M (term structure in backwardation; "
+               f"{vix_inversions} separate runs in the selected range) - hover any day for the VIX/VIX3M ratio. "
+               "VIX3M history comes from the Cboe CDN (since 2009-09). The VIX Term Structure bar chart is "
+               "a current snapshot: yfinance only ever returns the single latest value for ^VIX9D and ^VIX3M.")
 
     # Dollar Index - with 200D/200W moving averages
     fig_dxy = go.Figure()
