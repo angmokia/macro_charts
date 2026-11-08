@@ -4047,12 +4047,18 @@ with tabs[1]:
         # VIX / VIX3M: > 1 = backwardation (near-term fear priced above 3-month), NaN before VIX3M history
         term_ratio = (vix_clipped["VIX"] / vix3m_hist.reindex(vix_clipped.index, method="ffill", limit=3)
                       if not vix3m_hist.empty else pd.Series(np.nan, index=vix_clipped.index))
+        # trailing-1Y z of the ratio, computed on full history so the first visible year isn't blank
+        if not vix3m_hist.empty:
+            term_full = (vix_full["VIX"] / vix3m_hist.reindex(vix_full.index, method="ffill", limit=3)).dropna()
+            term_z = pd.Series(_z1y(term_full), index=term_full.index).reindex(vix_clipped.index)
+        else:
+            term_z = pd.Series(np.nan, index=vix_clipped.index)
         fig_vix.add_trace(go.Scatter(
             x=vix_clipped.index, y=vix_clipped["VIX"], name="VIX",
             line=dict(color="#ef5350"), fill="tozeroy", fillcolor="rgba(239,83,80,0.12)",
-            customdata=np.c_[vix_z.values, term_ratio.values],
+            customdata=np.c_[vix_z.values, term_ratio.values, term_z.values],
             hovertemplate="%{x|%Y-%m-%d}<br>VIX: %{y:.1f}<br>Z (1Y): %{customdata[0]:.2f}"
-                          "<br>VIX/VIX3M: %{customdata[1]:.2f}<extra></extra>"))
+                          "<br>VIX/VIX3M: %{customdata[1]:.2f} (Z 1Y: %{customdata[2]:.2f})<extra></extra>"))
         inv = term_ratio > 1
         if inv.any():
             # one band per run of consecutive inverted days, extended to the next trading day so 1-day runs show
@@ -4065,14 +4071,15 @@ with tabs[1]:
             vix_inversions = int(run_id.nunique())
             fig_vix.add_trace(go.Scatter(
                 x=vix_clipped.index[inv], y=vix_clipped["VIX"][inv], name="VIX > VIX3M (backwardation)",
-                mode="markers", marker=dict(color="#ff9800", size=5), customdata=term_ratio[inv].values,
-                hovertemplate="%{x|%Y-%m-%d}<br>VIX: %{y:.1f}<br><b>VIX/VIX3M: %{customdata:.2f}</b>"
-                              " - backwardation<extra></extra>"))
+                mode="markers", marker=dict(color="#ff9800", size=5),
+                customdata=np.c_[term_ratio[inv].values, term_z[inv].values],
+                hovertemplate="%{x|%Y-%m-%d}<br>VIX: %{y:.1f}<br><b>VIX/VIX3M: %{customdata[0]:.2f}</b>"
+                              " - backwardation (Z 1Y: %{customdata[1]:.2f})<extra></extra>"))
         if term_ratio.notna().any():
             fig_vix.add_trace(go.Scatter(
                 x=vix_clipped.index, y=term_ratio, name="VIX / VIX3M (right axis)", yaxis="y2",
-                line=dict(color="#4fc3f7", width=1),
-                hovertemplate="%{x|%Y-%m-%d}<br>VIX/VIX3M: %{y:.2f}<extra></extra>"))
+                line=dict(color="#4fc3f7", width=1), customdata=term_z.values,
+                hovertemplate="%{x|%Y-%m-%d}<br>VIX/VIX3M: %{y:.2f}<br>Z (1Y): %{customdata:.2f}<extra></extra>"))
             fig_vix.add_shape(type="line", xref="paper", x0=0, x1=1, yref="y2", y0=1, y1=1,
                               line=dict(dash="dot", color="#4fc3f7", width=1), opacity=0.6)
     fig_vix.update_layout(**dual_axis_layout("VIX (Implied Volatility) · orange = VIX > VIX3M", "VIX", "VIX / VIX3M"))
@@ -4096,7 +4103,7 @@ with tabs[1]:
         ("VIX Term Structure", fig_vix_term, pd.DataFrame({"Tenor": term_labels, "VIX": term_vals})),
     ])
     st.caption("VIX chart: orange bands mark days VIX closed above VIX3M (term structure in backwardation; "
-               f"{vix_inversions} separate runs in the selected range) - hover any day for the VIX/VIX3M ratio. "
+               f"{vix_inversions} separate runs in the selected range) - hover any day for the VIX/VIX3M ratio and its trailing-1Y z-score. "
                "VIX3M history comes from the Cboe CDN (since 2009-09). The VIX Term Structure bar chart is "
                "a current snapshot: yfinance only ever returns the single latest value for ^VIX9D and ^VIX3M.")
 
