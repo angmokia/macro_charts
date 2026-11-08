@@ -1160,6 +1160,83 @@ def fetch_cboe_index(symbol: str) -> pd.Series:
     d.columns = [c.strip().upper() for c in d.columns]
     return pd.Series(d["CLOSE"].astype(float).values, index=pd.to_datetime(d["DATE"], format="%m/%d/%Y"), name=symbol)
 
+# ── Bottom-signal tracker ─────────────────────────────────────────────────────
+# Four "local bottom" signals that held up in a 2026-11 backtest of 28 candidates on SPX and NDX
+# back to 1985: each beat its own base rate on both indices and in both halves of its history.
+# Trigger = first day a signal fires after 10 quiet trading days; hit = index higher 21 trading
+# days later. Top/overbought signals were tested too and none worked (strength tends to persist),
+# so only bottoms are tracked. Stats below are from that backtest; the live readings are computed here.
+BOTTOM_SIGNAL_INDICES = {"^GSPC": "SPX", "^NDX": "NDX"}
+BOTTOM_SIGNALS = {
+    "move": "Bond fear: MOVE spike",
+    "pullback": "Uptrend pullback",
+    "vixfade": "VIX spike fading",
+    "low_inv": "20D low + VIX > VIX3M",
+}
+# (hit % up after 21d, base %, independent triggers, data since, median 21d return %)
+BOTTOM_SIGNAL_STATS = {
+    "SPX": {"move": (81, 66, 43, 2002, 2.4), "pullback": (80, 64, 51, 1986, 3.0),
+            "vixfade": (72, 64, 68, 1990, 2.1), "low_inv": (73, 66, 60, 2006, 3.1)},
+    "NDX": {"move": (74, 65, 43, 2002, 3.1), "pullback": (72, 63, 54, 1986, 2.8),
+            "vixfade": (75, 63, 68, 1990, 2.6), "low_inv": (72, 67, 55, 2006, 3.2)},
+}
+# >=3 of 4 active within the last 5 trading days, since 2006: (n, hit5, hit21, base21, worst21 %)
+BOTTOM_CONFLUENCE_STATS = {"SPX": (29, 54, 82, 66, -20.9), "NDX": (23, 50, 77, 67, -18.3)}
+
+
+def _rsi(s: pd.Series, n: int) -> pd.Series:
+    d = s.diff()
+    up = d.clip(lower=0).ewm(alpha=1 / n, adjust=False).mean()
+    dn = (-d.clip(upper=0)).ewm(alpha=1 / n, adjust=False).mean()
+    return 100 - 100 / (1 + up / dn)
+
+
+def compute_bottom_signals(px: pd.Series, vix: pd.Series, vix3m: pd.Series, move: pd.Series) -> pd.DataFrame:
+    """Daily flags for the four bottom signals on px's dates, plus the readings behind them.
+    VIX/MOVE features are built on their own calendars, then aligned (ffill <= 3 days)."""
+    px = px.dropna()
+    idx = px.index
+    al = lambda s: s.reindex(idx, method="ffill", limit=3)
+    vma = vix.rolling(20).mean()
+    vix_fade = (vix.shift() >= 1.25 * vma.shift()) & (vix.pct_change() <= -0.10)
+    term = vix / vix3m.reindex(vix.index, method="ffill", limit=3) if not vix3m.empty else vix * np.nan
+    move_pct = move.rolling(252, min_periods=200).rank(pct=True) * 100 if not move.empty else pd.Series(dtype=float)
+    ma200, rsi14, lo20 = px.rolling(200).mean(), _rsi(px, 14), px.rolling(20).min()
+    out = pd.DataFrame({
+        "px": px, "ma200": ma200, "rsi14": rsi14, "lo20": lo20,
+        "vix": al(vix), "vix_vs_avg": al(vix / vma - 1) * 100, "vix_chg": al(vix.pct_change()) * 100,
+        "vix_prev_vs_avg": al((vix / vma - 1).shift()) * 100,
+        "term": al(term), "move_lvl": al(move), "move_pct": al(move_pct),
+    })
+    out["move"] = out["move_pct"].ge(90)
+    out["pullback"] = (px > ma200) & (rsi14 < 35)
+    out["vixfade"] = al(vix_fade.astype(float)).fillna(0).astype(bool)
+    out["low_inv"] = (px <= lo20) & out["term"].gt(1)
+    recent = out[list(BOTTOM_SIGNALS)].rolling(5, min_periods=1).max().astype(bool)
+    out["score"] = recent.sum(axis=1)
+    for k in BOTTOM_SIGNALS:
+        out[f"{k}_recent"] = recent[k]
+    return out
+
+
+def bottom_confluence_triggers(sig: pd.DataFrame, thr: int = 3) -> pd.DataFrame:
+    """First day the 5-day score reaches thr after 10 quiet days, with forward returns from that close."""
+    m = sig["score"] >= thr
+    prev = m.shift(1, fill_value=False).rolling(10, min_periods=1).max().astype(bool)
+    px = sig["px"]
+    rows = []
+    for d in sig.index[m & ~prev]:
+        i = px.index.get_loc(d)
+        row = {"Date": d.date(), "Close": round(px.iloc[i], 1), "Active": int(sig["score"].iloc[i])}
+        for h in (5, 10, 21):
+            row[f"{h}D %"] = (px.iloc[i + h] / px.iloc[i] - 1) * 100 if i + h < len(px) else np.nan
+        win = px.iloc[i + 1:i + 22]  # only reported once the full 21-day window has printed
+        row["21D trough %"] = (win.min() / px.iloc[i] - 1) * 100 if len(win) == 21 else np.nan
+        row["21D peak %"] = (win.max() / px.iloc[i] - 1) * 100 if len(win) == 21 else np.nan
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
 @st.cache_data(ttl=3600)
 def fetch_yf_close_batch(tickers_map: dict, start: str) -> dict:
     """Fetch Close prices for several tickers in ONE yfinance request instead of one request per
@@ -1743,6 +1820,7 @@ for _tkr in ("SPY", "TLT", "^VIX", "DX-Y.NYB", "GC=F"):
 prefetch(_yf_batch_raw, tuple(MARKET_INDICES), MARKETS_HIST_START)
 prefetch(_yf_batch_raw, tuple(SECTOR_ETFS), MARKETS_HIST_START)
 prefetch(_yf_batch_raw, tuple(CORR_EXTRA_TICKERS), MARKETS_HIST_START)
+prefetch(_yf_batch_raw, tuple(BOTTOM_SIGNAL_INDICES), MARKETS_HIST_START)
 prefetch(_yf_last_close, "^VIX9D", every=600)
 prefetch(_yf_last_close, "^VIX3M", every=600)
 prefetch(_yf_trailing_pe, "SPY", every=600)
@@ -3596,6 +3674,7 @@ with tabs[1]:
         idx_full = fetch_yf_close_batch(MARKET_INDICES, MARKETS_HIST_START)
         sector_full = fetch_yf_close_batch(SECTOR_ETFS, MARKETS_HIST_START)
         corr_extra_full = fetch_yf_close_batch(CORR_EXTRA_TICKERS, MARKETS_HIST_START)
+        bottom_idx_full = fetch_yf_close_batch(BOTTOM_SIGNAL_INDICES, MARKETS_HIST_START)
 
         # VIX term structure - ^VIX9D/^VIX3M only ever return their single current value via
         # yfinance (confirmed live: requesting 2 years of history still returns exactly 1 row),
@@ -3917,6 +3996,121 @@ with tabs[1]:
                f"{vix_inversions} separate runs in the selected range) - hover any day for the VIX/VIX3M ratio. "
                "VIX3M history comes from the Cboe CDN (since 2009-09). The VIX Term Structure bar chart is "
                "a current snapshot: yfinance only ever returns the single latest value for ^VIX9D and ^VIX3M.")
+
+    # ── Bottom-signal tracker (see BOTTOM_SIGNALS for the backtest behind it) ──────────────
+    st.markdown('<div class="section-header">Bottom-Signal Tracker</div>', unsafe_allow_html=True)
+    bs_name = st.radio("Index", list(BOTTOM_SIGNAL_INDICES.values()), horizontal=True, key="bottom_idx",
+                       label_visibility="collapsed")
+    bs_tkr = {v: k for k, v in BOTTOM_SIGNAL_INDICES.items()}[bs_name]
+    bs_px = bottom_idx_full.get(bs_tkr, pd.DataFrame())
+    bs_move = corr_extra_full.get("^MOVE", pd.DataFrame())
+    if bs_px.empty or vix_full.empty:
+        st.info("Bottom-signal tracker unavailable: index or VIX history failed to load.")
+    else:
+        bs = compute_bottom_signals(bs_px.iloc[:, 0], vix_full["VIX"], vix3m_hist,
+                                    bs_move.iloc[:, 0] if not bs_move.empty else pd.Series(dtype=float))
+        bs_last, bs_asof = bs.iloc[-1], bs.index[-1]
+        n_act = int(bs_last["score"])
+        cn, c5, c21, cb, cw = BOTTOM_CONFLUENCE_STATS[bs_name]
+        act_cls = "positive" if n_act >= 3 else "neutral"
+        st.markdown(f"""
+        <div class="metric-card" style="text-align:left">
+          <div class="metric-label">{bs_name} · signals active in the last 5 trading days · as of {bs_asof:%d %b %Y}</div>
+          <div class="metric-value {act_cls}">{n_act} of 4</div>
+          <div class="metric-delta neutral">When 3+ were active together (since 2006): {bs_name} higher 21 trading days later
+            <b>{c21}%</b> of the time (n {cn}, base {cb}%), but only {c5}% after 5 days, and the worst 21D outcome was {cw:+.1f}%.
+            Read it as "a low is forming within weeks", not "today is the low".</div>
+        </div>""", unsafe_allow_html=True)
+
+        def _fmt_last(k):
+            hits = bs.index[bs[k]]
+            return f"{hits[-1]:%d %b %Y}" if len(hits) else "not since 2015"
+
+        readings = {
+            "move": (f"MOVE {bs_last['move_lvl']:.0f} · {bs_last['move_pct']:.0f}th pct of 1Y (needs ≥ 90)"
+                     if pd.notna(bs_last["move_pct"]) else "MOVE n/a"),
+            "pullback": (f"RSI14 {bs_last['rsi14']:.1f} (needs < 35) · {(bs_last['px'] / bs_last['ma200'] - 1) * 100:+.1f}% "
+                         "vs 200D (needs > 0)"),
+            "vixfade": (f"VIX {bs_last['vix_chg']:+.1f}% today (needs ≤ −10%) · "
+                        f"prior day {bs_last['vix_prev_vs_avg']:+.0f}% vs 20D avg (needs ≥ +25%)"),
+            "low_inv": (f"{(bs_last['px'] / bs_last['lo20'] - 1) * 100:+.1f}% above 20D low · "
+                        f"VIX/VIX3M {bs_last['term']:.2f} (needs > 1)"),
+        }
+        bs_cols = st.columns(4)
+        for col, (k, label) in zip(bs_cols, BOTTOM_SIGNALS.items()):
+            hit, base, n, since, med = BOTTOM_SIGNAL_STATS[bs_name][k]
+            if bs_last[k]:
+                status, cls = "FIRING TODAY", "positive"
+            elif bs_last[f"{k}_recent"]:
+                status, cls = "ACTIVE (last 5D)", "positive"
+            else:
+                status, cls = "OFF", "neutral"
+            with col:
+                st.markdown(f"""
+                <div class="metric-card" style="min-height:190px">
+                  <div class="metric-label">{label}</div>
+                  <div class="metric-value {cls}">{status}</div>
+                  <div class="metric-delta neutral">{readings[k]}</div>
+                  <div class="metric-z"><span class="neutral">{hit}% up after 21D vs {base}% base · n {n} since {since} · median {med:+.1f}%</span></div>
+                  <div class="metric-asof">last fired {_fmt_last(k)}</div>
+                </div>""", unsafe_allow_html=True)
+
+        # Chart: index with 3+-active stretches shaded and confluence triggers marked; score below.
+        bs_trig = bottom_confluence_triggers(bs)
+        bs_c = bs[(bs.index >= START) & (bs.index <= END)]
+        fig_bs = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.72, 0.28], vertical_spacing=0.04)
+        fig_bs.add_trace(go.Scatter(x=bs_c.index, y=bs_c["px"], name=bs_name, line=dict(color="#90a4d4", width=1.4),
+                                    customdata=bs_c["score"],
+                                    hovertemplate="%{x|%Y-%m-%d}<br>" + bs_name + ": %{y:,.0f}<br>Active: %{customdata} of 4<extra></extra>"),
+                         row=1, col=1)
+        hot = bs_c["score"] >= 3
+        if hot.any():
+            run_id = (hot != hot.shift()).cumsum()[hot]
+            dates = bs_c.index
+            for _, run in bs_c[hot].groupby(run_id):
+                end_pos = min(dates.get_loc(run.index[-1]) + 1, len(dates) - 1)
+                fig_bs.add_vrect(x0=run.index[0], x1=dates[end_pos], fillcolor="rgba(38,166,154,0.22)",
+                                 line_width=0, layer="below", row=1, col=1)
+        if not bs_trig.empty:
+            td = pd.to_datetime(bs_trig["Date"])
+            sel = (td >= START) & (td <= END)
+            fig_bs.add_trace(go.Scatter(
+                x=td[sel], y=bs_trig.loc[sel, "Close"], mode="markers", name="3+ active (trigger)",
+                marker=dict(symbol="triangle-up", size=11, color="#26a69a", line=dict(color="#e0e0e0", width=1)),
+                customdata=bs_trig.loc[sel, ["21D %", "21D trough %"]].values,
+                hovertemplate="%{x|%Y-%m-%d} trigger<br>21D: %{customdata[0]:+.1f}%<br>21D trough: %{customdata[1]:+.1f}%<extra></extra>"),
+                row=1, col=1)
+        fig_bs.add_trace(go.Scatter(x=bs_c.index, y=bs_c["score"], name="Signals active (5D)", mode="lines",
+                                    line=dict(color="#26a69a", width=1, shape="hv"), fill="tozeroy",
+                                    fillcolor="rgba(38,166,154,0.35)",
+                                    hovertemplate="%{x|%Y-%m-%d}: %{y} of 4<extra></extra>"), row=2, col=1)
+        fig_bs.add_shape(type="line", xref="x2 domain", x0=0, x1=1, yref="y2", y0=3, y1=3,
+                         line=dict(color="#8a94a6", width=1, dash="dot"))
+        fig_bs.update_layout(template=TEMPLATE, paper_bgcolor=PAPER_BG, plot_bgcolor=PLOT_BG, height=520,
+                             margin=dict(l=10, r=10, t=50, b=30),
+                             title=f"{bs_name} · green = 3+ bottom signals active in a 5-day window",
+                             legend=dict(orientation="h", y=-0.08, yanchor="top"))
+        fig_bs.update_yaxes(range=[0, 4.2], dtick=1, row=2, col=1, title_text="Active")
+        fig_bs.update_xaxes(gridcolor=GRID_COLOR)
+        fig_bs.update_yaxes(gridcolor=GRID_COLOR)
+        st.plotly_chart(fig_bs, use_container_width=True, key="chart_bottom_signals")
+
+        with st.expander(f"Every 3+ trigger on {bs_name} since 2015 (forward returns from the trigger close)"):
+            if bs_trig.empty:
+                st.write("No triggers in the loaded history.")
+            else:
+                # Pre-formatted strings: st.dataframe ignores the Styler's na_rep and shows "None"
+                bs_show = bs_trig.iloc[::-1].copy()
+                for c in [c for c in bs_show.columns if c.endswith("%")]:
+                    bs_show[c] = bs_show[c].map(lambda v: "pending" if pd.isna(v) else f"{v:+.1f}")
+                bs_show["Close"] = bs_show["Close"].map("{:,.1f}".format)
+                st.dataframe(bs_show, use_container_width=True, hide_index=True)
+        st.caption("Four bottom signals that beat their own base rate on both SPX and NDX and in both halves of "
+                   "their history, out of 28 tested back to 1985 (trigger = first day after 10 quiet days; hit = "
+                   "index higher 21 trading days later). No overbought/top signal passed the same test - stretched, "
+                   "calm markets usually kept rising - so none is shown. Hit rates are on daily closes with no costs; "
+                   "samples are 40-70 independent triggers, so treat them as odds, not certainties. Live readings use "
+                   "yfinance (index, VIX, MOVE) and Cboe (VIX3M); history loaded since 2015.")
 
     # Dollar Index - with 200D/200W moving averages
     fig_dxy = go.Figure()
