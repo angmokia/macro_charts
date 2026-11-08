@@ -1709,29 +1709,76 @@ def fetch_ism_pmi() -> pd.DataFrame:
 # just doesn't get the head start.
 # In render order (header cards, then tab by tab) - ~142 series against FRED's 110/min budget
 # here, so the first tabs' series go first and the last ~30 fill in as the rate window rolls.
-# ── Truflation (daily alternative US CPI) via the TRUF.NETWORK public gateway ──────────
-# Truflation's own REST API needs a paid key, but the same index is published on-chain and the
-# gateway answers read-only SQL (JSON-RPC `user.query`) with no auth - verified 2026-10-26.
+# ── Truflation (daily alternative US CPI) via TRUF.NETWORK ─────────────────────────────
+# Truflation's own REST API needs a paid key, but the same index is published on-chain. Until late
+# Oct-2026 the gateway answered raw read-only SQL (`user.query`); it now rejects that with HTTP 403
+# "adhoc query not allowed", so reads go through the official SDK (`trufnetwork-sdk-py`, free signed
+# reads with a throwaway key). The SDK only ships Python 3.12 wheels, so it runs in-process when it's
+# importable, otherwise in a 3.12 venv (TRUF_PYTHON env var, or python_folder/.venv_truf). The last
+# good pull is kept on disk so an outage shows stale data rather than nothing.
 # One print a day (~12:30-13:50 UTC), daily YoY %. History before ~Aug 2025 was bulk-loaded
 # on-chain, so it is not point-in-time.
-TRUF_GATEWAY = "https://gateway.mainnet.truf.network/rpc/v1"
+TRUF_GATEWAY = "https://gateway.mainnet.truf.network"
 TRUF_STREAM, TRUF_PROVIDER = "st1e321de22ece39a258bc2588dd2871", "0x4710a8d8f0d845da110086812a32de6d90d7ff5c"
+TRUF_CACHE = os.path.join(os.path.expanduser("~"), ".cache", "usa_macro", "truflation_yoy.parquet")
+TRUF_VENV_PY = os.environ.get("TRUF_PYTHON") or os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), ".venv_truf", "bin", "python")
+_TRUF_SDK_SCRIPT = f"""
+import json, secrets, time
+from trufnetwork_sdk_py.client import TNClient
+c = TNClient("{TRUF_GATEWAY}", secrets.token_hex(32))
+r = c.get_records(stream_id="{TRUF_STREAM}", data_provider="{TRUF_PROVIDER}", date_from=1262304000,
+                  date_to=int(time.time()), use_cache=False)
+print(json.dumps([[int(x["EventTime"]), float(x["Value"])] for x in getattr(r, "data", r)]))
+"""
+
+def _truflation_sdk_records():
+    import importlib.util, subprocess, sys, json as _json
+    py = sys.executable if importlib.util.find_spec("trufnetwork_sdk_py") else TRUF_VENV_PY
+    if not os.path.exists(py):
+        raise RuntimeError("TRUF.NETWORK no longer allows keyless SQL reads (403 'adhoc query not allowed') and the "
+                           "trufnetwork-sdk-py Python 3.12 venv isn't set up")
+    out = subprocess.run([py, "-c", _TRUF_SDK_SCRIPT], capture_output=True, text=True, timeout=90)
+    if out.returncode != 0:
+        raise RuntimeError(f"TRUF SDK failed: {(out.stderr or out.stdout).strip().splitlines()[-1][:200]}")
+    return _json.loads(out.stdout)
 
 @st.cache_data(ttl=21600, show_spinner=False)
 def truflation_headline() -> pd.Series:
-    sql = ("SELECT p.event_time, p.value, p.created_at FROM primitive_events p JOIN streams s ON s.id = p.stream_ref "
-           f"WHERE s.stream_id = '{TRUF_STREAM}' AND s.data_provider = '{TRUF_PROVIDER}' AND p.event_time >= 1262304000")
-    r = requests.post(TRUF_GATEWAY, json={"jsonrpc": "2.0", "id": 1, "method": "user.query",
-                                          "params": {"query": sql, "params": {}}}, timeout=60)
+    try:
+        df = pd.DataFrame(_truflation_sdk_records(), columns=["event_time", "value"])
+        df["date"] = pd.to_datetime(df["event_time"], unit="s").dt.normalize()
+        s = df.sort_values("event_time").groupby("date")["value"].last().rename("Truflation YoY %")
+        s = s[s.index >= "2010-01-01"]
+        os.makedirs(os.path.dirname(TRUF_CACHE), exist_ok=True)
+        s.to_frame().to_parquet(TRUF_CACHE)
+        return s
+    except Exception as e:
+        if not os.path.exists(TRUF_CACHE):
+            raise
+        s = pd.read_parquet(TRUF_CACHE).iloc[:, 0].rename("Truflation YoY %")
+        s.attrs["stale_note"] = f"Truflation live fetch failed ({e}) - showing the cached history to {s.index[-1]:%d %b %Y}."
+        return s
+
+# ── Cleveland Fed inflation nowcast (daily, keyless) ─────────────────────────────────────
+# The Cleveland Fed's model nowcasts the MoM % change of CPI / core CPI / PCE / core PCE for the
+# current and next unreleased months, updated each business day (oil + gasoline prices + past
+# inflation). Same JSON its own chart uses.
+@st.cache_data(ttl=21600, show_spinner=False)
+def cleveland_inflation_nowcast():
+    r = requests.get("https://www.clevelandfed.org/-/media/files/webcharts/inflationnowcasting/nowcast_month.json",
+                     headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
     r.raise_for_status()
-    body = r.json()
-    if "error" in body:
-        raise RuntimeError(f"TRUF gateway: {body['error']}")
-    df = pd.DataFrame(body["result"]["values"], columns=body["result"]["column_names"])
-    df = df.astype({"event_time": "int64", "value": "float64", "created_at": "int64"})
-    df = df.sort_values(["event_time", "created_at"]).drop_duplicates("event_time", keep="last")
-    df["date"] = pd.to_datetime(df["event_time"], unit="s").dt.normalize()
-    return df.groupby("date")["value"].last().rename("Truflation YoY %")
+    months, asof = {}, None
+    for e in r.json():
+        vals = {}
+        for ds in e.get("dataset", []):
+            v = [float(x["value"]) for x in ds.get("data", []) if x.get("value") not in ("", None)]
+            if v:
+                vals[ds["seriesname"]] = v[-1]
+        months[pd.Timestamp(e["chart"]["subcaption"] + "-01")] = vals
+        asof = e["chart"].get("_comment", asof)
+    return {"asof": pd.Timestamp(asof) if asof else None, "months": months}
 
 def truflation_cpi_nowcast(truf: pd.Series, cpi_level: pd.Series):
     """Where the next headline CPI print (CPIAUCSL, SA) is heading, from Truflation.
@@ -1812,6 +1859,7 @@ for _tkr in ("CL=F", "RB=F", "HO=F"):  # crack spreads - follow the date slider
     prefetch(_yf_close_raw, _tkr, START, END)
 prefetch(get_tga_balance, START, END)
 prefetch(truflation_headline)
+prefetch(cleveland_inflation_nowcast)
 prefetch(get_debt_subject_to_limit, START, END)
 prefetch(get_mts_monthly)
 prefetch(get_category_spend, tuple(FISCAL_SPEND_GROUPS[next(iter(FISCAL_SPEND_GROUPS))]), "2022-01-01")
@@ -2866,8 +2914,45 @@ with tabs[2]:
                                      customdata=pd.Series(_z1y(truf), index=truf.index).reindex(tc.index).values,
                                      hovertemplate="%{x|%Y-%m-%d}<br>Truflation: %{y:.2f}%<br>Z (1Y): %{customdata:.2f}<extra></extra>"))
         cpi_nowcast = truflation_cpi_nowcast(truf, _fred_full("CPIAUCSL"))
+        if truf.attrs.get("stale_note"):
+            st.caption(truf.attrs["stale_note"])
     except Exception as e:
         st.caption(f"Truflation unavailable right now ({e}).")
+    # Cleveland Fed nowcast for the next unreleased CPI month (MoM on the right axis)
+    cle_nowcast = None
+    try:
+        cle = cleveland_inflation_nowcast()
+        cpi_lvl = _fred_full("CPIAUCSL").dropna()
+        core_lvl = _fred_full("CPILFESL").dropna()
+        nxt_m = cpi_lvl.index[-1] + pd.DateOffset(months=1)
+        cm = cle["months"].get(nxt_m, {})
+        if "CPI Inflation" in cm:
+            def _implied_yoy(lvl, mom):
+                base_m = nxt_m - pd.DateOffset(months=12)
+                base = lvl.get(base_m, np.nan)
+                if pd.isna(base):   # missing month (Oct-2025, shutdown): geometric mean of its neighbours
+                    base = np.sqrt(lvl.get(base_m - pd.DateOffset(months=1), np.nan) * lvl.get(base_m + pd.DateOffset(months=1), np.nan))
+                return (lvl.iloc[-1] * (1 + mom / 100) / base - 1) * 100
+            cle_nowcast = {"month": nxt_m, "asof": cle["asof"], "mom": cm["CPI Inflation"], "core_mom": cm.get("Core CPI Inflation"),
+                           "yoy": _implied_yoy(cpi_lvl, cm["CPI Inflation"]),
+                           "core_yoy": _implied_yoy(core_lvl, cm["Core CPI Inflation"]) if "Core CPI Inflation" in cm else None,
+                           "last_mom": (cpi_lvl.iloc[-1] / cpi_lvl.iloc[-2] - 1) * 100,
+                           "last_core_mom": (core_lvl.iloc[-1] / core_lvl.iloc[-2] - 1) * 100}
+            fig_cpi.add_trace(go.Scatter(
+                x=[nxt_m, nxt_m], y=[cle_nowcast["mom"], cle_nowcast["core_mom"]], yaxis="y2", mode="markers",
+                name=f"{nxt_m:%b} MoM nowcast (Cleveland Fed)", marker=dict(color=["#ef5350", "#ff9800"], size=11, symbol="star",
+                                                                          line=dict(color="white", width=1)),
+                customdata=["CPI", "Core CPI"],
+                hovertemplate=f"{nxt_m:%b %Y} %{{customdata}} MoM nowcast (Cleveland Fed): %{{y:+.2f}}%<extra></extra>"))
+    except Exception as e:
+        st.caption(f"Cleveland Fed nowcast unavailable right now ({e}).")
+    nowcast_lines = []
+    if cle_nowcast:
+        cn = cle_nowcast
+        nowcast_lines.append(f"<b>{cn['month']:%b} CPI MoM nowcast</b> (Cleveland Fed, {cn['asof']:%d %b}): "
+                             f"headline {cn['mom']:+.2f}% · core {cn['core_mom']:+.2f}%"
+                             f"<br><span style='font-size:10px'>implied YoY {cn['yoy']:.2f}% · core {cn['core_yoy']:.2f}% · "
+                             f"last print MoM {cn['last_mom']:+.2f}% / core {cn['last_core_mom']:+.2f}%</span>")
     if cpi_nowcast:
         nc = cpi_nowcast
         fig_cpi.add_trace(go.Scatter(
@@ -2876,12 +2961,14 @@ with tabs[2]:
             error_y=dict(type="constant", value=nc["band"], color="#ffd54f"),
             hovertemplate=(f"{nc['month']:%b %Y} CPI nowcast<br>YoY %{{y:.2f}}% ± {nc['band']:.2f}<br>"
                            f"MoM {nc['mom']:+.2f}%<extra></extra>")))
+        nowcast_lines.append(f"<b>{nc['month']:%b} CPI nowcast (Truflation)</b>: YoY {nc['yoy']:.2f}% ± {nc['band']:.2f}"
+                             f" · MoM {nc['mom']:+.2f}%<br><span style='font-size:10px'>{nc['days']} daily prints so far · "
+                             f"out-of-sample RMSE {nc['rmse']:.2f}pp</span>")
+    if nowcast_lines:
         fig_cpi.add_annotation(
             xref="paper", yref="paper", x=0.01, y=0.99, xanchor="left", yanchor="top", showarrow=False, align="left",
             bgcolor="rgba(22,27,38,0.85)", bordercolor="#ffd54f", borderwidth=1, font=dict(size=11, color="#e0e0e0"),
-            text=(f"<b>{nc['month']:%b} CPI nowcast (Truflation)</b><br>YoY {nc['yoy']:.2f}% ± {nc['band']:.2f}"
-                  f" · MoM {nc['mom']:+.2f}%<br><span style='font-size:10px'>{nc['days']} daily prints so far · "
-                  f"out-of-sample RMSE {nc['rmse']:.2f}pp</span>"))
+            text="<br>".join(nowcast_lines))
     fig_cpi.update_layout(**dual_axis_layout("CPI vs Core CPI (+ Truflation)", "YoY %", "MoM %"))
     add_recessions(fig_cpi, recessions)
 
@@ -3061,10 +3148,26 @@ with tabs[2]:
         ("PCE Components History", fig_pce_comp_hist, pd.concat([pce_components[l] for l, _ in PCE_COMPONENTS], axis=1)),
         ("PCE Components Snapshot", fig_pce_comp_snap, pce_comp_df),
     ]
+    if cle_nowcast or cpi_nowcast:
+        _m = (cle_nowcast or cpi_nowcast)["month"]
+        st.markdown(f"**Next CPI print ({_m:%B %Y}) - projected**")
+        mc = st.columns(4)
+        if cle_nowcast:
+            mc[0].metric("CPI MoM · Cleveland Fed", f"{cle_nowcast['mom']:+.2f}%",
+                         f"{cle_nowcast['mom'] - cle_nowcast['last_mom']:+.2f}pp vs last print", delta_color="inverse",
+                         help=f"Cleveland Fed inflation nowcast as of {cle_nowcast['asof']:%d %b %Y}; last print {cle_nowcast['last_mom']:+.2f}%.")
+            mc[1].metric("Core CPI MoM · Cleveland Fed", f"{cle_nowcast['core_mom']:+.2f}%",
+                         f"{cle_nowcast['core_mom'] - cle_nowcast['last_core_mom']:+.2f}pp vs last print", delta_color="inverse")
+            mc[2].metric("CPI YoY · implied", f"{cle_nowcast['yoy']:.2f}%", f"core {cle_nowcast['core_yoy']:.2f}%", delta_color="off",
+                         help="From the Cleveland Fed MoM nowcast and the index level 12 months earlier.")
+        if cpi_nowcast:
+            mc[3].metric("CPI MoM · Truflation-implied", f"{cpi_nowcast['mom']:+.2f}%",
+                         f"YoY {cpi_nowcast['yoy']:.2f}% ± {cpi_nowcast['band']:.2f}", delta_color="off",
+                         help="From the Truflation bridge model below (direction of Truflation's monthly average).")
     render_two_col(inflation_charts)
     if cpi_nowcast:
         st.caption(
-            f"Truflation: daily alternative CPI read keyless from the TRUF.NETWORK gateway. It runs below CPI in level ("
+            f"Truflation: daily alternative CPI read from TRUF.NETWORK via its SDK (free reads). It runs below CPI in level ("
             f"housing is ~23% of its basket vs ~35% of CPI), so the {cpi_nowcast['month']:%b} nowcast uses its direction: "
             f"last CPI YoY + {cpi_nowcast['beta']:.2f} × the change in Truflation's monthly average; the band is the 80% range "
             f"from its out-of-sample error on the last 24 prints. MoM is implied from the YoY and the index a year earlier"
