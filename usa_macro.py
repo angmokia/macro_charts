@@ -1237,6 +1237,76 @@ def bottom_confluence_triggers(sig: pd.DataFrame, thr: int = 3) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+# ── S&P 500 breadth ───────────────────────────────────────────────────────────
+# % of S&P 500 members above their 20/50/200-day moving averages, built from every constituent's
+# daily close (current members from Wikipedia - so there is survivorship bias in older history).
+# The "thrust" signal is the green-bar breadth signal traders post: the 20D breadth washes out
+# below an oversold level, then recovers through a trigger level. Default 20 -> 25 fired 36 times
+# since 2015 (20-day cooldown); SPX was higher 21 trading days later 74% of the time (+2.2% mean
+# vs +1.0% base), but 5 days later it was below a random day's hit rate (retests are common), so
+# it marks washouts, not the exact low.
+BREADTH_CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "breadth_cache", "sp500_close.pkl")
+BREADTH_WINDOWS = (20, 50, 200)
+
+
+@st.cache_data(ttl=604800, show_spinner=False)
+def get_sp500_tickers() -> tuple:
+    html = requests.get("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
+                        headers={"User-Agent": "Mozilla/5.0 (macro-dashboard)"}, timeout=30).text
+    syms = pd.read_html(io.StringIO(html))[0]["Symbol"].astype(str)
+    return tuple(syms.str.replace(".", "-", regex=False))  # BRK.B -> BRK-B on Yahoo
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def get_sp500_breadth(start: str) -> pd.DataFrame:
+    """Daily % of constituents above each MA in BREADTH_WINDOWS, plus member count. Downloads in
+    chunks (each under the yfinance lock, so other tabs' downloads can interleave); falls back to
+    the last good close panel on disk if Yahoo or Wikipedia fails. Pure: raises if neither works."""
+    import pickle
+    try:
+        tickers = list(get_sp500_tickers())
+        parts = []
+        for i in range(0, len(tickers), 100):
+            chunk = tickers[i:i + 100]
+            raw = _yf_retry(lambda: _yf_download(chunk, start=start, progress=False,
+                                                 auto_adjust=True, threads=True))
+            parts.append(raw["Close"])
+        close = pd.concat(parts, axis=1)
+        close.index = pd.to_datetime(close.index).tz_localize(None)
+        close = close.loc[:, close.notna().any()]
+        if close.shape[1] < 400:
+            raise RuntimeError(f"only {close.shape[1]} constituents downloaded")
+        os.makedirs(os.path.dirname(BREADTH_CACHE), exist_ok=True)
+        with open(BREADTH_CACHE, "wb") as f:
+            pickle.dump(close, f)
+    except Exception:
+        if not os.path.exists(BREADTH_CACHE):
+            raise
+        with open(BREADTH_CACHE, "rb") as f:
+            close = pickle.load(f)
+    out = pd.DataFrame(index=close.index)
+    for n in BREADTH_WINDOWS:
+        ma = close.rolling(n, min_periods=n).mean()
+        valid = ma.notna() & close.notna()
+        out[f"pct{n}"] = (close > ma).where(valid).sum(axis=1) / valid.sum(axis=1).replace(0, np.nan) * 100
+    out["members"] = close.notna().sum(axis=1)
+    return out.dropna(subset=[f"pct{BREADTH_WINDOWS[0]}"])
+
+
+def breadth_thrust_signals(pct: pd.Series, oversold: float, trigger: float,
+                           lookback: int = 10, cooldown_days: int = 20) -> pd.DatetimeIndex:
+    """Days pct crosses up through `trigger` after printing below `oversold` within the prior
+    `lookback` sessions; repeats within `cooldown_days` calendar days are dropped."""
+    washed = (pct.rolling(lookback, min_periods=1).min() < oversold).shift(fill_value=False)
+    cross = (pct >= trigger) & (pct.shift() < trigger) & washed
+    keep, last = [], None
+    for d in pct.index[cross]:
+        if last is None or (d - last).days > cooldown_days:
+            keep.append(d)
+        last = d
+    return pd.DatetimeIndex(keep)
+
+
 @st.cache_data(ttl=3600)
 def fetch_yf_close_batch(tickers_map: dict, start: str) -> dict:
     """Fetch Close prices for several tickers in ONE yfinance request instead of one request per
@@ -1869,6 +1939,7 @@ prefetch(_yf_batch_raw, tuple(MARKET_INDICES), MARKETS_HIST_START)
 prefetch(_yf_batch_raw, tuple(SECTOR_ETFS), MARKETS_HIST_START)
 prefetch(_yf_batch_raw, tuple(CORR_EXTRA_TICKERS), MARKETS_HIST_START)
 prefetch(_yf_batch_raw, tuple(BOTTOM_SIGNAL_INDICES), MARKETS_HIST_START)
+prefetch(get_sp500_breadth, MARKETS_HIST_START, every=10800)
 prefetch(_yf_last_close, "^VIX9D", every=600)
 prefetch(_yf_last_close, "^VIX3M", every=600)
 prefetch(_yf_trailing_pe, "SPY", every=600)
@@ -3950,6 +4021,113 @@ with tabs[1]:
                "the reverse of bond-price signs: SPY vs 10Y yield < 0 means stocks fall when yields rise, i.e. "
                "stocks and bond PRICES move together - the same thing as a positive SPY/TLT correlation above. "
                "BTC's weekend moves are folded into the next trading day.")
+
+    # ── S&P 500 breadth: % of members above their 20/50/200D MAs + washout-thrust signal ─────
+    st.markdown('<div class="section-header">S&P 500 Breadth — % of Members Above Moving Average</div>',
+                unsafe_allow_html=True)
+    br_c1, br_c2, _ = st.columns([1, 1, 3])
+    br_os = br_c1.number_input("Oversold below (20D breadth %)", 5, 50, 20, 5, key="breadth_oversold")
+    br_tr = br_c2.number_input("Signal when it recovers through", 10, 60, 25, 5, key="breadth_trigger")
+    try:
+        with st.spinner("Loading S&P 500 constituents (first load ~1 min)…"):
+            breadth = get_sp500_breadth(MARKETS_HIST_START)
+    except Exception as e:
+        breadth = pd.DataFrame()
+        st.warning(f"S&P 500 breadth unavailable: {e}")
+    spx_br = bottom_idx_full.get("^GSPC", pd.DataFrame())
+    if not breadth.empty and not spx_br.empty:
+        spx_s = spx_br.iloc[:, 0].reindex(breadth.index, method="ffill", limit=3)
+        br_sig = breadth_thrust_signals(breadth["pct20"], br_os, br_tr)
+        # Forward SPX returns after each signal vs the unconditional base rate (full history)
+        fwd_rows, horizons = [], (5, 21, 63)
+        for d in br_sig:
+            i = spx_s.index.get_loc(d)
+            row = {"Date": d.date(), "20D breadth %": round(breadth["pct20"].iloc[i], 1),
+                   "SPX": round(spx_s.iloc[i], 1)}
+            for h in horizons:
+                row[f"{h}D %"] = (spx_s.iloc[i + h] / spx_s.iloc[i] - 1) * 100 if i + h < len(spx_s) else np.nan
+            fwd_rows.append(row)
+        br_fwd = pd.DataFrame(fwd_rows)
+        base_fwd = {h: (spx_s.shift(-h) / spx_s - 1) * 100 for h in horizons}
+
+        last = breadth.iloc[-1]
+        prev5 = breadth.iloc[-6] if len(breadth) > 5 else last
+        last_sig = f"{br_sig[-1]:%d %b %Y}" if len(br_sig) else "none since 2015"
+        mcols = st.columns(4)
+        for col, n in zip(mcols, BREADTH_WINDOWS):
+            v, dv = last[f"pct{n}"], last[f"pct{n}"] - prev5[f"pct{n}"]
+            cls = "negative" if v < br_os else ("positive" if v > 70 else "neutral")
+            with col:
+                st.markdown(f"""
+                <div class="metric-card">
+                  <div class="metric-label">% above {n}D MA</div>
+                  <div class="metric-value {cls}">{v:.1f}%</div>
+                  <div class="metric-delta {'positive' if dv >= 0 else 'negative'}">{dv:+.1f} pts vs 5 sessions ago</div>
+                  <div class="metric-asof">as of {breadth.index[-1]:%d %b %Y} · {int(last['members'])} members</div>
+                </div>""", unsafe_allow_html=True)
+        recent = len(br_sig) and (breadth.index[-1] - br_sig[-1]).days <= 10
+        with mcols[3]:
+            st.markdown(f"""
+            <div class="metric-card">
+              <div class="metric-label">Washout thrust signal</div>
+              <div class="metric-value {'positive' if recent else 'neutral'}">{'FIRED' if recent else 'OFF'}</div>
+              <div class="metric-delta neutral">20D breadth &lt; {br_os} then back above {br_tr}</div>
+              <div class="metric-asof">last fired {last_sig}</div>
+            </div>""", unsafe_allow_html=True)
+
+        bc = breadth[(breadth.index >= START) & (breadth.index <= END)]
+        sc = spx_s.reindex(bc.index)
+        fig_br = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.55, 0.45], vertical_spacing=0.04)
+        fig_br.add_trace(go.Scatter(x=sc.index, y=sc, name="S&P 500", line=dict(color="#90a4d4", width=1.4),
+                                    hovertemplate="%{x|%Y-%m-%d}<br>S&P 500: %{y:,.0f}<extra></extra>"), row=1, col=1)
+        sig_in = br_sig[(br_sig >= bc.index.min()) & (br_sig <= bc.index.max())] if not bc.empty else br_sig[:0]
+        for d in sig_in:
+            fig_br.add_vline(x=d, line=dict(color="rgba(38,166,154,0.55)", width=2))
+        if len(sig_in):
+            fig_br.add_trace(go.Scatter(x=sig_in, y=sc.reindex(sig_in), mode="markers", name="Thrust signal",
+                                        marker=dict(symbol="triangle-up", size=11, color="#26a69a",
+                                                    line=dict(color="#e0e0e0", width=1)),
+                                        hovertemplate="%{x|%Y-%m-%d} signal<extra></extra>"), row=1, col=1)
+        for n, color in zip(BREADTH_WINDOWS, ("#42a5f5", "#ff9800", "#ab47bc")):
+            fig_br.add_trace(go.Scatter(x=bc.index, y=bc[f"pct{n}"], name=f"% > {n}D MA",
+                                        line=dict(color=color, width=1.6 if n == 20 else 1.2),
+                                        hovertemplate="%{x|%Y-%m-%d}: %{y:.1f}%<extra>" + f"{n}D</extra>"),
+                             row=2, col=1)
+        for lvl, dash in ((br_os, "dot"), (br_tr, "dash"), (80, "dot")):
+            fig_br.add_shape(type="line", xref="x2 domain", x0=0, x1=1, yref="y2", y0=lvl, y1=lvl,
+                             line=dict(color="#8a94a6", width=1, dash=dash))
+        fig_br.update_layout(template=TEMPLATE, paper_bgcolor=PAPER_BG, plot_bgcolor=PLOT_BG, height=560,
+                             margin=dict(l=10, r=10, t=90, b=30), hovermode="x unified",
+                             title=dict(text="S&P 500 vs Breadth (green lines = washout thrust signals)", y=0.98),
+                             legend=dict(orientation="h", yanchor="bottom", y=1.01, x=0))
+        fig_br.update_yaxes(gridcolor=GRID_COLOR)
+        fig_br.update_yaxes(range=[0, 100], title_text="% of members", row=2, col=1)
+        fig_br.update_xaxes(gridcolor=GRID_COLOR)
+        st.plotly_chart(fig_br, use_container_width=True, key="chart_sp500_breadth")
+
+        if not br_fwd.empty:
+            summ = []
+            for h in horizons:
+                v = br_fwd[f"{h}D %"].dropna()
+                b = base_fwd[h].dropna()
+                summ.append({"Horizon": f"{h} trading days", "Signals": len(v),
+                             "% higher": round((v > 0).mean() * 100), "Base % higher": round((b > 0).mean() * 100),
+                             "Mean %": round(v.mean(), 2), "Base mean %": round(b.mean(), 2),
+                             "Median %": round(v.median(), 2), "Worst %": round(v.min(), 2)})
+            s1, s2 = st.columns([1, 1])
+            with s1:
+                st.markdown("**S&P 500 after signals vs any day (since 2015)**")
+                st.dataframe(pd.DataFrame(summ), hide_index=True, use_container_width=True)
+            with s2:
+                st.markdown("**Recent signals**")
+                st.dataframe(br_fwd.tail(10).iloc[::-1].round(2), hide_index=True, use_container_width=True)
+            csv_download(breadth.round(2), "sp500_breadth")
+        st.caption("Breadth = share of S&P 500 members closing above their own 20/50/200-day moving average, "
+                   "computed from every constituent's daily close. Uses today's member list, so older history "
+                   "has survivorship bias (stocks dropped from the index are missing). Signal = 20D breadth drops "
+                   f"below {br_os}%, then closes back above {br_tr}% within 10 sessions (repeats within 20 days "
+                   "ignored). It marks a washout being absorbed, not the exact low: over the next 5 days SPX does "
+                   "no better than a random day (often a retest), the edge shows at 21 days, and in a bear market (2018, 2022) the bounce can fail and breadth wash out again.")
 
     # Index levels, 1M/3M/1Y returns, and z-scores - returns use the same fixed trailing
     # windows as the z-scores (not the global date-range slider), so the two charts stay
